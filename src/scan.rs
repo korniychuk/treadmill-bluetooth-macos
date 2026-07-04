@@ -158,9 +158,10 @@ async fn is_treadmill(peripheral: &Peripheral) -> bool {
         .unwrap_or(false)
 }
 
-/// Subscribe to Treadmill Data notifications and log decoded frames until the
-/// stream ends (device disconnects) or the task is cancelled.
-pub async fn stream_treadmill_data(peripheral: &Peripheral) -> Result<()> {
+/// Subscribe to Treadmill Data (`0x2ACD`) notifications on an already
+/// connected peripheral. Shared by the interactive `connect` stream and the
+/// presence-aware daemon loop.
+pub async fn subscribe_treadmill_data(peripheral: &Peripheral) -> Result<()> {
     let characteristic = peripheral
         .characteristics()
         .into_iter()
@@ -172,6 +173,13 @@ pub async fn stream_treadmill_data(peripheral: &Peripheral) -> Result<()> {
         .await
         .context("subscribe to Treadmill Data")?;
     info!("subscribed to Treadmill Data notifications");
+    Ok(())
+}
+
+/// Subscribe to Treadmill Data notifications and log decoded frames until the
+/// stream ends (device disconnects) or the task is cancelled.
+pub async fn stream_treadmill_data(peripheral: &Peripheral) -> Result<()> {
+    subscribe_treadmill_data(peripheral).await?;
 
     let mut notifications = peripheral
         .notifications()

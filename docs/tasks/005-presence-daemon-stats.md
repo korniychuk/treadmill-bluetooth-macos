@@ -153,10 +153,37 @@ source-of-truth параллельно с SQLite-агрегацией — даж
 Колонка в схеме не заводится (уже подтверждено: `incline_percent` в
 `TreadmillData` всегда `None`).
 
+## Presence-confirmation window: не засчитывать хвост перед away
+
+Обнаружено при живом e2e-тесте (замечено оператором): наивная реализация
+"копим distance/time, пока `state == Walking`" пропускает баг — сам
+`AWAY_THRESHOLD` (10 с) выполняется как задержка **до** перехода в
+`AwayWhileRunning`, всё это время состояние формально остаётся `Walking`, и
+крутящаяся без оператора лента успевает "накрутить" ~10 с фантомного времени
+и дистанции в daily_stats на каждый уход.
+
+**Фикс:** дистанция/время не пишутся в SQLite немедленно — копятся в памяти
+(`daemon::PendingCredit`) с момента последнего подтверждённого шага. Шаг
+(steps delta > 0) — самоподтверждающийся сигнал, коммитится сразу вместе с
+накопленным буфером. Если вместо этого наступает подтверждённый away —
+буфер сбрасывается **без записи в БД**. `store.rs` разделён на
+`advance_baseline` (persist-safe дельты, restart-safety) и `credit_daily`
+(явное зачисление уже принятого решения) — само решение "считать за ходьбу
+или нет" целиком переехало в `daemon.rs`. Тесты
+`daemon::tests::confirmed_away_discards_pending_instead_of_crediting_it` и
+`confirmed_step_flushes_pending_distance_and_time` фиксируют оба сценария.
+
 ## Progress log
 
 - 2026-07-05: оба де-риска подтверждены на живом железе (LaunchAgent видит
   BLE; steps-каданс устойчив, worst-case gap ~2с на мин. скорости) →
   AWAY_THRESHOLD = 10s. Развилка по distance/steps/time при away зафиксирована
-  (все три — только в Walking). Приступаю к реализации store → presence →
-  notify → daemon/launchd → stats.
+  (все три — только в Walking).
+- 2026-07-05: реализованы store (SQLite), presence state machine, notify
+  (osascript toast), daemon loop, `scripts/install-daemon.sh` /
+  `uninstall-daemon.sh` (LaunchAgent), CLI `stats`. 13 unit-тестов.
+- 2026-07-05: живой e2e-тест поймал баг с фантомным хвостом перед away
+  (см. выше) — исправлено буферизацией; ещё +2 теста (15 всего). LaunchAgent
+  переустановлен с фиксом, живая проверка на реальном железе: presence
+  корректно переключается Walking ⇄ AwayWhileRunning, `stats` показывает
+  только подтверждённую ходьбу.

@@ -16,9 +16,16 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
 
 ## Архитектура
 
-- `src/main.rs` — точка входа и CLI (`scan` | `connect`).
+- `src/main.rs` — точка входа и CLI (`scan` | `connect` | `daemon` | `stats` | ...).
 - `src/scan.rs` — обнаружение адаптера, скан, подключение, подписка на нотификации.
 - `src/ftms.rs` — константы Fitness Machine Service (`0x1826`) и парсинг Treadmill Data (`0x2ACD`).
+- `src/control.rs` — FTMS Control Point (start/stop/speed).
+- `src/presence.rs` — детекция присутствия: лента крутится, но шаги не растут → `AwayWhileRunning`.
+- `src/store.rs` — SQLite (`~/Library/Application Support/treadmill-bluetooth-macos/treadmill.db`),
+  дневная статистика (шаги/дистанция/время ходьбы), restart-safe дельта-накопление.
+- `src/daemon.rs` — фоновый цикл (LaunchAgent): авто-скан/коннект/реконнект + presence + toast.
+- `src/notify.rs` — нативные macOS-уведомления через `osascript` (без Swift).
+- `src/logger.rs` — сырой JSONL-лог телеметрии (source-of-truth параллельно с SQLite).
 
 ## Протокол
 
@@ -37,9 +44,14 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
 ```bash
 cargo run             # = scan: перечислить BLE-устройства рядом (диагностика)
 cargo run -- connect  # подключиться к первой FTMS-дорожке и стримить данные
-cargo test            # юнит-тесты (парсинг FTMS)
-cargo clippy          # линт
+cargo run -- daemon    # фоновый режим: авто-коннект + presence + toast (для интерактивной проверки)
+cargo run -- stats     # статистика за сегодня; `stats all` — за все дни
+cargo test             # юнит-тесты
+cargo clippy           # линт
 RUST_LOG=debug cargo run  # подробные логи (env-filter)
+
+scripts/install-daemon.sh    # собрать, подписать, поставить LaunchAgent (авто-старт при логине)
+scripts/uninstall-daemon.sh  # снять LaunchAgent (данные в Application Support не трогает)
 ```
 
 ## Заметки по macOS

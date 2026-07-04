@@ -7,12 +7,16 @@
 //! Run without arguments to `scan`.
 
 mod control;
+mod daemon;
 mod discover;
 mod fitshow;
 mod ftms;
 mod logger;
+mod notify;
+mod presence;
 mod scan;
 mod sniff;
+mod store;
 
 use anyhow::{Context, Result};
 use tokio::signal;
@@ -74,10 +78,12 @@ async fn main() -> Result<()> {
                 .context("incline must be a number, percent")?;
             run_command(&adapter, Command::Incline(percent)).await?;
         }
+        "daemon" => run_daemon(&adapter).await?,
+        "stats" => run_stats()?,
         other => {
             error!(
                 mode = other,
-                "unknown mode; use `scan`, `connect`, `discover`, `start`, `stop`, `speed <kmh>`, or `incline <pct>`"
+                "unknown mode; use `scan`, `connect`, `discover`, `start`, `stop`, `speed <kmh>`, `incline <pct>`, `daemon`, or `stats`"
             );
             std::process::exit(2);
         }
@@ -111,6 +117,42 @@ async fn run_sniff(adapter: &btleplug::platform::Adapter) -> Result<()> {
         _ = signal::ctrl_c() => info!("interrupted — disconnecting"),
     }
     Ok(())
+}
+
+/// Run the presence-aware background daemon: scan → connect → stream →
+/// reconnect forever, until interrupted (Ctrl-C or LaunchAgent stop).
+async fn run_daemon(adapter: &btleplug::platform::Adapter) -> Result<()> {
+    tokio::select! {
+        result = daemon::run(adapter) => result?,
+        _ = signal::ctrl_c() => info!("interrupted — shutting down daemon"),
+    }
+    Ok(())
+}
+
+/// Print today's accumulated stats, or every recorded day with `stats all`.
+fn run_stats() -> Result<()> {
+    let store = store::Store::open()?;
+    if std::env::args().nth(2).as_deref() == Some("all") {
+        for day in store.all_stats()? {
+            print_day(&day);
+        }
+    } else {
+        print_day(&store.today_stats()?);
+    }
+    Ok(())
+}
+
+fn print_day(day: &store::DailyStats) {
+    let minutes = day.walking_time_s / 60;
+    let seconds = day.walking_time_s % 60;
+    println!(
+        "{}: {} steps, {:.2} km, {}m{:02}s walking",
+        day.date,
+        day.steps,
+        day.distance_m as f64 / 1000.0,
+        minutes,
+        seconds
+    );
 }
 
 /// A one-shot FTMS command issued over a fresh connection.
