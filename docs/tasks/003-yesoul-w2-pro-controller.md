@@ -123,6 +123,25 @@ already-pinned versions and the global `~`-only version policy before adopting:
   vendor-specific write (`d18d2c10-…` or `0xFAB0`/`0xFFF0`); needs Phase 3 capture.
 - Units (km/h vs mph) source of truth: device setting vs app-side conversion?
 
+## Incline: investigation verdict (2026-07-05)
+
+**Incline is NOT controllable over BLE on this firmware.** Evidence:
+- FTMS Set Target Inclination (0x03) → `0x04 Operation Failed` in every belt
+  state (running, stopped, paused), any encoding (percent/levels).
+- Remote presses (6× incline) produce **zero** traffic on all GATT notify
+  channels (2ACD/2ADA/2AD3/fab3/fff3/fff4) — the remote is a proprietary RF
+  link (AAA battery, pairs independently of the app; no BLE advertiser
+  appears when pressing buttons).
+- FitShow-style framed queries (`02 … xor 03`) to fff2/fab1/fab2 → ATT-ACKed
+  but never answered; Sperax RM-01 pcap (identical GATT) contains only
+  time-sync frames on `d18d2c10`, no control commands.
+- qdomyos-zwift has no Yesoul treadmill support; no public RE of
+  `SDC_W2_BT`/`YS_W2PRO` exists.
+
+Possible future paths (out of BLE scope): RF sniffing of the remote
+(RTL-SDR/CC1101, 433 MHz / 2.4 GHz ISM) + replay from ESP32; or console PCB
+teardown (remote receiver may be a UART daughterboard). Both need hardware.
+
 ## Progress log
 
 - 2026-07-05: Phase 1 research synthesized (research/001). Phase 2 GATT dump

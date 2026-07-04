@@ -8,8 +8,10 @@
 
 mod control;
 mod discover;
+mod fitshow;
 mod ftms;
 mod scan;
+mod sniff;
 
 use anyhow::{Context, Result};
 use tokio::signal;
@@ -36,6 +38,27 @@ async fn main() -> Result<()> {
                 .parse()
                 .context("speed must be a number, km/h")?;
             run_command(&adapter, Command::Speed(kmh)).await?;
+        }
+        "sniff" => run_sniff(&adapter).await?,
+        "fitshow-probe" => {
+            let peripheral = scan::connect_treadmill(&adapter).await?;
+            let fs = fitshow::FitShow::attach(&peripheral).await?;
+            fs.probe_info().await?;
+        }
+        "fitshow-set" => {
+            let speed: f32 = std::env::args()
+                .nth(2)
+                .context("usage: fitshow-set <kmh> <incline-level>")?
+                .parse()
+                .context("speed must be a number, km/h")?;
+            let incline: u8 = std::env::args()
+                .nth(3)
+                .context("usage: fitshow-set <kmh> <incline-level>")?
+                .parse()
+                .context("incline must be an integer level")?;
+            let peripheral = scan::connect_treadmill(&adapter).await?;
+            let fs = fitshow::FitShow::attach(&peripheral).await?;
+            fs.set_speed_incline(speed, incline).await?;
         }
         "incline" => {
             let percent: f32 = std::env::args()
@@ -73,6 +96,15 @@ async fn run_connect(adapter: &btleplug::platform::Adapter) -> Result<()> {
 async fn run_discover(adapter: &btleplug::platform::Adapter) -> Result<()> {
     let peripheral = scan::connect_treadmill(adapter).await?;
     discover::dump_gatt(&peripheral).await
+}
+
+async fn run_sniff(adapter: &btleplug::platform::Adapter) -> Result<()> {
+    let peripheral = scan::connect_treadmill(adapter).await?;
+    tokio::select! {
+        result = sniff::sniff_all(&peripheral) => result?,
+        _ = signal::ctrl_c() => info!("interrupted — disconnecting"),
+    }
+    Ok(())
 }
 
 /// A one-shot FTMS command issued over a fresh connection.
