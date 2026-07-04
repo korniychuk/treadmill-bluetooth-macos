@@ -29,6 +29,11 @@ async fn main() -> Result<()> {
         "scan" => scan::scan_and_list(&adapter).await?,
         "connect" => run_connect(&adapter).await?,
         "discover" => run_discover(&adapter).await?,
+        "discover-id" => {
+            let id = std::env::args().nth(2).context("usage: discover-id <peripheral-uuid>")?;
+            let peripheral = scan::connect_by_id(&adapter, &id).await?;
+            discover::dump_gatt(&peripheral).await?;
+        }
         "start" => run_command(&adapter, Command::Start).await?,
         "stop" => run_command(&adapter, Command::Stop).await?,
         "speed" => {

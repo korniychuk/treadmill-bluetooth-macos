@@ -57,10 +57,66 @@ pub async fn scan_and_list(adapter: &Adapter) -> Result<()> {
             .as_ref()
             .map(|p| p.services.contains(&ftms::FITNESS_MACHINE_SERVICE))
             .unwrap_or(false);
-        info!(id = %peripheral.id(), %name, ftms = has_ftms, "discovered");
+        // Advertisement details help identify nameless devices (e.g. a vendor
+        // remote): manufacturer data carries the company id, services hint at
+        // the device class.
+        let manufacturer = props
+            .as_ref()
+            .map(|p| {
+                p.manufacturer_data
+                    .iter()
+                    .map(|(id, data)| {
+                        let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
+                        format!("{id:#06x}:{hex}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        let services = props
+            .as_ref()
+            .map(|p| {
+                p.services
+                    .iter()
+                    .map(|u| u.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        let rssi = props.as_ref().and_then(|p| p.rssi);
+        info!(id = %peripheral.id(), %name, ftms = has_ftms, ?rssi, %manufacturer, %services, "discovered");
     }
 
     Ok(())
+}
+
+/// Connect to a specific peripheral by its (opaque macOS) UUID string.
+///
+/// Used for probing devices that do not advertise FTMS (e.g. identifying an
+/// unknown advertiser suspected to be the treadmill in a vendor-specific mode).
+pub async fn connect_by_id(adapter: &Adapter, id: &str) -> Result<Peripheral> {
+    adapter
+        .start_scan(ScanFilter::default())
+        .await
+        .context("start BLE scan")?;
+
+    let deadline = tokio::time::Instant::now() + SCAN_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        for peripheral in adapter.peripherals().await.context("list peripherals")? {
+            if peripheral.id().to_string() == id {
+                info!(id = %peripheral.id(), "connecting by id");
+                peripheral.connect().await.context("connect")?;
+                peripheral
+                    .discover_services()
+                    .await
+                    .context("discover services")?;
+                return Ok(peripheral);
+            }
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    bail!("peripheral {id} not seen within {:?}", SCAN_TIMEOUT)
 }
 
 /// Find and connect to the first peripheral advertising the FTMS service.
