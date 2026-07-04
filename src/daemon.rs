@@ -20,6 +20,13 @@
 //! Instead, `NOTIFICATION_TIMEOUT` bounds how long we wait for the next
 //! `0x2ACD` sample (which the device sends ~1/s whenever connected, even at
 //! rest) before treating the link as lost ourselves.
+//!
+//! Idle scanning (treadmill not currently found) is skipped while the laptop
+//! is on battery — see `power::is_on_ac_power`. Scanning keeps the Bluetooth
+//! radio active; that's negligible for one session but wasteful to run
+//! unconditionally forever when the laptop is away from the treadmill anyway
+//! (the common case when unplugged). An already-open connection is never
+//! interrupted by a power-state change, only idle *discovery* is gated.
 
 use std::time::Duration;
 
@@ -28,11 +35,12 @@ use btleplug::api::Peripheral as _;
 use btleplug::platform::{Adapter, Peripheral};
 use futures::StreamExt;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::ftms;
 use crate::logger::WorkoutLogger;
 use crate::notify;
+use crate::power::is_on_ac_power;
 use crate::presence::{PresenceState, PresenceTracker};
 use crate::scan;
 use crate::store::{RawDeltas, Store};
@@ -47,10 +55,21 @@ const RETRY_DELAY: Duration = Duration::from_secs(5);
 /// power-off well before a human would otherwise notice.
 const NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How often to re-check AC power while skipping idle scans on battery.
+/// Coarser than the scan cycle since a `pmset` poll is the only thing
+/// happening at this cadence — cheap either way, but no need to hurry.
+const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Run the daemon forever: scan → connect → stream with presence tracking →
 /// on disconnect, toast and go back to scanning.
 pub async fn run(adapter: &Adapter) -> Result<()> {
     loop {
+        if !is_on_ac_power() {
+            debug!("on battery and not connected — skipping idle scan to save power");
+            sleep(BATTERY_POLL_INTERVAL).await;
+            continue;
+        }
+
         match scan::connect_treadmill(adapter).await {
             Ok(peripheral) => {
                 notify::treadmill_found();

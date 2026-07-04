@@ -24,6 +24,8 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
 - `src/store.rs` — SQLite (`~/Library/Application Support/treadmill-bluetooth-macos/treadmill.db`),
   дневная статистика (шаги/дистанция/время ходьбы), restart-safe дельта-накопление.
 - `src/daemon.rs` — фоновый цикл (LaunchAgent): авто-скан/коннект/реконнект + presence + toast.
+- `src/power.rs` — детекция AC-питания (`pmset -g batt`); на батарее и без
+  подключённой дорожки демон не сканирует, чтобы не сажать аккумулятор.
 - `src/notify.rs` — нативные macOS-уведомления (`mac-notification-sys`,
   чистый Rust, без Swift в рантайме) с иконкой и именем "Treadmill".
 - `src/logger.rs` — сырой JSONL-лог телеметрии (source-of-truth параллельно с SQLite).

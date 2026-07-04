@@ -10,6 +10,7 @@ mod fitshow;
 mod ftms;
 mod logger;
 mod notify;
+mod power;
 mod presence;
 mod scan;
 mod sniff;
