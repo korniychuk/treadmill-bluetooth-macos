@@ -87,6 +87,15 @@ async fn stream_with_presence(peripheral: &Peripheral) -> Result<()> {
                 PresenceState::Walking if prev_state == PresenceState::AwayWhileRunning => {
                     notify::walker_resumed();
                 }
+                PresenceState::Walking if prev_state == PresenceState::Paused => {
+                    notify::treadmill_resumed();
+                }
+                // Skip the very first sample after connecting: PresenceState
+                // starts Unknown, so a treadmill discovered already stopped
+                // must not immediately toast "paused".
+                PresenceState::Paused if prev_state != PresenceState::Unknown => {
+                    notify::treadmill_paused();
+                }
                 _ => {}
             }
         }

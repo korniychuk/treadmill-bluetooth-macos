@@ -49,6 +49,15 @@ impl PresenceTracker {
             self.last_step_change = Some(now);
         }
 
+        // While paused, keep the away-clock pinned to "now": a pause is a
+        // deliberate action, not an absence, and it commonly outlasts
+        // `AWAY_THRESHOLD`. Without this, resuming after a long pause would
+        // immediately read as `AwayWhileRunning` instead of `Walking`, since
+        // `last_step_change` would still be stale from before the pause.
+        if speed_kmh.is_some_and(|speed| speed <= 0.0) {
+            self.last_step_change = Some(now);
+        }
+
         let next = match speed_kmh {
             Some(speed) if speed <= 0.0 => PresenceState::Paused,
             Some(_) => match self.last_step_change {
@@ -125,5 +134,25 @@ mod tests {
         tracker.last_step_change = Some(Instant::now() - AWAY_THRESHOLD - Duration::from_secs(1));
         let transition = tracker.observe(Some(2.5), Some(10));
         assert_eq!(transition, Some(PresenceState::AwayWhileRunning));
+    }
+
+    #[test]
+    fn resuming_after_a_long_pause_reads_as_walking_not_away() {
+        let mut tracker = PresenceTracker::new();
+        tracker.observe(Some(2.5), Some(10));
+        let paused = tracker.observe(Some(0.0), Some(10));
+        assert_eq!(paused, Some(PresenceState::Paused));
+
+        // Back-date last_step_change to simulate a pause far longer than
+        // AWAY_THRESHOLD — the pause-clock-pin logic must have kept it fresh
+        // on every paused sample, so this only proves the bug *would* have
+        // fired without it; the real fix is exercised by the assert below.
+        tracker.last_step_change = Some(Instant::now() - AWAY_THRESHOLD - Duration::from_secs(60));
+        // One more paused sample, as would arrive from a real long pause,
+        // must re-pin the clock before resuming.
+        tracker.observe(Some(0.0), Some(10));
+
+        let resumed = tracker.observe(Some(2.5), Some(10));
+        assert_eq!(resumed, Some(PresenceState::Walking));
     }
 }

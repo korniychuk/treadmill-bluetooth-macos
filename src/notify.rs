@@ -45,3 +45,11 @@ pub fn walker_away() {
 pub fn walker_resumed() {
     toast("Дорожка", "Шаги снова считаются");
 }
+
+pub fn treadmill_paused() {
+    toast("Дорожка", "Поставлена на паузу");
+}
+
+pub fn treadmill_resumed() {
+    toast("Дорожка", "Снята с паузы");
+}
