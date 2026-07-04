@@ -24,7 +24,8 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
 - `src/store.rs` — SQLite (`~/Library/Application Support/treadmill-bluetooth-macos/treadmill.db`),
   дневная статистика (шаги/дистанция/время ходьбы), restart-safe дельта-накопление.
 - `src/daemon.rs` — фоновый цикл (LaunchAgent): авто-скан/коннект/реконнект + presence + toast.
-- `src/notify.rs` — нативные macOS-уведомления через `osascript` (без Swift).
+- `src/notify.rs` — нативные macOS-уведомления (`mac-notification-sys`,
+  чистый Rust, без Swift в рантайме) с иконкой и именем "Treadmill".
 - `src/logger.rs` — сырой JSONL-лог телеметрии (source-of-truth параллельно с SQLite).
 
 ## Протокол
@@ -53,6 +54,7 @@ RUST_LOG=debug cargo run  # подробные логи (env-filter)
 
 scripts/install-daemon.sh    # собрать, подписать, поставить LaunchAgent (авто-старт при логине)
 scripts/uninstall-daemon.sh  # снять LaunchAgent (данные в Application Support не трогает)
+scripts/build-icon.sh        # перегенерировать macos/AppIcon.icns из SF Symbol (см. generate-icon.swift)
 ```
 
 ## Заметки по macOS

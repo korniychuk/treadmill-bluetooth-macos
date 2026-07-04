@@ -46,6 +46,11 @@ app_support="$HOME/Library/Application Support/treadmill-bluetooth-macos"
 log_dir="$HOME/Library/Logs/treadmill-bluetooth-macos"
 mkdir -p "$app_support" "$log_dir"
 
+# Registers the nominal "Treadmill.app" that gives toast notifications their
+# name + icon (src/notify.rs) — see that script for why this is not the
+# daemon binary itself.
+bash "$repo_root/scripts/register-notification-identity.sh"
+
 plist="$HOME/Library/LaunchAgents/${LABEL}.plist"
 mkdir -p "$(dirname "$plist")"
 cat > "$plist" <<EOF

@@ -39,6 +39,9 @@ enum Commands {
     /// stats, toast notifications. Normally installed as a LaunchAgent — see
     /// `scripts/install-daemon.sh` — but can be run in the foreground too.
     Daemon,
+    /// Fire every toast notification once, with no BLE connection required —
+    /// a smoke test for the notification pipeline (icon, identity, delivery).
+    NotifyTest,
     /// Print accumulated daily walking statistics.
     Stats {
         /// Show every recorded day instead of just today.
@@ -90,10 +93,13 @@ async fn main() -> Result<()> {
 
     let command = Cli::parse().command.unwrap_or(Commands::Scan);
 
-    // Reading stats is a pure local SQLite query — do it before touching
-    // Bluetooth at all, so it works even without an adapter present.
+    // Reading stats and firing test notifications need no Bluetooth adapter —
+    // handle them before touching Bluetooth at all.
     if let Commands::Stats { all } = command {
         return run_stats(all);
+    }
+    if let Commands::NotifyTest = command {
+        return run_notify_test();
     }
 
     let adapter = scan::first_adapter().await?;
@@ -121,7 +127,9 @@ async fn main() -> Result<()> {
             let fs = fitshow::FitShow::attach(&peripheral).await?;
             fs.set_speed_incline(kmh, incline_level).await?;
         }
-        Commands::Stats { .. } => unreachable!("handled above, before the adapter was opened"),
+        Commands::Stats { .. } | Commands::NotifyTest => {
+            unreachable!("handled above, before the adapter was opened")
+        }
     }
 
     Ok(())
@@ -160,6 +168,25 @@ async fn run_daemon(adapter: &Adapter) -> Result<()> {
     tokio::select! {
         result = daemon::run(adapter) => result?,
         _ = signal::ctrl_c() => info!("interrupted — shutting down daemon"),
+    }
+    Ok(())
+}
+
+/// Fire every toast once, spaced out so they render as separate banners
+/// instead of collapsing into one Notification Center group.
+fn run_notify_test() -> Result<()> {
+    let toasts: [(&str, fn()); 6] = [
+        ("found", notify::treadmill_found),
+        ("lost", notify::treadmill_lost),
+        ("away", notify::walker_away),
+        ("resumed (from away)", notify::walker_resumed),
+        ("paused", notify::treadmill_paused),
+        ("resumed (from pause)", notify::treadmill_resumed),
+    ];
+    for (label, send) in toasts {
+        println!("sending: {label}");
+        send();
+        std::thread::sleep(std::time::Duration::from_millis(800));
     }
     Ok(())
 }
