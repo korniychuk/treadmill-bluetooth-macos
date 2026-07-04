@@ -151,3 +151,11 @@ teardown (remote receiver may be a UART daughterboard). Both need hardware.
   round-trip confirmed via telemetry (2.5 → 2.8 → 2.5 km/h).
 - ⚠️ Standing constraint: **never touch firmware/OTA/DFU** without explicit
   operator approval.
+- 2026-07-05 (final incline verdict): operator declined extra hardware
+  (SDR/nRF dongle) — **incline over BLE is closed as impossible on this
+  firmware**. Confirmations: remote emits no BLE advertising even with the
+  base powered off; the official Yesoul app (checked live by the operator)
+  controls only speed + pause — same FTMS surface we already exceed.
+- 2026-07-05: Phase 5 logger done — full 0x2ACD decode (avg speed, kcal,
+  elapsed, vendor step counter in flag-13 slot) + JSONL workout logger
+  (`workouts/`, gitignored). 4 unit tests incl. live-captured frame.
