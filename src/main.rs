@@ -6,6 +6,7 @@
 //!
 //! Run without arguments to `scan`.
 
+mod discover;
 mod ftms;
 mod scan;
 
@@ -24,8 +25,9 @@ async fn main() -> Result<()> {
     match mode.as_str() {
         "scan" => scan::scan_and_list(&adapter).await?,
         "connect" => run_connect(&adapter).await?,
+        "discover" => run_discover(&adapter).await?,
         other => {
-            error!(mode = other, "unknown mode; use `scan` or `connect`");
+            error!(mode = other, "unknown mode; use `scan`, `connect`, or `discover`");
             std::process::exit(2);
         }
     }
@@ -44,6 +46,11 @@ async fn run_connect(adapter: &btleplug::platform::Adapter) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_discover(adapter: &btleplug::platform::Adapter) -> Result<()> {
+    let peripheral = scan::connect_treadmill(adapter).await?;
+    discover::dump_gatt(&peripheral).await
 }
 
 fn init_tracing() {

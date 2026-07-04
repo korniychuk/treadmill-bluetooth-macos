@@ -1,0 +1,174 @@
+{
+  "device_name": "YS_W2PRO_02395",
+  "peripheral_id": "2815ccff-67ed-b5cb-1ffa-2b5a665bb98e",
+  "services": [
+    {
+      "uuid": "0000180a-0000-1000-8000-00805f9b34fb",
+      "primary": true,
+      "characteristics": [
+        {
+          "uuid": "00002a23-0000-1000-8000-00805f9b34fb",
+          "properties": "read",
+          "value_hex": "2b 80 04 3b 0d e1",
+          "descriptors": []
+        },
+        {
+          "uuid": "00002a24-0000-1000-8000-00805f9b34fb",
+          "properties": "read",
+          "value_hex": "57 32 50 52 4f 00",
+          "descriptors": []
+        },
+        {
+          "uuid": "00002a25-0000-1000-8000-00805f9b34fb",
+          "properties": "read",
+          "value_hex": "54 57 32 50 52 4f 30 30 45 4b 30 31 46 34 30 32 33 39 35",
+          "descriptors": []
+        },
+        {
+          "uuid": "00002a26-0000-1000-8000-00805f9b34fb",
+          "properties": "read",
+          "value_hex": "56 33 35 37",
+          "descriptors": []
+        },
+        {
+          "uuid": "00002a27-0000-1000-8000-00805f9b34fb",
+          "properties": "read",
+          "value_hex": "53 44 43 5f 57 32 5f 42 54 5f 56 33 2e 30 33 2d 35 30 2d 35 34",
+          "descriptors": []
+        },
+        {
+          "uuid": "00002a28-0000-1000-8000-00805f9b34fb",
+          "properties": "read",
+          "value_hex": "56 30 2e 30 2e 31 5f 32 30 32 35 31 31 32 30 00",
+          "descriptors": []
+        },
+        {
+          "uuid": "00002a29-0000-1000-8000-00805f9b34fb",
+          "properties": "read",
+          "value_hex": "59 45 53 4f 55 4c 00",
+          "descriptors": []
+        }
+      ]
+    },
+    {
+      "uuid": "00001826-0000-1000-8000-00805f9b34fb",
+      "primary": true,
+      "characteristics": [
+        {
+          "uuid": "00002acc-0000-1000-8000-00805f9b34fb",
+          "properties": "read",
+          "value_hex": "45 12 00 00 01 00 00 00",
+          "descriptors": []
+        },
+        {
+          "uuid": "00002acd-0000-1000-8000-00805f9b34fb",
+          "properties": "notify",
+          "value_hex": null,
+          "descriptors": ["00002902-0000-1000-8000-00805f9b34fb"]
+        },
+        {
+          "uuid": "00002ad3-0000-1000-8000-00805f9b34fb",
+          "properties": "read|notify",
+          "value_hex": "01 0d",
+          "descriptors": ["00002902-0000-1000-8000-00805f9b34fb"]
+        },
+        {
+          "uuid": "00002ad4-0000-1000-8000-00805f9b34fb",
+          "properties": "read",
+          "value_hex": "32 00 62 02 0a 00",
+          "descriptors": []
+        },
+        {
+          "uuid": "00002ad9-0000-1000-8000-00805f9b34fb",
+          "properties": "write|indicate",
+          "value_hex": null,
+          "descriptors": ["00002902-0000-1000-8000-00805f9b34fb"]
+        },
+        {
+          "uuid": "00002ada-0000-1000-8000-00805f9b34fb",
+          "properties": "notify",
+          "value_hex": null,
+          "descriptors": ["00002902-0000-1000-8000-00805f9b34fb"]
+        },
+        {
+          "uuid": "d18d2c10-c44c-11e8-a355-529269fb1459",
+          "properties": "write",
+          "value_hex": null,
+          "descriptors": []
+        }
+      ]
+    },
+    {
+      "uuid": "0000fab0-0000-1000-8000-00805f9b34fb",
+      "primary": true,
+      "characteristics": [
+        {
+          "uuid": "0000fab1-0000-1000-8000-00805f9b34fb",
+          "properties": "write-no-rsp",
+          "value_hex": null,
+          "descriptors": []
+        },
+        {
+          "uuid": "0000fab2-0000-1000-8000-00805f9b34fb",
+          "properties": "write-no-rsp",
+          "value_hex": null,
+          "descriptors": []
+        },
+        {
+          "uuid": "0000fab3-0000-1000-8000-00805f9b34fb",
+          "properties": "notify",
+          "value_hex": null,
+          "descriptors": ["00002902-0000-1000-8000-00805f9b34fb"]
+        }
+      ]
+    },
+    {
+      "uuid": "0000ff00-0000-1000-8000-00805f9b34fb",
+      "primary": true,
+      "characteristics": [
+        {
+          "uuid": "0000ff01-0000-1000-8000-00805f9b34fb",
+          "properties": "read",
+          "value_hex": "4f 02 00 00",
+          "descriptors": []
+        }
+      ]
+    },
+    {
+      "uuid": "0000fff0-0000-1000-8000-00805f9b34fb",
+      "primary": true,
+      "characteristics": [
+        {
+          "uuid": "0000fff1-0000-1000-8000-00805f9b34fb",
+          "properties": "read",
+          "value_hex": "f0",
+          "descriptors": []
+        },
+        {
+          "uuid": "0000fff2-0000-1000-8000-00805f9b34fb",
+          "properties": "write",
+          "value_hex": null,
+          "descriptors": []
+        },
+        {
+          "uuid": "0000fff3-0000-1000-8000-00805f9b34fb",
+          "properties": "notify",
+          "value_hex": null,
+          "descriptors": ["00002902-0000-1000-8000-00805f9b34fb"]
+        },
+        {
+          "uuid": "0000fff4-0000-1000-8000-00805f9b34fb",
+          "properties": "notify",
+          "value_hex": null,
+          "descriptors": ["00002902-0000-1000-8000-00805f9b34fb"]
+        },
+        {
+          "uuid": "0000fff5-0000-1000-8000-00805f9b34fb",
+          "properties": "read",
+          "value_hex": "f0 00 00 00 00",
+          "descriptors": []
+        }
+      ]
+    }
+  ]
+}
