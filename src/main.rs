@@ -6,11 +6,12 @@
 //!
 //! Run without arguments to `scan`.
 
+mod control;
 mod discover;
 mod ftms;
 mod scan;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::signal;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -26,8 +27,21 @@ async fn main() -> Result<()> {
         "scan" => scan::scan_and_list(&adapter).await?,
         "connect" => run_connect(&adapter).await?,
         "discover" => run_discover(&adapter).await?,
+        "start" => run_command(&adapter, Command::Start).await?,
+        "stop" => run_command(&adapter, Command::Stop).await?,
+        "speed" => {
+            let kmh: f32 = std::env::args()
+                .nth(2)
+                .context("usage: speed <km/h>")?
+                .parse()
+                .context("speed must be a number, km/h")?;
+            run_command(&adapter, Command::Speed(kmh)).await?;
+        }
         other => {
-            error!(mode = other, "unknown mode; use `scan`, `connect`, or `discover`");
+            error!(
+                mode = other,
+                "unknown mode; use `scan`, `connect`, `discover`, `start`, `stop`, or `speed <kmh>`"
+            );
             std::process::exit(2);
         }
     }
@@ -51,6 +65,24 @@ async fn run_connect(adapter: &btleplug::platform::Adapter) -> Result<()> {
 async fn run_discover(adapter: &btleplug::platform::Adapter) -> Result<()> {
     let peripheral = scan::connect_treadmill(adapter).await?;
     discover::dump_gatt(&peripheral).await
+}
+
+/// A one-shot FTMS command issued over a fresh connection.
+enum Command {
+    Start,
+    Stop,
+    Speed(f32),
+}
+
+async fn run_command(adapter: &btleplug::platform::Adapter, command: Command) -> Result<()> {
+    let peripheral = scan::connect_treadmill(adapter).await?;
+    let controller = control::Controller::take_control(&peripheral).await?;
+    match command {
+        Command::Start => controller.start().await?,
+        Command::Stop => controller.stop().await?,
+        Command::Speed(kmh) => controller.set_speed(kmh).await?,
+    }
+    Ok(())
 }
 
 fn init_tracing() {
