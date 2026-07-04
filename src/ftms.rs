@@ -35,10 +35,19 @@ pub const FITNESS_MACHINE_STATUS: Uuid = Uuid::from_u128(0x00002ada_0000_1000_80
 pub struct TreadmillData {
     /// Instantaneous speed, km/h.
     pub speed_kmh: Option<f32>,
+    /// Average speed, km/h.
+    pub avg_speed_kmh: Option<f32>,
     /// Instantaneous incline, percent.
     pub incline_percent: Option<f32>,
     /// Total distance, meters.
     pub total_distance_m: Option<u32>,
+    /// Total expended energy, kcal.
+    pub total_energy_kcal: Option<u16>,
+    /// Elapsed workout time, seconds.
+    pub elapsed_s: Option<u16>,
+    /// Step count — Yesoul vendor extension carried in the flag-13 slot
+    /// (officially RFU in FTMS 1.0); verified live against the W2 Pro console.
+    pub steps: Option<u32>,
 }
 
 /// Flag bits of the Treadmill Data packet (GATT Specification Supplement).
@@ -48,6 +57,17 @@ mod flags {
     pub const AVG_SPEED_PRESENT: u16 = 1 << 1;
     pub const TOTAL_DISTANCE_PRESENT: u16 = 1 << 2;
     pub const INCLINATION_PRESENT: u16 = 1 << 3;
+    pub const ELEVATION_GAIN_PRESENT: u16 = 1 << 4;
+    pub const INSTANT_PACE_PRESENT: u16 = 1 << 5;
+    pub const AVG_PACE_PRESENT: u16 = 1 << 6;
+    pub const ENERGY_PRESENT: u16 = 1 << 7;
+    pub const HEART_RATE_PRESENT: u16 = 1 << 8;
+    pub const MET_PRESENT: u16 = 1 << 9;
+    pub const ELAPSED_TIME_PRESENT: u16 = 1 << 10;
+    pub const REMAINING_TIME_PRESENT: u16 = 1 << 11;
+    pub const FORCE_POWER_PRESENT: u16 = 1 << 12;
+    /// RFU in the spec; Yesoul uses it for a uint24 step counter.
+    pub const VENDOR_STEPS_PRESENT: u16 = 1 << 13;
 }
 
 /// Parse a raw Treadmill Data (`0x2ACD`) notification payload.
@@ -73,8 +93,9 @@ pub fn parse_treadmill_data(payload: &[u8]) -> Option<TreadmillData> {
     }
 
     if flags & flags::AVG_SPEED_PRESENT != 0 {
-        // Average Speed (uint16, 0.01 km/h) — skipped for now.
-        read_u16(payload, &mut cursor)?;
+        let raw = read_u16(payload, &mut cursor)?;
+        // Unit: 0.01 km/h.
+        data.avg_speed_kmh = Some(raw as f32 * 0.01);
     }
 
     if flags & flags::TOTAL_DISTANCE_PRESENT != 0 {
@@ -90,7 +111,61 @@ pub fn parse_treadmill_data(payload: &[u8]) -> Option<TreadmillData> {
         read_i16(payload, &mut cursor)?; // Ramp Angle Setting.
     }
 
+    if flags & flags::ELEVATION_GAIN_PRESENT != 0 {
+        read_u16(payload, &mut cursor)?; // Positive Elevation Gain.
+        read_u16(payload, &mut cursor)?; // Negative Elevation Gain.
+    }
+
+    if flags & flags::INSTANT_PACE_PRESENT != 0 {
+        read_u8(payload, &mut cursor)?;
+    }
+
+    if flags & flags::AVG_PACE_PRESENT != 0 {
+        read_u8(payload, &mut cursor)?;
+    }
+
+    if flags & flags::ENERGY_PRESENT != 0 {
+        let total = read_u16(payload, &mut cursor)?;
+        // 0xFFFF means "data not available" per spec.
+        if total != u16::MAX {
+            data.total_energy_kcal = Some(total);
+        }
+        read_u16(payload, &mut cursor)?; // Energy Per Hour.
+        read_u8(payload, &mut cursor)?; // Energy Per Minute.
+    }
+
+    if flags & flags::HEART_RATE_PRESENT != 0 {
+        read_u8(payload, &mut cursor)?;
+    }
+
+    if flags & flags::MET_PRESENT != 0 {
+        read_u8(payload, &mut cursor)?;
+    }
+
+    if flags & flags::ELAPSED_TIME_PRESENT != 0 {
+        data.elapsed_s = Some(read_u16(payload, &mut cursor)?);
+    }
+
+    if flags & flags::REMAINING_TIME_PRESENT != 0 {
+        read_u16(payload, &mut cursor)?;
+    }
+
+    if flags & flags::FORCE_POWER_PRESENT != 0 {
+        read_i16(payload, &mut cursor)?; // Force on Belt.
+        read_i16(payload, &mut cursor)?; // Power Output.
+    }
+
+    if flags & flags::VENDOR_STEPS_PRESENT != 0 {
+        data.steps = Some(read_u24(payload, &mut cursor)?);
+    }
+
     Some(data)
+}
+
+fn read_u8(buf: &[u8], cursor: &mut usize) -> Option<u8> {
+    let byte = *buf.get(*cursor)?;
+    *cursor += 1;
+    Some(byte)
 }
 
 fn read_u16(buf: &[u8], cursor: &mut usize) -> Option<u16> {
@@ -141,5 +216,31 @@ mod tests {
     #[test]
     fn rejects_truncated_payload() {
         assert!(parse_treadmill_data(&[0x00]).is_none());
+    }
+
+    #[test]
+    fn parses_real_w2pro_frame() {
+        // Captured live from a YS_W2PRO_02395: flags 0x2486 = avg speed,
+        // distance, energy, elapsed time, vendor steps (bit 13).
+        let payload = [
+            0x86, 0x24, // flags
+            0xfa, 0x00, // speed 2.50 km/h
+            0xd9, 0x00, // avg speed 2.17 km/h
+            0xa6, 0x05, 0x00, // distance 1446 m
+            0x55, 0x00, // total energy 85 kcal
+            0xff, 0xff, // energy/hour: not available
+            0xff, // energy/min: not available
+            0x57, 0x09, // elapsed 2391 s
+            0xf3, 0x0d, 0x00, // steps 3571
+        ];
+        let data = parse_treadmill_data(&payload).expect("should parse");
+        assert_eq!(data.speed_kmh, Some(2.5));
+        let avg = data.avg_speed_kmh.expect("avg speed present");
+        assert!((avg - 2.17).abs() < 1e-4, "avg speed {avg} != ~2.17");
+        assert_eq!(data.total_distance_m, Some(1446));
+        assert_eq!(data.total_energy_kcal, Some(85));
+        assert_eq!(data.elapsed_s, Some(2391));
+        assert_eq!(data.steps, Some(3571));
+        assert_eq!(data.incline_percent, None);
     }
 }

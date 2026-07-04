@@ -14,6 +14,7 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::ftms;
+use crate::logger::WorkoutLogger;
 
 /// How long to scan before giving up on finding a treadmill.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(15);
@@ -176,17 +177,22 @@ pub async fn stream_treadmill_data(peripheral: &Peripheral) -> Result<()> {
         .notifications()
         .await
         .context("open notification stream")?;
+    let mut logger = WorkoutLogger::create()?;
 
     while let Some(notification) = notifications.next().await {
         if notification.uuid != ftms::TREADMILL_DATA {
             continue;
         }
         match ftms::parse_treadmill_data(&notification.value) {
-            Some(data) => info!(?data, "treadmill data"),
+            Some(data) => {
+                info!(?data, "treadmill data");
+                logger.log(&data)?;
+            }
             None => warn!(bytes = ?notification.value, "undecodable treadmill frame"),
         }
     }
 
+    logger.finish();
     warn!("notification stream ended (device disconnected?)");
     Ok(())
 }

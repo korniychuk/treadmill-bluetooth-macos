@@ -10,6 +10,7 @@ mod control;
 mod discover;
 mod fitshow;
 mod ftms;
+mod logger;
 mod scan;
 mod sniff;
 
