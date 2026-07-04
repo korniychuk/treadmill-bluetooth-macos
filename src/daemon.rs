@@ -10,8 +10,16 @@
 //! Caveat: while this daemon holds the BLE connection, the official Yesoul
 //! phone app cannot also connect (a peripheral serves one central at a time).
 //! The physical remote is a separate RF link, so operator control is
-//! unaffected. Caveat: a "lost" toast lags the real power-off by however long
-//! the BLE supervision timeout takes to expire — expected, not a bug.
+//! unaffected.
+//!
+//! Disconnect detection does *not* rely on CoreBluetooth's own disconnect
+//! event or the notification stream ending: a hard power-off (unplugging the
+//! belt) was observed live to leave both silent indefinitely — the BLE
+//! supervision timeout that would eventually fire a real disconnect event can
+//! take arbitrarily long, and btleplug/CoreBluetooth gave no other signal.
+//! Instead, `NOTIFICATION_TIMEOUT` bounds how long we wait for the next
+//! `0x2ACD` sample (which the device sends ~1/s whenever connected, even at
+//! rest) before treating the link as lost ourselves.
 
 use std::time::Duration;
 
@@ -32,6 +40,12 @@ use crate::store::{RawDeltas, Store};
 /// Delay before retrying discovery after a scan/connect failure, so a
 /// transient Bluetooth hiccup does not spin the CPU in a tight loop.
 const RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// How long to wait for the next Treadmill Data sample before treating the
+/// link as lost. The device streams ~1/s even while stationary, so this
+/// leaves generous margin above normal jitter while still catching a hard
+/// power-off well before a human would otherwise notice.
+const NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Run the daemon forever: scan → connect → stream with presence tracking →
 /// on disconnect, toast and go back to scanning.
@@ -67,7 +81,15 @@ async fn stream_with_presence(peripheral: &Peripheral) -> Result<()> {
     // instant a sample arrives.
     let mut pending = PendingCredit::default();
 
-    while let Some(notification) = notifications.next().await {
+    loop {
+        let notification = match tokio::time::timeout(NOTIFICATION_TIMEOUT, notifications.next()).await {
+            Ok(Some(notification)) => notification,
+            Ok(None) => break, // stream closed cleanly (rare, but handle it)
+            Err(_) => {
+                warn!(timeout_s = NOTIFICATION_TIMEOUT.as_secs(), "no telemetry received — treating as disconnected");
+                break;
+            }
+        };
         if notification.uuid != ftms::TREADMILL_DATA {
             continue;
         }

@@ -45,7 +45,8 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
 cargo run             # = scan: перечислить BLE-устройства рядом (диагностика)
 cargo run -- connect  # подключиться к первой FTMS-дорожке и стримить данные
 cargo run -- daemon    # фоновый режим: авто-коннект + presence + toast (для интерактивной проверки)
-cargo run -- stats     # статистика за сегодня; `stats all` — за все дни
+cargo run -- stats     # статистика за сегодня; `stats --all` — за все дни
+cargo run -- --help    # полный список команд
 cargo test             # юнит-тесты
 cargo clippy           # линт
 RUST_LOG=debug cargo run  # подробные логи (env-filter)

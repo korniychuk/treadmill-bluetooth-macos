@@ -31,25 +31,25 @@ fn escape(s: &str) -> String {
 }
 
 pub fn treadmill_found() {
-    toast("Дорожка", "Обнаружена и подключена");
+    toast("Treadmill", "Discovered and connected");
 }
 
 pub fn treadmill_lost() {
-    toast("Дорожка", "Соединение потеряно (выключена?)");
+    toast("Treadmill", "Connection lost (powered off?)");
 }
 
 pub fn walker_away() {
-    toast("Дорожка", "Лента крутится, но шаги не считаются — вы ушли?");
+    toast("Treadmill", "Belt is running but steps aren't counting — did you step off?");
 }
 
 pub fn walker_resumed() {
-    toast("Дорожка", "Шаги снова считаются");
+    toast("Treadmill", "Steps are counting again");
 }
 
 pub fn treadmill_paused() {
-    toast("Дорожка", "Поставлена на паузу");
+    toast("Treadmill", "Paused");
 }
 
 pub fn treadmill_resumed() {
-    toast("Дорожка", "Снята с паузы");
+    toast("Treadmill", "Resumed");
 }
