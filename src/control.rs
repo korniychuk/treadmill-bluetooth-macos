@@ -20,6 +20,7 @@ use crate::ftms;
 mod opcode {
     pub const REQUEST_CONTROL: u8 = 0x00;
     pub const SET_TARGET_SPEED: u8 = 0x02;
+    pub const SET_TARGET_INCLINATION: u8 = 0x03;
     pub const START_RESUME: u8 = 0x07;
     pub const STOP_PAUSE: u8 = 0x08;
     /// Prefix of every Control Point response indication.
@@ -77,6 +78,19 @@ impl<'a> Controller<'a> {
         // FTMS encodes speed as uint16 in units of 0.01 km/h, little-endian.
         let raw = (kmh * 100.0).round() as u16;
         self.execute(opcode::SET_TARGET_SPEED, &raw.to_le_bytes()).await
+    }
+
+    /// Set target inclination in percent (FTMS sint16, 0.1 % units).
+    ///
+    /// The W2 Pro's Feature bitmap advertises no inclination target support —
+    /// this exists to empirically probe whether the machine rejects the opcode
+    /// (expected result 0x02 = "Op Code not supported").
+    pub async fn set_incline(&self, percent: f32) -> Result<()> {
+        if !(-10.0..=15.0).contains(&percent) {
+            bail!("incline {percent}% out of sane range");
+        }
+        let raw = (percent * 10.0).round() as i16;
+        self.execute(opcode::SET_TARGET_INCLINATION, &raw.to_le_bytes()).await
     }
 
     /// Write `[op, params...]` and wait for the `[0x80, op, result]` indication.

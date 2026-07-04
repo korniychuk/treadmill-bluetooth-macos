@@ -37,10 +37,18 @@ async fn main() -> Result<()> {
                 .context("speed must be a number, km/h")?;
             run_command(&adapter, Command::Speed(kmh)).await?;
         }
+        "incline" => {
+            let percent: f32 = std::env::args()
+                .nth(2)
+                .context("usage: incline <percent>")?
+                .parse()
+                .context("incline must be a number, percent")?;
+            run_command(&adapter, Command::Incline(percent)).await?;
+        }
         other => {
             error!(
                 mode = other,
-                "unknown mode; use `scan`, `connect`, `discover`, `start`, `stop`, or `speed <kmh>`"
+                "unknown mode; use `scan`, `connect`, `discover`, `start`, `stop`, `speed <kmh>`, or `incline <pct>`"
             );
             std::process::exit(2);
         }
@@ -72,6 +80,7 @@ enum Command {
     Start,
     Stop,
     Speed(f32),
+    Incline(f32),
 }
 
 async fn run_command(adapter: &btleplug::platform::Adapter, command: Command) -> Result<()> {
@@ -81,6 +90,7 @@ async fn run_command(adapter: &btleplug::platform::Adapter, command: Command) ->
         Command::Start => controller.start().await?,
         Command::Stop => controller.stop().await?,
         Command::Speed(kmh) => controller.set_speed(kmh).await?,
+        Command::Incline(percent) => controller.set_incline(percent).await?,
     }
     Ok(())
 }
