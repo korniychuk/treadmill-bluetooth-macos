@@ -10,14 +10,21 @@
 # `workouts/` JSONL logger (see src/logger.rs) lands next to it instead of
 # under launchd's default cwd ("/"), which is not writable.
 #
+# Signs with the local self-signed "AnKor Treadmill BLE Dev" code-signing
+# identity by default (see `docs/tasks/002-macos-bluetooth-permission.md` for
+# how it was created) — its designated requirement pins to the certificate,
+# not the binary's cdhash, so rebuilds keep the same TCC identity and the
+# Bluetooth permission prompt does not reappear. Override with IDENTITY=- for
+# a plain ad-hoc signature, or IDENTITY="Other Cert Name" for a different one.
+#
 #   scripts/install-daemon.sh
-#   IDENTITY="Treadmill BLE" scripts/install-daemon.sh   # rebuild-stable signing identity
+#   IDENTITY="-" scripts/install-daemon.sh   # ad-hoc — re-prompts every rebuild
 set -euo pipefail
 
 readonly BUNDLE_ID="com.korniychuk.treadmill-bluetooth-macos"
 readonly LABEL="${BUNDLE_ID}.daemon"
 readonly BIN_NAME="treadmill-bluetooth-macos"
-IDENTITY="${IDENTITY:--}"
+IDENTITY="${IDENTITY:-AnKor Treadmill BLE Dev}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"

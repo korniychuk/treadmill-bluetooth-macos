@@ -12,18 +12,19 @@
 #   scripts/run.sh                # scan (default)
 #   scripts/run.sh connect        # connect + stream
 #   PROFILE=release scripts/run.sh connect
-#   IDENTITY="Treadmill BLE" scripts/run.sh    # sign with a stable self-signed cert
+#   IDENTITY="-" scripts/run.sh    # ad-hoc — re-prompts every rebuild
 #
-# IDENTITY defaults to ad-hoc ("-"): enough to test that attribution works, but
-# the signature's cdhash changes each rebuild, so macOS re-prompts after a
-# rebuild. Create a self-signed *code-signing* cert in Keychain Access once and
-# pass its name via IDENTITY to get a rebuild-stable identity (prompt only once).
+# IDENTITY defaults to the local self-signed "AnKor Treadmill BLE Dev"
+# code-signing cert (see docs/tasks/002) — its designated requirement pins to
+# the certificate, not the binary's cdhash, so rebuilds keep the same TCC
+# identity and macOS does not re-prompt for Bluetooth. Ad-hoc ("-") is enough
+# to test that attribution works, but re-prompts on every rebuild.
 set -euo pipefail
 
 readonly BUNDLE_ID="com.korniychuk.treadmill-bluetooth-macos"
 readonly BIN_NAME="treadmill-bluetooth-macos"
 PROFILE="${PROFILE:-debug}"
-IDENTITY="${IDENTITY:--}"
+IDENTITY="${IDENTITY:-AnKor Treadmill BLE Dev}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"

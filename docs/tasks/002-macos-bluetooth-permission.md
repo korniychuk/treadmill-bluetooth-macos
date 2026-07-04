@@ -39,16 +39,31 @@ First run → macOS shows the one-time Bluetooth prompt → approve.
 - [x] `codesign -dv` → `Identifier=com.korniychuk.treadmill-bluetooth-macos`.
 - [ ] **Check A (attribution):** run once, approve. System Settings → Privacy &
       Security → Bluetooth lists **treadmill-bluetooth-macos**, not the terminal.
-- [ ] **Check B (persistence):** rebuild + run again.
-  - Silent (no re-prompt) → **done, no cert needed.**
-  - Re-prompts → create a self-signed **code-signing** cert in Keychain Access
-    (Certificate Assistant → Create a Certificate → Self-Signed Root, Code
-    Signing) and run with `IDENTITY="<cert name>"` — its DR is rebuild-stable.
+- [x] **Check B (persistence):** confirmed re-prompting on every daemon
+      rebuild during 005's development (operator noticed live). Fixed
+      2026-07-05: generated a local self-signed code-signing certificate,
+      CN "AnKor Treadmill BLE Dev" (org "AnKor"), via `openssl req -x509`
+      (RSA 2048, `extendedKeyUsage=codeSigning`) + `security import ...
+      -T /usr/bin/codesign` into the login keychain — operator approved this
+      keychain write explicitly (the auto-mode classifier blocked the first,
+      unauthorized attempt). `openssl pkcs12 -export` needed `-legacy`
+      (OpenSSL 3.x's default MAC/cipher isn't what macOS's `security import`
+      expects). Verified: `codesign -d -r-` now shows
+      `designated => identifier "com.korniychuk.treadmill-bluetooth-macos"
+      and certificate root = H"<cert hash>"` — pinned to the certificate, not
+      a per-build cdhash. `scripts/install-daemon.sh` and `scripts/run.sh`
+      default `IDENTITY` to this cert name now.
 
 ## Notes
 
-- Ad-hoc signature's cdhash changes each rebuild → TCC may re-prompt. That is
-  the expected trigger for adding the self-signed cert (Check B).
+- Ad-hoc signature's cdhash changes each rebuild → TCC re-prompts every time
+  (confirmed, not just theoretical — see Check B). The self-signed cert fixes
+  this because its designated requirement anchors on the certificate itself.
+- `security find-identity -v -p codesigning` reports the self-signed identity
+  as `0 valid identities` / `CSSMERR_TP_NOT_TRUSTED` (expected — no trust
+  chain to a root). `codesign --sign "<name>"` still works: producing a
+  signature does not require the signing cert to be trusted, only present
+  (cert + private key) in the keychain.
 - To re-arm the prompt while testing:
   `tccutil reset Bluetooth com.korniychuk.treadmill-bluetooth-macos`.
 - Plain `cargo run` still works but is unsigned → attributed to the terminal;
