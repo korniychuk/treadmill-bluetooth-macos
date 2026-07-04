@@ -1,6 +1,6 @@
 # 003 — Yesoul W2 Pro: BLE protocol reverse-engineering & controller
 
-**Status:** planned (not started — do NOT implement yet)
+**Status:** in progress — Phases 1–2 done, core control (Phase 4/5 subset) done & hardware-verified; Phase 3 (vendor capture) and logger/CLI polish remain
 **Source:** external agent prompt, recorded verbatim-in-intent on 2026-07-04.
 **Depends on:** [001](001-verify-treadmill-on-hardware.md) (does the device speak
 FTMS?), [002](002-macos-bluetooth-permission.md) (Bluetooth permission).
@@ -113,8 +113,22 @@ already-pinned versions and the global `~`-only version policy before adopting:
 
 ## Open questions (resolve before impl)
 
-- FTMS vs proprietary Yesoul service? (blocks Phase 4 design) → answered by 001.
+- ~~FTMS vs proprietary Yesoul service?~~ → **RESOLVED 2026-07-05: standard
+  FTMS confirmed on hardware** (see research/001 hardware-verified section).
+- ~~Incline control?~~ → **RESOLVED: no motorized incline over FTMS** —
+  op 0x03 rejected with 0x04, no 0x2AD5, no feature bit.
 - Steps: does W2 Pro even expose step count over BLE, or only speed/distance?
+  (Telemetry so far: speed + total distance only → likely vendor notify.)
 - LED-off command: standard FTMS has no LED control → almost certainly a
-  vendor-specific write; needs Phase 3 capture.
+  vendor-specific write (`d18d2c10-…` or `0xFAB0`/`0xFFF0`); needs Phase 3 capture.
 - Units (km/h vs mph) source of truth: device setting vs app-side conversion?
+
+## Progress log
+
+- 2026-07-05: Phase 1 research synthesized (research/001). Phase 2 GATT dump
+  captured (research/gatt-snapshot.json). Implemented & hardware-verified:
+  `scan`, `connect` (telemetry stream), `discover`, `start`, `stop`,
+  `speed <kmh>`, `incline <pct>` (probe; device rejects). Speed change
+  round-trip confirmed via telemetry (2.5 → 2.8 → 2.5 km/h).
+- ⚠️ Standing constraint: **never touch firmware/OTA/DFU** without explicit
+  operator approval.

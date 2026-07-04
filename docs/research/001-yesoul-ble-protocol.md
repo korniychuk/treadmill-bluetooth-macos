@@ -1,5 +1,27 @@
 # Yesoul W2 Pro Treadmill — BLE Protocol Research Synthesis
 
+> ## ⚡ HARDWARE-VERIFIED FINDINGS (2026-07-05, unit `YS_W2PRO_02395`)
+>
+> Live tests on the real device supersede the UNVERIFIED markers below:
+>
+> - **FTMS confirmed.** Advertises `0x1826`; full GATT in
+>   [`gatt-snapshot.json`](gatt-snapshot.json). DIS: model `W2PRO`,
+>   FW `SDC_W2_BT_V3.03-50-54`, manufacturer `YESOUL`.
+> - **Telemetry works:** `0x2ACD` notifies ~2/s; speed (0.01 km/h) +
+>   total distance (uint24 m) decoded live. No inclination field.
+> - **Control works:** `0x2AD9` RequestControl (0x00) → success;
+>   SetTargetSpeed (0x02) → success, belt speed verified via telemetry.
+> - **No incline over FTMS:** SetTargetInclination (0x03) → result `0x04`
+>   Operation Failed; no `0x2AD5` char; no Inclination Target feature bit.
+> - **Speed range (`0x2AD4`):** 0.50–6.10 km/h, step 0.1.
+> - **Feature (`0x2ACC`)** = `45 12 00 00 | 01 00 00 00` — only Speed Target
+>   supported for control.
+> - **Vendor surface for Phase 3:** char `d18d2c10-c44c-11e8-a355-529269fb1459`
+>   (write) inside FTMS service; services `0xFAB0`, `0xFF00`, `0xFFF0`
+>   (`0xFFF1` read=`f0`, `0xFFF2` write, `0xFFF3`/`0xFFF4` notify) — candidates
+>   for LED control etc. ⚠️ Do NOT write to anything OTA/DFU-like — firmware
+>   changes are forbidden without explicit operator approval.
+
 ## 1. Executive Summary — FTMS vs Proprietary Likelihood
 
 **Verdict: treat the W2 Pro as standard FTMS (`0x1826`) until a real capture proves otherwise — high confidence, but not directly verified on this exact model.**
