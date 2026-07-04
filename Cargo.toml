@@ -1,0 +1,17 @@
+[package]
+name = "treadmill-bluetooth-macos"
+version = "0.1.0"
+edition = "2024"
+description = "macOS Bluetooth Low Energy connector for a Yesoul treadmill"
+license = "MIT"
+repository = "https://github.com/korniychuk/treadmill-bluetooth-macos"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0.103"
+btleplug = "0.12.0"
+futures = "0.3.32"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = "1.23.4"
