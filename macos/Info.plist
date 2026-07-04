@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.korniychuk.treadmill-bluetooth-macos</string>
+	<key>CFBundleName</key>
+	<string>Treadmill BLE</string>
+	<key>CFBundleExecutable</key>
+	<string>treadmill-bluetooth-macos</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<!-- macOS shows this string in the one-time Bluetooth permission prompt.
+	     Without this key, creating a CBCentralManager terminates the process. -->
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Нужен доступ к Bluetooth, чтобы находить беговую дорожку Yesoul и читать телеметрию.</string>
+</dict>
+</plist>
