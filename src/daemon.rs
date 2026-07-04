@@ -33,6 +33,7 @@ use std::time::Duration;
 use anyhow::Result;
 use btleplug::api::Peripheral as _;
 use btleplug::platform::{Adapter, Peripheral};
+use chrono::Utc;
 use futures::StreamExt;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
@@ -89,10 +90,11 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
 
 async fn stream_with_presence(peripheral: &Peripheral) -> Result<()> {
     scan::subscribe_treadmill_data(peripheral).await?;
+    scan::subscribe_treadmill_status(peripheral).await?;
     let mut notifications = peripheral.notifications().await?;
 
     let mut store = Store::open()?;
-    store.start_session()?;
+    let session_id = store.start_session()?;
     let mut logger = WorkoutLogger::create()?;
     let mut presence = PresenceTracker::new();
     // Distance/time seen since the last *confirmed* step, not yet credited to
@@ -109,6 +111,16 @@ async fn stream_with_presence(peripheral: &Peripheral) -> Result<()> {
                 break;
             }
         };
+        if notification.uuid == ftms::FITNESS_MACHINE_STATUS {
+            let ts_ms = Utc::now().timestamp_millis();
+            if let Some(&event_code) = notification.value.first() {
+                info!(event = ftms::describe_status_event(event_code), code = event_code, "machine status event");
+                store.insert_status_event(session_id, ts_ms, event_code, &notification.value)?;
+            } else {
+                warn!("empty Fitness Machine Status frame");
+            }
+            continue;
+        }
         if notification.uuid != ftms::TREADMILL_DATA {
             continue;
         }
@@ -117,6 +129,7 @@ async fn stream_with_presence(peripheral: &Peripheral) -> Result<()> {
             continue;
         };
         logger.log(&data)?;
+        store.insert_raw_sample(session_id, Utc::now().timestamp_millis(), &data, &notification.value)?;
 
         let deltas = store.advance_baseline(data.steps, data.total_distance_m, data.elapsed_s)?;
 

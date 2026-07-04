@@ -176,6 +176,24 @@ pub async fn subscribe_treadmill_data(peripheral: &Peripheral) -> Result<()> {
     Ok(())
 }
 
+/// Subscribe to Fitness Machine Status (`0x2ADA`) notifications, if the
+/// characteristic exists — not every FTMS device implements it, so this is
+/// best-effort and returns `false` (not an error) when it's missing.
+pub async fn subscribe_treadmill_status(peripheral: &Peripheral) -> Result<bool> {
+    let Some(characteristic) = peripheral.characteristics().into_iter().find(|c| c.uuid == ftms::FITNESS_MACHINE_STATUS)
+    else {
+        warn!("Fitness Machine Status characteristic (0x2ADA) not present on this device — status events won't be logged");
+        return Ok(false);
+    };
+
+    peripheral
+        .subscribe(&characteristic)
+        .await
+        .context("subscribe to Fitness Machine Status")?;
+    info!("subscribed to Fitness Machine Status notifications");
+    Ok(true)
+}
+
 /// Subscribe to Treadmill Data notifications and log decoded frames until the
 /// stream ends (device disconnects) or the task is cancelled.
 pub async fn stream_treadmill_data(peripheral: &Peripheral) -> Result<()> {

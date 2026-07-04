@@ -25,6 +25,8 @@ use anyhow::{Context, Result};
 use chrono::{Local, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::ftms::TreadmillData;
+
 /// Aggregated totals for a single calendar day (local time).
 #[derive(Debug, Clone, Default)]
 pub struct DailyStats {
@@ -90,19 +92,41 @@ impl Store {
                     last_distance_m INTEGER,
                     last_elapsed_s INTEGER
                 );
+                CREATE TABLE IF NOT EXISTS raw_samples (
+                    id INTEGER PRIMARY KEY,
+                    session_id INTEGER NOT NULL REFERENCES sessions(id),
+                    ts_ms INTEGER NOT NULL,
+                    speed_centikmh INTEGER,
+                    avg_speed_centikmh INTEGER,
+                    distance_m INTEGER,
+                    energy_kcal INTEGER,
+                    elapsed_s INTEGER,
+                    steps INTEGER,
+                    raw_frame BLOB NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_raw_samples_session ON raw_samples(session_id);
+                CREATE TABLE IF NOT EXISTS status_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id INTEGER NOT NULL REFERENCES sessions(id),
+                    ts_ms INTEGER NOT NULL,
+                    event_code INTEGER NOT NULL,
+                    raw_frame BLOB NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_status_events_session ON status_events(session_id);
                 ",
             )
             .context("run schema migration")?;
         Ok(())
     }
 
-    /// Record the start of a new BLE connection to the treadmill.
-    pub fn start_session(&self) -> Result<()> {
+    /// Record the start of a new BLE connection to the treadmill. Returns the
+    /// new session id, used to tag `raw_samples`/`status_events` rows.
+    pub fn start_session(&self) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
         self.conn
             .execute("INSERT INTO sessions (started_at, ended_at) VALUES (?1, NULL)", params![now])
             .context("insert session")?;
-        Ok(())
+        Ok(self.conn.last_insert_rowid())
     }
 
     /// Close the most recently opened session (on disconnect).
@@ -182,6 +206,52 @@ impl Store {
                 params![today, distance_m, steps, walking_time_s],
             )
             .context("credit daily_stats")?;
+        Ok(())
+    }
+
+    /// Persist one decoded Treadmill Data (`0x2ACD`) sample verbatim.
+    ///
+    /// Structured columns use the *wire* scale (e.g. `speed_centikmh`, the raw
+    /// 0.01 km/h unit the device sends) rather than a decoded `f32` — integer
+    /// affinity stores small values in 1-3 bytes, where SQLite's `REAL` always
+    /// takes 8, and it sidesteps float round-tripping entirely. `raw_frame`
+    /// keeps the exact bytes alongside the decode, so a future protocol
+    /// discovery (e.g. this device starting to set a flag bit we don't parse
+    /// yet) can be recovered from history instead of lost.
+    pub fn insert_raw_sample(&self, session_id: i64, ts_ms: i64, sample: &TreadmillData, raw_frame: &[u8]) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO raw_samples
+                    (session_id, ts_ms, speed_centikmh, avg_speed_centikmh, distance_m, energy_kcal, elapsed_s, steps, raw_frame)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    session_id,
+                    ts_ms,
+                    sample.speed_kmh.map(|v| (v * 100.0).round() as i64),
+                    sample.avg_speed_kmh.map(|v| (v * 100.0).round() as i64),
+                    sample.total_distance_m.map(|v| v as i64),
+                    sample.total_energy_kcal.map(|v| v as i64),
+                    sample.elapsed_s.map(|v| v as i64),
+                    sample.steps.map(|v| v as i64),
+                    raw_frame,
+                ],
+            )
+            .context("insert raw_samples row")?;
+        Ok(())
+    }
+
+    /// Persist one Fitness Machine Status (`0x2ADA`) event verbatim.
+    ///
+    /// `event_code` is the raw FTMS op code (first byte); its human-readable
+    /// meaning lives in `ftms::describe_status_event` (code, not a DB column)
+    /// so the mapping has one source of truth instead of drifting copies.
+    pub fn insert_status_event(&self, session_id: i64, ts_ms: i64, event_code: u8, raw_frame: &[u8]) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO status_events (session_id, ts_ms, event_code, raw_frame) VALUES (?1, ?2, ?3, ?4)",
+                params![session_id, ts_ms, event_code, raw_frame],
+            )
+            .context("insert status_events row")?;
         Ok(())
     }
 

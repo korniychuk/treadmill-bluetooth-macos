@@ -22,9 +22,44 @@ pub const TREADMILL_DATA: Uuid = Uuid::from_u128(0x00002acd_0000_1000_8000_00805
 pub const FITNESS_MACHINE_CONTROL_POINT: Uuid =
     Uuid::from_u128(0x00002ad9_0000_1000_8000_00805f9b34fb);
 
-/// Fitness Machine Status — `0x2ADA` (notify). Reserved for future use.
-#[allow(dead_code)]
+/// Fitness Machine Status — `0x2ADA` (notify). Device-initiated events
+/// (start/stop/pause by the operator's own remote, target changes) —
+/// independent of and a cross-check against our own speed/steps-derived
+/// presence heuristic.
 pub const FITNESS_MACHINE_STATUS: Uuid = Uuid::from_u128(0x00002ada_0000_1000_8000_00805f9b34fb);
+
+/// Human-readable name for a Fitness Machine Status op code (first byte of
+/// the `0x2ADA` payload), for logging only — the raw code is what's persisted.
+///
+/// Spec: GATT Specification Supplement, Fitness Machine Service, Machine
+/// Status Op Code.
+pub fn describe_status_event(event_code: u8) -> &'static str {
+    match event_code {
+        0x01 => "Reset",
+        0x02 => "StoppedOrPausedByUser",
+        0x03 => "StoppedBySafetyKey",
+        0x04 => "StartedOrResumedByUser",
+        0x05 => "TargetSpeedChanged",
+        0x06 => "TargetInclineChanged",
+        0x07 => "TargetResistanceLevelChanged",
+        0x08 => "TargetPowerChanged",
+        0x09 => "TargetHeartRateChanged",
+        0x0a => "TargetedExpendedEnergyChanged",
+        0x0b => "TargetedNumberOfStepsChanged",
+        0x0c => "TargetedNumberOfStridesChanged",
+        0x0d => "TargetedDistanceChanged",
+        0x0e => "TargetedTrainingTimeChanged",
+        0x0f => "TargetedTimeInTwoHeartRateZonesChanged",
+        0x10 => "TargetedTimeInThreeHeartRateZonesChanged",
+        0x11 => "TargetedTimeInFiveHeartRateZonesChanged",
+        0x12 => "IndoorBikeSimulationParametersChanged",
+        0x13 => "WheelCircumferenceChanged",
+        0x14 => "SpinDownStatus",
+        0x15 => "TargetedCadenceChanged",
+        0xff => "ControlPermissionLost",
+        _ => "Unknown",
+    }
+}
 
 /// A single decoded Treadmill Data notification.
 ///
