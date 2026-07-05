@@ -4,6 +4,7 @@
 //! devices) is the default when no subcommand is given.
 
 mod control;
+mod control_command;
 mod daemon;
 mod discover;
 mod fitshow;
@@ -18,14 +19,17 @@ mod sniff;
 mod store;
 
 use std::io::IsTerminal;
+use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use btleplug::platform::Adapter;
 use chrono::{DateTime, Local, Utc};
 use clap::{Parser, Subcommand};
 use tokio::signal;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+
+use crate::control_command::ControlCommand;
 
 #[derive(Parser)]
 #[command(name = "treadmill-bluetooth-macos", version, about = "macOS BLE connector for a Yesoul treadmill")]
@@ -126,15 +130,25 @@ async fn main() -> Result<()> {
     if let Commands::NotifyTest = command {
         return run_notify_test();
     }
+    // Control commands route through the daemon's queue when it holds the BLE
+    // link (two processes can't co-own the connection — задача 013), and only
+    // fall back to a direct connection when the daemon is off. Handled here,
+    // before the adapter is opened, so the enqueue path never touches BLE.
+    if let Commands::Start = command {
+        return run_control(ControlCommand::Start).await;
+    }
+    if let Commands::Stop = command {
+        return run_control(ControlCommand::Stop).await;
+    }
+    if let Commands::Speed { kmh } = command {
+        return run_control(ControlCommand::Speed(kmh)).await;
+    }
 
     let adapter = scan::first_adapter().await?;
     match command {
         Commands::Scan => scan::scan_and_list(&adapter).await?,
         Commands::Connect => run_connect(&adapter).await?,
         Commands::Daemon => run_daemon(&adapter).await?,
-        Commands::Start => run_command(&adapter, Command::Start).await?,
-        Commands::Stop => run_command(&adapter, Command::Stop).await?,
-        Commands::Speed { kmh } => run_command(&adapter, Command::Speed(kmh)).await?,
         Commands::Incline { percent } => run_command(&adapter, Command::Incline(percent)).await?,
         Commands::Discover => run_discover(&adapter).await?,
         Commands::DiscoverId { id } => {
@@ -152,7 +166,13 @@ async fn main() -> Result<()> {
             let fs = fitshow::FitShow::attach(&peripheral).await?;
             fs.set_speed_incline(kmh, incline_level).await?;
         }
-        Commands::Stats { .. } | Commands::Status | Commands::Widget | Commands::NotifyTest => {
+        Commands::Stats { .. }
+        | Commands::Status
+        | Commands::Widget
+        | Commands::NotifyTest
+        | Commands::Start
+        | Commands::Stop
+        | Commands::Speed { .. } => {
             unreachable!("handled above, before the adapter was opened")
         }
     }
@@ -531,6 +551,107 @@ fn daemon_process_alive() -> bool {
             tracing::warn!(%err, "status: failed to spawn `launchctl print`, assuming daemon not running");
             false
         }
+    }
+}
+
+/// How long the CLI waits for the daemon to run an enqueued command before
+/// giving up. Comfortably above the daemon's ≤1s pick-up plus one
+/// [`daemon::CONTROL_EXEC_TIMEOUT`]-bounded write, but short enough to fail
+/// fast and tell the operator to retry.
+const CONTROL_POLL_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// How often the CLI re-reads the command row while waiting.
+const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Route a control command (start/stop/speed). When the daemon owns the live
+/// BLE link, enqueue the command and wait for the daemon to run it — the CLI
+/// cannot open its own connection then, because the treadmill serves one
+/// central at a time and stops advertising while connected (задача 013). When
+/// the daemon is off, fall back to the original direct-BLE path. Only the
+/// fallback touches the Bluetooth adapter.
+async fn run_control(command: ControlCommand) -> Result<()> {
+    let store = store::Store::open()?;
+    if daemon_holds_link(&store) {
+        return enqueue_and_wait(&store, command).await;
+    }
+
+    info!("daemon not holding the link — sending command over a direct connection");
+    let adapter = scan::first_adapter().await?;
+    let mapped = match command {
+        ControlCommand::Start => Command::Start,
+        ControlCommand::Stop => Command::Stop,
+        ControlCommand::Speed(kmh) => Command::Speed(kmh),
+    };
+    run_command(&adapter, mapped).await?;
+    println!("{}", describe_control_success(&command));
+    Ok(())
+}
+
+/// Whether the daemon is currently the sole owner of the BLE link — alive
+/// (real PID), reporting `connected`, and with a fresh heartbeat. All three
+/// are required: a dead or hung daemon can leave a stale `connected` row
+/// behind, and routing to the queue then would hang the CLI on a command
+/// nothing will ever run, when the direct fallback would have worked.
+fn daemon_holds_link(store: &store::Store) -> bool {
+    let status = match store.daemon_status() {
+        Ok(Some(status)) => status,
+        Ok(None) => return false,
+        Err(err) => {
+            tracing::warn!(%err, "control: failed to read daemon_status — falling back to a direct connection");
+            return false;
+        }
+    };
+    status.connected && daemon_status_fresh(&status) && daemon_process_alive()
+}
+
+/// Whether the daemon heartbeat (`daemon_status.updated_at`) is recent enough
+/// to trust — an unparseable timestamp counts as not fresh (route to fallback).
+fn daemon_status_fresh(status: &store::DaemonStatus) -> bool {
+    match DateTime::parse_from_rfc3339(&status.updated_at) {
+        Ok(updated_at) => (Utc::now() - updated_at.with_timezone(&Utc)).num_seconds() <= WATCHDOG_STALE_THRESHOLD_S,
+        Err(err) => {
+            tracing::warn!(%err, updated_at = %status.updated_at, "control: unparseable daemon_status.updated_at — treating daemon as not holding the link");
+            false
+        }
+    }
+}
+
+/// Enqueue a command for the daemon and poll its row until it resolves or the
+/// wait times out. Prints a clear result; a `failed` outcome or a timeout is a
+/// non-zero exit so scripts can react.
+async fn enqueue_and_wait(store: &store::Store, command: ControlCommand) -> Result<()> {
+    let id = store.enqueue_control_command(&command)?;
+    info!(id, command = %command.to_wire(), "daemon holds the link — enqueued command, waiting for it to run");
+
+    let deadline = Instant::now() + CONTROL_POLL_TIMEOUT;
+    loop {
+        match store.control_command_outcome(id)? {
+            Some((status, _)) if status == "done" => {
+                println!("{}", describe_control_success(&command));
+                return Ok(());
+            }
+            Some((status, error)) if status == "failed" => {
+                bail!("treadmill command failed: {}", error.unwrap_or_else(|| "unknown error".to_string()));
+            }
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "daemon did not run the command within {}s — it may be busy or the treadmill just disconnected; try again",
+                CONTROL_POLL_TIMEOUT.as_secs()
+            );
+        }
+        tokio::time::sleep(CONTROL_POLL_INTERVAL).await;
+    }
+}
+
+/// Human-readable confirmation line printed once a control command succeeds
+/// (via either path).
+fn describe_control_success(command: &ControlCommand) -> String {
+    match command {
+        ControlCommand::Start => "belt started".to_string(),
+        ControlCommand::Stop => "belt stopped".to_string(),
+        ControlCommand::Speed(kmh) => format!("speed set to {kmh} km/h"),
     }
 }
 

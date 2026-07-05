@@ -20,12 +20,17 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
 - `src/scan.rs` — обнаружение адаптера, скан, подключение, подписка на нотификации.
 - `src/ftms.rs` — константы Fitness Machine Service (`0x1826`) и парсинг Treadmill Data (`0x2ACD`).
 - `src/control.rs` — FTMS Control Point (start/stop/speed).
+- `src/control_command.rs` — `ControlCommand` тип (`start`/`stop`/`speed:<kmh>`),
+  парс/формат и staleness-проверка для очереди команд (задача 013).
 - `src/presence.rs` — детекция присутствия: лента крутится, но шаги не растут → `AwayWhileRunning`.
 - `src/store.rs` — SQLite (`~/Library/Application Support/treadmill-bluetooth-macos/treadmill.db`),
   дневная статистика (шаги/дистанция/время ходьбы), restart-safe дельта-накопление.
 - `src/daemon.rs` — фоновый цикл (LaunchAgent): авто-скан/коннект/реконнект +
   presence + toast; на resume после паузы авто-восстанавливает pre-pause
   скорость ленты через `control.rs` (bounded BLE-write, см. `docs/tasks/012`).
+  Единственный владелец BLE-линка: команды управления (`tm speed`/`start`/`stop`)
+  от CLI идут через SQLite-очередь `control_commands` и исполняются здесь на живом
+  подключении (задача 013). CLI напрямую открывает BLE только если демон не держит линк.
 - `src/power.rs` — детекция AC-питания (`pmset -g batt`); на батарее и без
   подключённой дорожки демон не сканирует, чтобы не сажать аккумулятор.
 - `src/notify.rs` — нативные macOS-уведомления (`mac-notification-sys`,
