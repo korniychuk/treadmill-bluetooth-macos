@@ -469,19 +469,31 @@ fn run_widget() -> Result<()> {
     // the presence filter has already excluded step-away and paused stretches
     // (the `36m27s`, not the `raw 41m42s`, that `stats` prints). It auto-freezes
     // when not walking, since nothing is credited then.
-    let (cur_walking_s, cur_steps, cur_distance_m) = match store.latest_workout(gap_minutes)? {
+    let latest = store.latest_workout(gap_minutes)?;
+    let (cur_walking_s, cur_steps, cur_distance_m) = match &latest {
         Some(workout) => (workout.walking_time_s, workout.steps, workout.distance_m),
         None => (0, 0, 0),
     };
 
-    let today = Local::now().format("%Y-%m-%d").to_string();
-    let workout_count = store.workouts_for(&today, gap_minutes)?.len();
-    // Today's calendar totals, straight from `daily_stats` (credited walking).
-    let day = store.today_stats()?;
+    // The widget's "day" context follows the CURRENT workout's START date, not
+    // the wall-clock calendar day — so a workout that crosses midnight keeps its
+    // start-day context (count + totals) instead of the widget resetting to zero
+    // at 00:00 mid-walk. Falls back to today when there is no workout yet. Day
+    // totals are the sum of that day's workouts (by start-date), so the crossing
+    // workout is counted whole; on a normal (non-midnight) day this equals the
+    // calendar `daily_stats`. `cur_* ≤ day_*` still holds (the current workout is
+    // one of the reference day's workouts). `tm stats` daily lines stay strictly
+    // calendar — this start-date view is widget-only, for live-workout continuity.
+    let reference_day =
+        latest.as_ref().map(|w| w.date.clone()).unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
+    let workouts = store.workouts_for(&reference_day, gap_minutes)?;
+    let workout_count = workouts.len();
+    let day_walking_s: i64 = workouts.iter().map(|w| w.walking_time_s).sum();
+    let day_steps: i64 = workouts.iter().map(|w| w.steps).sum();
+    let day_distance_m: i64 = workouts.iter().map(|w| w.distance_m).sum();
 
     println!(
-        "{state}\t{workout_count}\t{cur_walking_s}\t{cur_steps}\t{cur_distance_m}\t{}\t{}\t{}",
-        day.walking_time_s, day.steps, day.distance_m,
+        "{state}\t{workout_count}\t{cur_walking_s}\t{cur_steps}\t{cur_distance_m}\t{day_walking_s}\t{day_steps}\t{day_distance_m}",
     );
     Ok(())
 }
