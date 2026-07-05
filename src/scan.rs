@@ -19,14 +19,15 @@ use crate::logger::WorkoutLogger;
 /// How long to scan before giving up on finding a treadmill.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// How long to wait on a single `connect()`/`discover_services()` call before
-/// giving up. CoreBluetooth calls through `btleplug` have no built-in bound —
-/// a live incident saw the daemon hang for 10+ hours inside one of these
-/// calls, with no scan and no error, until `launchctl kickstart -k` forced a
-/// restart. Wrapping both calls in a timeout turns that silent hang into a
-/// normal `Err`, so the daemon's existing retry loop handles it exactly like
-/// today's "not found" case instead of blocking forever.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait on a single CoreBluetooth call (`connect()`,
+/// `discover_services()`, `subscribe()`, `notifications()`, `disconnect()`)
+/// before giving up. These calls have no built-in bound in `btleplug` — two
+/// live incidents (2026-07-04/05, see `docs/tasks/007-...md`) saw the daemon
+/// hang for hours inside one of them (`disconnect()` on a hard-powered-off
+/// treadmill), with no scan and no error, until an external restart. Wrapping
+/// every such call in a timeout turns a silent hang into a normal `Err` the
+/// caller's retry loop can handle.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Acquire the first available Bluetooth adapter.
 pub async fn first_adapter() -> Result<Adapter> {
@@ -163,6 +164,22 @@ pub async fn connect_treadmill(adapter: &Adapter) -> Result<Peripheral> {
     bail!("no FTMS treadmill found within {:?}", SCAN_TIMEOUT)
 }
 
+/// Best-effort disconnect bounded by [`CONNECT_TIMEOUT`]: on a hard
+/// power-off CoreBluetooth may never complete the disconnect (observed live
+/// hanging for ~10 hours), so a timeout here only gets logged — the caller
+/// proceeds to rescan either way, and CoreBluetooth finishes the teardown on
+/// its own whenever the peripheral reappears.
+pub async fn disconnect_best_effort(peripheral: &Peripheral) {
+    match timeout(CONNECT_TIMEOUT, peripheral.disconnect()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => warn!(%err, "disconnect failed — continuing to rescan"),
+        Err(_) => warn!(
+            timeout_s = CONNECT_TIMEOUT.as_secs(),
+            "disconnect timed out (possible CoreBluetooth hang) — continuing to rescan"
+        ),
+    }
+}
+
 async fn is_treadmill(peripheral: &Peripheral) -> bool {
     peripheral
         .properties()
@@ -183,9 +200,9 @@ pub async fn subscribe_treadmill_data(peripheral: &Peripheral) -> Result<()> {
         .find(|c| c.uuid == ftms::TREADMILL_DATA)
         .context("Treadmill Data characteristic (0x2ACD) not found")?;
 
-    peripheral
-        .subscribe(&characteristic)
+    timeout(CONNECT_TIMEOUT, peripheral.subscribe(&characteristic))
         .await
+        .context("subscribe to Treadmill Data timed out (possible CoreBluetooth hang)")?
         .context("subscribe to Treadmill Data")?;
     info!("subscribed to Treadmill Data notifications");
     Ok(())
@@ -201,9 +218,9 @@ pub async fn subscribe_treadmill_status(peripheral: &Peripheral) -> Result<bool>
         return Ok(false);
     };
 
-    peripheral
-        .subscribe(&characteristic)
+    timeout(CONNECT_TIMEOUT, peripheral.subscribe(&characteristic))
         .await
+        .context("subscribe to Fitness Machine Status timed out (possible CoreBluetooth hang)")?
         .context("subscribe to Fitness Machine Status")?;
     info!("subscribed to Fitness Machine Status notifications");
     Ok(true)

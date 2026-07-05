@@ -35,14 +35,23 @@
 //! never interrupted by a power-state change, only idle *discovery* is
 //! gated — see `run()`.
 //!
-//! A watchdog (`Watchdog`, задача D) independently guards against a *silent
-//! hang* with no power-state cause at all (e.g. stuck deep inside
+//! A watchdog (`Watchdog`, задачи D/007) independently guards against a
+//! *silent hang* with no power-state cause at all (e.g. stuck deep inside
 //! btleplug/CoreBluetooth): every meaningful transition — and, as a
 //! backstop, every idle tick and every telemetry sample — refreshes the
-//! persisted `daemon_status.updated_at` row; if that stops advancing beyond
-//! [`WATCHDOG_STALE_THRESHOLD`] we log a `WARN` so the hang is visible in
-//! logs and to the future `status` CLI, without trying to self-heal.
+//! persisted `daemon_status.updated_at` row and touches the watchdog. The
+//! watchdog runs on its *own* spawned tokio task (the 2026-07-05 incident
+//! showed a `select!`-arm watchdog is blocked by the very hang it guards
+//! against, because the hang lives inside another arm's handler body), and
+//! when staleness exceeds [`WATCHDOG_STALE_THRESHOLD`] it logs an `ERROR`
+//! and exits the process: the hang sits inside CoreBluetooth and cannot be
+//! healed in-process, while `KeepAlive=true` in the LaunchAgent plist makes
+//! launchd restart the daemon within seconds. SQLite commits per operation
+//! and the JSONL log flushes per line, so an exit loses nothing a hung
+//! daemon wasn't already losing. See `docs/tasks/007-...md`.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -72,35 +81,25 @@ const RETRY_DELAY: Duration = Duration::from_secs(5);
 /// power-off well before a human would otherwise notice.
 const NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Duplicated from `scan::SCAN_TIMEOUT` (private to `scan.rs`), which bounds
-/// the discovery loop in `connect_treadmill`/`connect_by_id`. Not made `pub`
-/// here to avoid a premature cross-module coupling — a later 006 stage that
-/// touches `scan.rs` (задача D.1: wrapping `connect()`/`discover_services()`
-/// in a timeout) should reconcile this with the real constant, e.g. by
-/// exporting it from `scan.rs` instead of duplicating. Keep in sync by hand
-/// until then.
-const ASSUMED_SCAN_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Expected name/value for the `CONNECT_TIMEOUT` constant the next 006 stage
-/// should add in `scan.rs` to bound `peripheral.connect().await` and
-/// `peripheral.discover_services().await` (задача D.1 — those calls are
-/// currently unbounded). Defined here only so the watchdog threshold below
-/// has a concrete number; once `scan.rs` defines its own `CONNECT_TIMEOUT`,
-/// this local copy should be removed in favor of importing that one.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// How often the idle/scanning loop checks `Watchdog` for staleness.
-/// Coarser than the scan cycle since this is just a liveness check, not
-/// where the real work happens.
+/// How often the standalone watchdog task checks for staleness. Coarser than
+/// the scan cycle since this is just a liveness check, not where the real
+/// work happens.
 const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
-/// How stale `daemon_status.updated_at` may get before we treat it as a
-/// possible silent hang (задача D.2). Generous margin above the worst-case
-/// single scan+connect cycle so normal latency never trips it, while a
-/// genuine hang (the 2026-07-05 incident: silent for 10+ hours) is still
-/// caught in minutes, not hours.
-const WATCHDOG_STALE_THRESHOLD: Duration =
-    Duration::from_secs(ASSUMED_SCAN_TIMEOUT.as_secs() + CONNECT_TIMEOUT.as_secs() + 60);
+/// How stale the watchdog's last touch may get before we treat it as a
+/// silent hang and exit for launchd to restart us (задача 007). Generous
+/// margin above the worst-case legitimate gap (a full 15s scan cycle plus
+/// two 10s bounded CoreBluetooth calls plus the 5s retry delay) so normal
+/// latency never trips it, while a genuine hang (2026-07-04/05 incidents:
+/// silent for 10+ hours / 79+ minutes) is caught in ~2 minutes. `Instant`
+/// on macOS does not advance during system sleep, so waking from a long
+/// sleep cannot false-positive here.
+const WATCHDOG_STALE_THRESHOLD: Duration = Duration::from_secs(120);
+
+/// Exit code used when the watchdog kills the process on a detected hang —
+/// distinct from panics/normal errors so `launchctl print` / log forensics
+/// can tell watchdog restarts apart.
+const WATCHDOG_EXIT_CODE: i32 = 86;
 
 /// Run the daemon forever: scan → connect → stream with presence tracking →
 /// on disconnect, toast and go back to scanning. Reacts to power/sleep
@@ -108,8 +107,11 @@ const WATCHDOG_STALE_THRESHOLD: Duration =
 pub async fn run(adapter: &Adapter) -> Result<()> {
     let mut power_events = power::spawn_power_event_listener();
     let mut store = Store::open()?;
-    let mut watchdog = Watchdog::new();
-    let mut watchdog_tick = tokio::time::interval(WATCHDOG_CHECK_INTERVAL);
+    let watchdog = Watchdog::new();
+    watchdog.spawn_monitor();
+    // Refreshes `daemon_status.updated_at` (and the watchdog) while idle, so
+    // quiet-but-healthy stretches never look like a hang to `status`.
+    let mut persist_tick = tokio::time::interval(WATCHDOG_CHECK_INTERVAL);
 
     // The listener always sends the current AC/battery state as its first
     // event (see `power::spawn_power_event_listener`), so this seeds `on_ac`
@@ -127,7 +129,7 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
     };
 
     let mut state = DaemonState::new(on_ac);
-    state.persist(&store, &mut watchdog)?;
+    state.persist(&store, &watchdog)?;
 
     loop {
         if !on_ac {
@@ -141,7 +143,7 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                                 info!("AC power restored — resuming scanning immediately");
                                 on_ac = true;
                                 state.set_power_mode(true);
-                                state.persist(&store, &mut watchdog)?;
+                                state.persist(&store, &watchdog)?;
                                 break;
                             }
                             Some(PowerEvent::DidWake) => {
@@ -151,7 +153,7 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                                 info!(on_ac = now_on_ac, "system woke while idle — re-checked power state");
                                 on_ac = now_on_ac;
                                 state.set_power_mode(now_on_ac);
-                                state.persist(&store, &mut watchdog)?;
+                                state.persist(&store, &watchdog)?;
                                 if now_on_ac {
                                     break;
                                 }
@@ -161,11 +163,11 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                             }
                             Some(PowerEvent::WillSleep) => {
                                 info!("system will sleep while idle (no active session)");
-                                state.persist(&store, &mut watchdog)?;
+                                state.persist(&store, &watchdog)?;
                             }
                             Some(PowerEvent::WillPowerOff) => {
                                 info!("system will power off while idle — no active session to close");
-                                state.persist(&store, &mut watchdog)?;
+                                state.persist(&store, &watchdog)?;
                             }
                             None => {
                                 error!("power-event listener channel closed — cannot react to power state anymore");
@@ -173,9 +175,8 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                             }
                         }
                     }
-                    _ = watchdog_tick.tick() => {
-                        watchdog.check();
-                        state.persist(&store, &mut watchdog)?;
+                    _ = persist_tick.tick() => {
+                        state.persist(&store, &watchdog)?;
                     }
                 }
             }
@@ -190,7 +191,7 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                         info!("switched to battery with no active connection — going idle");
                         on_ac = false;
                         state.set_power_mode(false);
-                        state.persist(&store, &mut watchdog)?;
+                        state.persist(&store, &watchdog)?;
                     }
                     Some(PowerEvent::AcPowerChanged(true)) => {
                         // Already scanning on AC — nothing to do.
@@ -200,11 +201,11 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                     }
                     Some(PowerEvent::WillSleep) => {
                         info!("system will sleep (no active session)");
-                        state.persist(&store, &mut watchdog)?;
+                        state.persist(&store, &watchdog)?;
                     }
                     Some(PowerEvent::WillPowerOff) => {
                         info!("system will power off — no active session to close");
-                        state.persist(&store, &mut watchdog)?;
+                        state.persist(&store, &watchdog)?;
                     }
                     None => {
                         error!("power-event listener channel closed — cannot react to power state anymore");
@@ -212,9 +213,8 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                     }
                 }
             }
-            _ = watchdog_tick.tick() => {
-                watchdog.check();
-                state.persist(&store, &mut watchdog)?;
+            _ = persist_tick.tick() => {
+                state.persist(&store, &watchdog)?;
             }
             result = scan::connect_treadmill(adapter) => {
                 match result {
@@ -222,21 +222,25 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                         notify::treadmill_found();
                         state.connected = true;
                         state.last_connected_at = Some(Utc::now().to_rfc3339());
-                        state.persist(&store, &mut watchdog)?;
+                        state.persist(&store, &watchdog)?;
 
                         if let Err(err) =
-                            stream_with_presence(&peripheral, &mut power_events, &mut store, &mut state, &mut watchdog, &mut on_ac)
+                            stream_with_presence(&peripheral, &mut power_events, &mut store, &mut state, &watchdog, &mut on_ac)
                                 .await
                         {
                             warn!(%err, "presence stream ended with an error");
                         }
-                        let _ = peripheral.disconnect().await;
+                        // Toast + status update must come *before* the BLE
+                        // teardown: on a hard power-off `disconnect()` was
+                        // observed to hang for hours (задача 007), and the
+                        // operator-visible signals must not depend on it.
                         notify::treadmill_lost();
-
                         state.connected = false;
                         state.presence_state = None;
                         state.last_disconnected_at = Some(Utc::now().to_rfc3339());
-                        state.persist(&store, &mut watchdog)?;
+                        state.persist(&store, &watchdog)?;
+
+                        scan::disconnect_best_effort(&peripheral).await;
                     }
                     Err(err) => {
                         warn!(%err, "treadmill not found this cycle, retrying");
@@ -260,12 +264,15 @@ async fn stream_with_presence(
     power_events: &mut UnboundedReceiver<PowerEvent>,
     store: &mut Store,
     state: &mut DaemonState,
-    watchdog: &mut Watchdog,
+    watchdog: &Watchdog,
     on_ac: &mut bool,
 ) -> Result<()> {
     scan::subscribe_treadmill_data(peripheral).await?;
     scan::subscribe_treadmill_status(peripheral).await?;
-    let mut notifications = peripheral.notifications().await?;
+    // Bounded like every other CoreBluetooth call — see задача 007.
+    let mut notifications = tokio::time::timeout(scan::CONNECT_TIMEOUT, peripheral.notifications())
+        .await
+        .map_err(|_| anyhow!("opening notification stream timed out (possible CoreBluetooth hang)"))??;
 
     let session_id = store.start_session()?;
     let mut logger = WorkoutLogger::create()?;
@@ -454,7 +461,7 @@ impl DaemonState {
     /// Upsert the current state into `daemon_status` and mark the watchdog
     /// as freshly touched. Called on every meaningful transition plus, as a
     /// backstop, on every telemetry sample and every idle/watchdog tick.
-    fn persist(&self, store: &Store, watchdog: &mut Watchdog) -> Result<()> {
+    fn persist(&self, store: &Store, watchdog: &Watchdog) -> Result<()> {
         store.upsert_daemon_status(&DaemonStatus {
             connected: self.connected,
             presence_state: self.presence_state.clone(),
@@ -473,34 +480,72 @@ fn power_mode_label(on_ac: bool) -> &'static str {
     if on_ac { "ac_scanning" } else { "battery_idle" }
 }
 
-/// Tracks the last time `daemon_status` was refreshed and logs a `WARN` if
-/// it goes stale — a diagnosable, unmissable signal for a silent hang
-/// (задача D), independent of *why* the daemon stopped advancing (power-gate
-/// bug, a wedged btleplug/CoreBluetooth call, or anything else). Does not
-/// attempt to self-heal, per the task doc's explicit call-out that an
-/// automatic "fix" here is its own risk.
+/// Tracks the last time the daemon made observable progress and, from its
+/// own spawned task, kills the process when that stops — the unmissable
+/// answer to a silent hang (задачи D/007), independent of *why* the daemon
+/// stopped advancing (power-gate bug, a wedged btleplug/CoreBluetooth call,
+/// or anything else).
+///
+/// Runs on a dedicated `tokio::spawn` task rather than a `select!` arm: the
+/// 2026-07-05 incident proved an in-loop check never fires while the hang
+/// sits inside another arm's handler body. Self-healing is a plain process
+/// exit (launchd `KeepAlive` restarts us) because a CoreBluetooth hang is
+/// unrecoverable in-process — see the module docs for why this reverses the
+/// original задача D "signal only" stance.
 struct Watchdog {
-    last_update: Instant,
+    /// Fixed anchor all touch timestamps are measured against.
+    anchor: Instant,
+    /// Milliseconds since `anchor` at the moment of the last `touch()`,
+    /// shared with the monitor task.
+    last_touch_ms: Arc<AtomicU64>,
 }
 
 impl Watchdog {
     fn new() -> Self {
-        Self { last_update: Instant::now() }
-    }
-
-    fn touch(&mut self) {
-        self.last_update = Instant::now();
-    }
-
-    fn check(&self) {
-        let elapsed = self.last_update.elapsed();
-        if elapsed > WATCHDOG_STALE_THRESHOLD {
-            warn!(
-                elapsed_s = elapsed.as_secs(),
-                threshold_s = WATCHDOG_STALE_THRESHOLD.as_secs(),
-                "daemon_status hasn't been refreshed in a while — possible silent hang"
-            );
+        Self {
+            anchor: Instant::now(),
+            last_touch_ms: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    fn touch(&self) {
+        let elapsed_ms = u64::try_from(self.anchor.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_touch_ms.store(elapsed_ms, Ordering::Relaxed);
+    }
+
+    /// Whether the last touch is older than [`WATCHDOG_STALE_THRESHOLD`],
+    /// given the current elapsed-since-anchor time. Split from
+    /// `spawn_monitor` so the threshold logic is unit-testable without a
+    /// runtime or real waiting.
+    fn is_stale_at(&self, elapsed_since_anchor: Duration) -> bool {
+        let last_touch = Duration::from_millis(self.last_touch_ms.load(Ordering::Relaxed));
+        elapsed_since_anchor.saturating_sub(last_touch) > WATCHDOG_STALE_THRESHOLD
+    }
+
+    /// Start the independent monitor task. On detected staleness it logs an
+    /// `ERROR` and exits the whole process with [`WATCHDOG_EXIT_CODE`] so
+    /// launchd (`KeepAlive=true`) restarts the daemon cleanly.
+    fn spawn_monitor(&self) {
+        let anchor = self.anchor;
+        let last_touch_ms = Arc::clone(&self.last_touch_ms);
+        let probe = Self { anchor, last_touch_ms };
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(WATCHDOG_CHECK_INTERVAL);
+            loop {
+                tick.tick().await;
+                let elapsed = probe.anchor.elapsed();
+                if probe.is_stale_at(elapsed) {
+                    let last_touch = Duration::from_millis(probe.last_touch_ms.load(Ordering::Relaxed));
+                    error!(
+                        stale_s = (elapsed - last_touch).as_secs(),
+                        threshold_s = WATCHDOG_STALE_THRESHOLD.as_secs(),
+                        exit_code = WATCHDOG_EXIT_CODE,
+                        "silent hang detected — exiting so launchd restarts the daemon"
+                    );
+                    std::process::exit(WATCHDOG_EXIT_CODE);
+                }
+            }
+        });
     }
 }
 
@@ -559,17 +604,21 @@ mod tests {
     #[test]
     fn daemon_state_persist_roundtrips_and_touches_watchdog() {
         let store = memory_store();
-        let mut watchdog = Watchdog::new();
-        // Force staleness so we can observe `persist` resetting it.
-        watchdog.last_update -= WATCHDOG_STALE_THRESHOLD * 2;
-        assert!(watchdog.last_update.elapsed() > WATCHDOG_STALE_THRESHOLD);
+        let watchdog = Watchdog::new();
+        // Untouched watchdog at a synthetic "far future" instant is stale.
+        let far_future = WATCHDOG_STALE_THRESHOLD * 2;
+        assert!(watchdog.is_stale_at(far_future));
 
         let mut state = DaemonState::new(true);
         state.connected = true;
         state.presence_state = Some("Walking".to_string());
-        state.persist(&store, &mut watchdog).unwrap();
+        state.persist(&store, &watchdog).unwrap();
 
-        assert!(watchdog.last_update.elapsed() < WATCHDOG_STALE_THRESHOLD);
+        // `persist` touched the watchdog just now: fresh well inside the
+        // threshold, stale again well past it (exact-boundary checks would
+        // race the sub-ms gap between the touch and this measurement).
+        assert!(!watchdog.is_stale_at(watchdog.anchor.elapsed() + WATCHDOG_STALE_THRESHOLD / 2));
+        assert!(watchdog.is_stale_at(watchdog.anchor.elapsed() + WATCHDOG_STALE_THRESHOLD * 2));
         let status = store.daemon_status().unwrap().expect("row present");
         assert!(status.connected);
         assert_eq!(status.presence_state.as_deref(), Some("Walking"));
