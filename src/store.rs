@@ -22,10 +22,14 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use chrono::{Local, Utc};
+use chrono::{DateTime, Duration, Local, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::ftms::TreadmillData;
+
+/// Gap between two credited activity bursts past which we consider it a new
+/// workout rather than a continuation (see module docs on `credit_activity`).
+const WORKOUT_GAP_THRESHOLD_S: i64 = 15 * 60;
 
 /// Aggregated totals for a single calendar day (local time).
 #[derive(Debug, Clone, Default)]
@@ -34,6 +38,41 @@ pub struct DailyStats {
     pub distance_m: i64,
     pub steps: i64,
     pub walking_time_s: i64,
+}
+
+/// One contiguous burst of walking, split from adjacent bursts by a gap of
+/// more than [`WORKOUT_GAP_THRESHOLD_S`] with no credited activity.
+///
+/// `date` is fixed to the calendar date (local time) of `started_at` and
+/// never changes, even if the workout is still open when the credit that
+/// extends `ended_at` crosses into the next calendar day — see
+/// `credit_activity` docs for the midnight-crossing edge case this implies
+/// for `daily_stats` vs. `workouts` reconciliation.
+#[derive(Debug, Clone, Default)]
+pub struct Workout {
+    pub id: i64,
+    pub date: String,
+    pub started_at: String,
+    pub ended_at: String,
+    pub distance_m: i64,
+    pub steps: i64,
+    pub walking_time_s: i64,
+}
+
+/// Persistent daemon status snapshot — one row, upserted on every transition
+/// the daemon observes (connect/disconnect, presence change, power mode
+/// change). Exists so a separate `status` CLI invocation (which must not
+/// itself open the BLE adapter) can report state without racing the daemon
+/// for the adapter. See `docs/tasks/006-...md`, задача B.
+#[derive(Debug, Clone)]
+pub struct DaemonStatus {
+    pub connected: bool,
+    pub presence_state: Option<String>,
+    pub last_connected_at: Option<String>,
+    pub last_disconnected_at: Option<String>,
+    pub power_mode: String,
+    pub power_mode_since: String,
+    pub updated_at: String,
 }
 
 /// Per-sample deltas against the persisted device baseline. Not yet a
@@ -113,6 +152,26 @@ impl Store {
                     raw_frame BLOB NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_status_events_session ON status_events(session_id);
+                CREATE TABLE IF NOT EXISTS workouts (
+                    id INTEGER PRIMARY KEY,
+                    date TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT NOT NULL,
+                    distance_m INTEGER NOT NULL DEFAULT 0,
+                    steps INTEGER NOT NULL DEFAULT 0,
+                    walking_time_s INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_workouts_date ON workouts(date);
+                CREATE TABLE IF NOT EXISTS daemon_status (
+                    id INTEGER PRIMARY KEY CHECK (id = 0),
+                    connected INTEGER NOT NULL,
+                    presence_state TEXT,
+                    last_connected_at TEXT,
+                    last_disconnected_at TEXT,
+                    power_mode TEXT NOT NULL,
+                    power_mode_since TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 ",
             )
             .context("run schema migration")?;
@@ -192,20 +251,83 @@ impl Store {
         Ok(deltas)
     }
 
-    /// Credit an already-decided amount of walking to today's totals.
-    pub fn credit_daily(&self, steps: i64, distance_m: i64, walking_time_s: i64) -> Result<()> {
-        let today = Local::now().format("%Y-%m-%d").to_string();
-        self.conn
-            .execute(
-                "INSERT INTO daily_stats (date, distance_m, steps, walking_time_s)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(date) DO UPDATE SET
-                    distance_m = daily_stats.distance_m + excluded.distance_m,
-                    steps = daily_stats.steps + excluded.steps,
-                    walking_time_s = daily_stats.walking_time_s + excluded.walking_time_s",
-                params![today, distance_m, steps, walking_time_s],
+    /// Credit an already-decided amount of walking to both today's totals
+    /// (`daily_stats`, unchanged behavior) and the current workout
+    /// (`workouts`), splitting into a new workout row when the gap since the
+    /// most recently credited activity exceeds [`WORKOUT_GAP_THRESHOLD_S`]
+    /// (or none has been credited yet). Both updates happen in one
+    /// transaction so a crash mid-credit cannot leave them disagreeing.
+    ///
+    /// `now` is threaded through explicitly (rather than calling
+    /// `Utc::now()` internally, like the rest of this module) so the workout
+    /// split/continue decision is deterministic in tests.
+    ///
+    /// There is no explicit "closed" flag on `workouts` rows — the most
+    /// recently started row is implicitly the open one; "closing" it just
+    /// means the next credit starts a new row instead of extending it.
+    ///
+    /// Midnight-crossing edge case: `workouts.date` is fixed to the calendar
+    /// date of `started_at` and never changes while the workout is extended,
+    /// even past local midnight. So "daily total == sum of that day's
+    /// workouts" holds for the day a workout *started* in, but not
+    /// necessarily for the day it *ended* in if those differ — `daily_stats`
+    /// still gets the correct split by calendar day of each individual
+    /// credit, since it does not know about workout boundaries at all.
+    pub fn credit_activity(&mut self, steps: i64, distance_m: i64, walking_time_s: i64, now: DateTime<Utc>) -> Result<()> {
+        let today = now.with_timezone(&Local).format("%Y-%m-%d").to_string();
+        let tx = self.conn.transaction().context("begin credit_activity transaction")?;
+
+        tx.execute(
+            "INSERT INTO daily_stats (date, distance_m, steps, walking_time_s)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(date) DO UPDATE SET
+                distance_m = daily_stats.distance_m + excluded.distance_m,
+                steps = daily_stats.steps + excluded.steps,
+                walking_time_s = daily_stats.walking_time_s + excluded.walking_time_s",
+            params![today, distance_m, steps, walking_time_s],
+        )
+        .context("credit daily_stats")?;
+
+        let latest: Option<(i64, String)> = tx
+            .query_row("SELECT id, ended_at FROM workouts ORDER BY id DESC LIMIT 1", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()
+            .context("read latest workout")?;
+
+        let continues_latest = latest.as_ref().is_some_and(|(_, ended_at)| {
+            match DateTime::parse_from_rfc3339(ended_at) {
+                Ok(prev) => now - prev.with_timezone(&Utc) <= Duration::seconds(WORKOUT_GAP_THRESHOLD_S),
+                Err(err) => {
+                    // Corrupt/foreign timestamp — treat as a gap rather than
+                    // fail the whole credit; log so it's not silently masked.
+                    tracing::warn!(%err, ended_at, "workouts.ended_at not RFC3339, starting a new workout");
+                    false
+                }
+            }
+        });
+
+        if let Some((id, _)) = latest.filter(|_| continues_latest) {
+            tx.execute(
+                "UPDATE workouts SET
+                    ended_at = ?1,
+                    distance_m = distance_m + ?2,
+                    steps = steps + ?3,
+                    walking_time_s = walking_time_s + ?4
+                 WHERE id = ?5",
+                params![now.to_rfc3339(), distance_m, steps, walking_time_s, id],
             )
-            .context("credit daily_stats")?;
+            .context("extend workout")?;
+        } else {
+            tx.execute(
+                "INSERT INTO workouts (date, started_at, ended_at, distance_m, steps, walking_time_s)
+                 VALUES (?1, ?2, ?2, ?3, ?4, ?5)",
+                params![today, now.to_rfc3339(), distance_m, steps, walking_time_s],
+            )
+            .context("insert workout")?;
+        }
+
+        tx.commit().context("commit credit_activity transaction")?;
         Ok(())
     }
 
@@ -298,6 +420,101 @@ impl Store {
             .context("run all_stats query")?;
         rows.collect::<rusqlite::Result<Vec<_>>>().context("collect all_stats rows")
     }
+
+    /// Workouts whose `date` (start day) is the given `YYYY-MM-DD`, oldest first.
+    pub fn workouts_for(&self, date: &str) -> Result<Vec<Workout>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, date, started_at, ended_at, distance_m, steps, walking_time_s
+                 FROM workouts WHERE date = ?1 ORDER BY id ASC",
+            )
+            .context("prepare workouts_for query")?;
+        let rows = stmt.query_map(params![date], workout_from_row).context("run workouts_for query")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("collect workouts_for rows")
+    }
+
+    /// All recorded workouts, most recently started first.
+    pub fn all_workouts(&self) -> Result<Vec<Workout>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, date, started_at, ended_at, distance_m, steps, walking_time_s
+                 FROM workouts ORDER BY id DESC",
+            )
+            .context("prepare all_workouts query")?;
+        let rows = stmt.query_map([], workout_from_row).context("run all_workouts query")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("collect all_workouts rows")
+    }
+
+    /// Upsert the single `daemon_status` row (id=0), same pattern as
+    /// `device_baseline` — the daemon calls this on every observed
+    /// transition (connect/disconnect, presence change, power mode change).
+    pub fn upsert_daemon_status(&self, status: &DaemonStatus) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO daemon_status
+                    (id, connected, presence_state, last_connected_at, last_disconnected_at,
+                     power_mode, power_mode_since, updated_at)
+                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                    connected = excluded.connected,
+                    presence_state = excluded.presence_state,
+                    last_connected_at = excluded.last_connected_at,
+                    last_disconnected_at = excluded.last_disconnected_at,
+                    power_mode = excluded.power_mode,
+                    power_mode_since = excluded.power_mode_since,
+                    updated_at = excluded.updated_at",
+                params![
+                    status.connected,
+                    status.presence_state,
+                    status.last_connected_at,
+                    status.last_disconnected_at,
+                    status.power_mode,
+                    status.power_mode_since,
+                    status.updated_at,
+                ],
+            )
+            .context("upsert daemon_status")?;
+        Ok(())
+    }
+
+    /// Read the single `daemon_status` row, or `None` if the daemon has
+    /// never written one yet (e.g. fresh install, daemon never ran).
+    pub fn daemon_status(&self) -> Result<Option<DaemonStatus>> {
+        self.conn
+            .query_row(
+                "SELECT connected, presence_state, last_connected_at, last_disconnected_at,
+                        power_mode, power_mode_since, updated_at
+                 FROM daemon_status WHERE id = 0",
+                [],
+                |row| {
+                    Ok(DaemonStatus {
+                        connected: row.get(0)?,
+                        presence_state: row.get(1)?,
+                        last_connected_at: row.get(2)?,
+                        last_disconnected_at: row.get(3)?,
+                        power_mode: row.get(4)?,
+                        power_mode_since: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .context("query daemon_status")
+    }
+}
+
+fn workout_from_row(row: &rusqlite::Row) -> rusqlite::Result<Workout> {
+    Ok(Workout {
+        id: row.get(0)?,
+        date: row.get(1)?,
+        started_at: row.get(2)?,
+        ended_at: row.get(3)?,
+        distance_m: row.get(4)?,
+        steps: row.get(5)?,
+        walking_time_s: row.get(6)?,
+    })
 }
 
 /// Delta of a monotonically-increasing device counter since the last sample.
@@ -327,6 +544,10 @@ fn db_path() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use chrono::TimeZone;
+
     use super::*;
 
     #[test]
@@ -347,5 +568,115 @@ mod tests {
     #[test]
     fn unchanged_counter_credits_zero() {
         assert_eq!(delta_since(10, Some(10)), 0);
+    }
+
+    fn memory_store() -> Store {
+        // Fix the process timezone so date-of-day assertions (in particular
+        // the midnight-crossing test) don't depend on the machine/CI's local
+        // timezone — chrono's `Local` reads `TZ` per call on unix.
+        unsafe {
+            std::env::set_var("TZ", "UTC");
+        }
+        Store::open_at(Path::new(":memory:")).expect("open in-memory store")
+    }
+
+    #[test]
+    fn credit_activity_continues_workout_within_gap_threshold() {
+        let mut store = memory_store();
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 5, 10, 0, 0).unwrap();
+        let t1 = t0 + Duration::minutes(10); // < 15 min threshold
+
+        store.credit_activity(5, 10, 30, t0).unwrap();
+        store.credit_activity(5, 10, 30, t1).unwrap();
+
+        let workouts = store.all_workouts().unwrap();
+        assert_eq!(workouts.len(), 1, "single continuous workout, not two");
+        assert_eq!(workouts[0].steps, 10);
+        assert_eq!(workouts[0].distance_m, 20);
+        assert_eq!(workouts[0].walking_time_s, 60);
+        assert_eq!(workouts[0].started_at, t0.to_rfc3339());
+        assert_eq!(workouts[0].ended_at, t1.to_rfc3339());
+    }
+
+    #[test]
+    fn credit_activity_splits_after_gap_exceeds_threshold() {
+        let mut store = memory_store();
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 5, 10, 0, 0).unwrap();
+        let t1 = t0 + Duration::minutes(20); // > 15 min threshold
+
+        store.credit_activity(5, 10, 30, t0).unwrap();
+        store.credit_activity(5, 10, 30, t1).unwrap();
+
+        let workouts = store.all_workouts().unwrap();
+        assert_eq!(workouts.len(), 2, "gap past the threshold must start a new workout");
+        // all_workouts is most-recent-first.
+        assert_eq!(workouts[0].started_at, t1.to_rfc3339());
+        assert_eq!(workouts[1].started_at, t0.to_rfc3339());
+    }
+
+    #[test]
+    fn credit_activity_first_workout_of_day_has_no_prior_activity() {
+        let mut store = memory_store();
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 5, 10, 0, 0).unwrap();
+
+        store.credit_activity(5, 10, 30, t0).unwrap();
+
+        let workouts = store.all_workouts().unwrap();
+        assert_eq!(workouts.len(), 1);
+        assert_eq!(workouts[0].date, "2026-07-05");
+        assert_eq!(workouts[0].steps, 5);
+    }
+
+    #[test]
+    fn credit_activity_across_midnight_keeps_start_date_but_splits_daily_stats() {
+        let mut store = memory_store();
+        // One continuous workout (each gap well under 15 min) that starts
+        // before local midnight and ends after it.
+        let before_midnight = Utc.with_ymd_and_hms(2026, 7, 5, 23, 50, 0).unwrap();
+        let after_midnight = Utc.with_ymd_and_hms(2026, 7, 6, 0, 0, 0).unwrap(); // 10 min gap, < 15 min threshold
+
+        store.credit_activity(10, 20, 60, before_midnight).unwrap();
+        store.credit_activity(20, 40, 120, after_midnight).unwrap();
+
+        let workouts = store.all_workouts().unwrap();
+        assert_eq!(workouts.len(), 1, "single workout spanning midnight");
+        assert_eq!(workouts[0].date, "2026-07-05", "date is fixed to the start day");
+        assert_eq!(workouts[0].steps, 30);
+        assert_eq!(workouts[0].ended_at, after_midnight.to_rfc3339());
+
+        // daily_stats, in contrast, is genuinely split by calendar day.
+        let day1 = store.stats_for("2026-07-05").unwrap().expect("day1 stats present");
+        assert_eq!(day1.steps, 10);
+        assert_eq!(day1.distance_m, 20);
+        let day2 = store.stats_for("2026-07-06").unwrap().expect("day2 stats present");
+        assert_eq!(day2.steps, 20);
+        assert_eq!(day2.distance_m, 40);
+    }
+
+    #[test]
+    fn daemon_status_upsert_roundtrips() {
+        let store = memory_store();
+        assert!(store.daemon_status().unwrap().is_none());
+
+        let status = DaemonStatus {
+            connected: true,
+            presence_state: Some("Walking".to_string()),
+            last_connected_at: Some("2026-07-05T10:00:00+00:00".to_string()),
+            last_disconnected_at: None,
+            power_mode: "ac_scanning".to_string(),
+            power_mode_since: "2026-07-05T09:00:00+00:00".to_string(),
+            updated_at: "2026-07-05T10:00:01+00:00".to_string(),
+        };
+        store.upsert_daemon_status(&status).unwrap();
+
+        let read_back = store.daemon_status().unwrap().expect("status row present");
+        assert!(read_back.connected);
+        assert_eq!(read_back.presence_state.as_deref(), Some("Walking"));
+
+        // Second upsert overwrites in place — still exactly one row (id=0).
+        let status2 = DaemonStatus { connected: false, ..status };
+        store.upsert_daemon_status(&status2).unwrap();
+        let read_back2 = store.daemon_status().unwrap().expect("status row present");
+        assert!(!read_back2.connected);
     }
 }

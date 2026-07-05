@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::StreamExt;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tracing::{info, warn};
 
 use crate::ftms;
@@ -18,6 +18,15 @@ use crate::logger::WorkoutLogger;
 
 /// How long to scan before giving up on finding a treadmill.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long to wait on a single `connect()`/`discover_services()` call before
+/// giving up. CoreBluetooth calls through `btleplug` have no built-in bound —
+/// a live incident saw the daemon hang for 10+ hours inside one of these
+/// calls, with no scan and no error, until `launchctl kickstart -k` forced a
+/// restart. Wrapping both calls in a timeout turns that silent hang into a
+/// normal `Err`, so the daemon's existing retry loop handles it exactly like
+/// today's "not found" case instead of blocking forever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Acquire the first available Bluetooth adapter.
 pub async fn first_adapter() -> Result<Adapter> {
@@ -106,10 +115,13 @@ pub async fn connect_by_id(adapter: &Adapter, id: &str) -> Result<Peripheral> {
         for peripheral in adapter.peripherals().await.context("list peripherals")? {
             if peripheral.id().to_string() == id {
                 info!(id = %peripheral.id(), "connecting by id");
-                peripheral.connect().await.context("connect")?;
-                peripheral
-                    .discover_services()
+                timeout(CONNECT_TIMEOUT, peripheral.connect())
                     .await
+                    .context("connect timed out (possible CoreBluetooth hang)")?
+                    .context("connect")?;
+                timeout(CONNECT_TIMEOUT, peripheral.discover_services())
+                    .await
+                    .context("discover services timed out (possible CoreBluetooth hang)")?
                     .context("discover services")?;
                 return Ok(peripheral);
             }
@@ -134,10 +146,13 @@ pub async fn connect_treadmill(adapter: &Adapter) -> Result<Peripheral> {
         for peripheral in adapter.peripherals().await.context("list peripherals")? {
             if is_treadmill(&peripheral).await {
                 info!(id = %peripheral.id(), "connecting to treadmill");
-                peripheral.connect().await.context("connect")?;
-                peripheral
-                    .discover_services()
+                timeout(CONNECT_TIMEOUT, peripheral.connect())
                     .await
+                    .context("connect timed out (possible CoreBluetooth hang)")?
+                    .context("connect")?;
+                timeout(CONNECT_TIMEOUT, peripheral.discover_services())
+                    .await
+                    .context("discover services timed out (possible CoreBluetooth hang)")?
                     .context("discover services")?;
                 return Ok(peripheral);
             }

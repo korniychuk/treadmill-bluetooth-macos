@@ -252,3 +252,79 @@ YYYY-MM-DD`, на усмотрение исполнителя, добавить 
   внутри `btleplug`/CoreBluetooth, который задача A не закрывает). Реализация
   идёт как последовательный pipeline по файлам (`store.rs` → `daemon.rs` →
   `scan.rs` → `main.rs`), не как параллельный fanout фич.
+- 2026-07-05: pipeline из 5 стадий (`store.rs`, `power.rs`, `daemon.rs`,
+  `scan.rs`, `main.rs`) реализован и прошёл финальную верификацию.
+  `cargo build`/`cargo build --release` чистые, `cargo test` — 23/23,
+  `cargo clippy --all-targets` без новых линтов (только 3 ожидаемых
+  dead-code warning на API, которое станет "live" только после переустановки
+  демона: `Workout::date`, `Store::all_workouts`,
+  `K_IO_MESSAGE_SYSTEM_WILL_POWER_ON`). Смоук-тест релизного бинаря:
+  `status` и `stats` отрабатывают без паники на живой машине; `workouts`
+  таблица пуста, потому что установленный LaunchAgent-демон — ещё старый
+  бинарь (не вызывает `credit_activity`), это ожидаемо и не баг стадии.
+  - **Задача A (event-driven power/sleep хуки)**: `power.rs` переписан на
+    IOKit FFI (`io-kit-sys` + `core-foundation`, без `build.rs` — линковка
+    транзитивная через зависимости), `spawn_power_event_listener()` отдаёт
+    канал `PowerEvent::{AcPowerChanged, WillSleep, DidWake, WillPowerOff}`;
+    `daemon.rs` подписан на канал вместо поллинга `pmset`.
+  - **Задача B (`status`)**: команда добавлена в `main.rs`, read-only (не
+    открывает BLE-адаптер), проверяет живость демона через
+    `launchctl print` (требует реальной строки `pid =`, не доверяет
+    протухшей записи в БД от мёртвого процесса), печатает daemon/treadmill/
+    power state + тренировки за сегодня.
+  - **Задача C (разделение тренировок)**: `store.rs` — таблица `workouts`,
+    `Store::credit_activity` (заменил `credit_daily`) со сплитом/расширением
+    по порогу 900с; `date` тренировки фиксируется по старту и не съезжает
+    при переходе через полночь (даже когда `daily_stats` корректно
+    разбивается по календарным дням) — покрыто тестом
+    `credit_activity_across_midnight_keeps_start_date_but_splits_daily_stats`.
+  - **Задача D (watchdog + connect-таймаут)**: `daemon.rs` — таблица/
+    структура `daemon_status`, `WATCHDOG_STALE_THRESHOLD`; `scan.rs` —
+    `CONNECT_TIMEOUT` (10с) вокруг `connect()`/`discover_services()` через
+    `tokio::time::timeout`, чтобы зависание превращалось в обычный `Err`
+    вместо тихого 10+-часового висения (как в живом инциденте).
+  - **Известный TODO, оставлен намеренно**: `credit_activity` в `daemon.rs`
+    вызывается с `chrono::Utc::now()` вместо метки времени реального сэмпла
+    — помечено `TODO(006/daemon.rs stage)`, не блокирует корректность порога
+    900с в обычной работе, но стоит уточнить при следующей правке `daemon.rs`.
+  - **Что осталось оператору**: (1) код-ревью диффа (`Cargo.toml`,
+    `src/{store,power,daemon,scan,main}.rs`); (2) `scripts/install-daemon.sh`
+    — пересобрать/переподписать/переустановить LaunchAgent, чтобы демон
+    реально начал писать `workouts`/`daemon_status` и слушать IOKit-события
+    вместо поллинга `pmset`; (3) live de-risk пассов для IOKit sleep/wake
+    хуков на реальном железе (выдернуть/воткнуть питание, закрыть крышку,
+    заснуть/разбудить) — по аналогии с де-риском задачи 005, это не
+    покрывается юнит-тестами и не проверялось на этой сессии.
+- 2026-07-05: пайплайн-этап `impl:daemon.rs` оборвался по API-ошибке
+  mid-stream — `daemon.rs` всё же оказался отредактирован (вероятно, обрыв
+  случился ближе к концу правок), последующие этапы (`scan.rs`/`main.rs`/
+  `verify`) подхватили состояние и довели до зелёной сборки. Т.к. build/test/
+  clippy не гоняют сам `daemon::run()`, а именно упавший этап — самое опасное
+  место, сделал по совету advisor'а дополнительную ручную рантайм-проверку
+  вместо того, чтобы доверять только зелёным чекам:
+  - Прочитан весь `daemon.rs` построчно против плана A/B/D — старого
+    poll-цикла не осталось, все 4 `PowerEvent` обработаны, watchdog реально
+    заспавнен и тикает внутри `run()`, `daemon_status` пишется на
+    connect/disconnect/presence/power-mode и на каждый сэмпл/idle-тик.
+  - Временно выгрузил старый LaunchAgent (`launchctl bootout`), прогнал
+    свежий релизный бинарь в foreground 25с (`RUST_LOG=debug ... daemon`):
+    power-listener стартовал, попытка скана прошла на INFO. `status`
+    прочитал реально записанную (не пустую) строку `daemon_status` —
+    единственный способ проверить populated-ветку рендера, т.к. на момент
+    проверки установленный демон ещё не писал в эту таблицу. Вернул старый
+    LaunchAgent обратно (`launchctl bootstrap`).
+  - Обнаружен побочный эффект: `cargo build --release`, выполненный во время
+    верификации, пересобрал бинарь по тому же пути, на который уже смотрел
+    установленный (старый) LaunchAgent-plist — демон незаметно для себя
+    подхватил новый код, но с **ad-hoc** подписью вместо стабильного
+    сертификата `AnKor Treadmill BLE Dev` (риск сброса Bluetooth-разрешения,
+    см. 002/005). Спросил оператора — подтвердил `scripts/install-daemon.sh`.
+    Выполнено: пересобрано, подписано правильным сертификатом
+    (`codesign -dv` подтвердил `identifier=com.korniychuk.treadmill-bluetooth-macos`,
+    не ad-hoc), LaunchAgent переустановлен и живой. Живой `status` после
+    переустановки: `daemon process: alive`, `treadmill: connected, presence =
+    Paused`, `power mode: on AC power, actively scanning`.
+  - **Всё ещё не покрыто (см. пункт (3) выше)**: live de-risk sleep/wake
+    хуков (реальный уход в сон/пробуждение, а не только AC plug/unplug,
+    который уже наблюдался живьём при переустановке) — сделать отдельно,
+    аналогично де-риску 005.
