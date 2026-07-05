@@ -74,15 +74,17 @@ scripts/build-icon.sh        # перегенерировать macos/AppIcon.ic
 
 ## Конфиг целей (step goals)
 
-Дневные цели по шагам (до 3) живут в **`config/goals.json`** (коммитится в репо):
-`{ "goals": [8000, 10000, 12000] }`. Демон резолвит путь так: env
-`TREADMILL_GOALS_CONFIG` → `./config/goals.json` (cwd, для `cargo run`) →
-вшитые дефолты `[8000,10000,12000]` + WARN. `install-daemon.sh` прописывает
-`TREADMILL_GOALS_CONFIG` в plist на repo-путь, так что **правки коммитнутого
-файла активны после рестарта демона** (`launchctl kickstart -k` или переустановка).
-Tier (яркость toast'а) выводится из ранга по возрастанию: низший порог → tier 1.
-Каждая цель празднуется ровно раз в день (local date, restart-safe через таблицу
-`goal_celebrations`). См. `docs/tasks/011-...md`.
+Дневные цели по шагам (до 3) — **per-user**, конфиг живёт **не в этом репо**, а в
+домашней директории: **`~/.config/treadmill-bluetooth-macos/goals.json`**
+(`$HOME`-anchored, работает под launchd). Формат — см. `config/goals.example.json`:
+`{ "goals": [8000, 10000, 12000] }`. Резолвинг: env `TREADMILL_GOALS_CONFIG`
+(override пути) → `$HOME/.config/.../goals.json` → вшитые дефолты
+`[8000,10000,12000]`. Нет файла — норма (INFO + дефолты); битый файл — WARN.
+Каждый пользователь приносит свой файл (например, симлинком из личного dotfiles-
+репо); правки активны после рестарта демона (`launchctl kickstart -k` или
+переустановка). Tier (яркость toast'а) — из ранга по возрастанию: низший порог →
+tier 1. Каждая цель празднуется ровно раз в день (local date, restart-safe через
+таблицу `goal_celebrations`). См. `docs/tasks/011-...md`.
 
 ## Заметки по macOS
 

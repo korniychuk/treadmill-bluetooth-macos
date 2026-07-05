@@ -16,28 +16,33 @@
 
 ## Решение
 
-### Конфиг: `config/goals.json`, ссылка через env-var (не копирование)
+### Конфиг: per-user, в `$HOME` (НЕ в этом репо)
 
-Файл коммитим в репозиторий (`config/goals.json`) — оператор явно хочет конфиг
-в репо. Формат минимальный, только список порогов:
+Цели — личная преференция пользователя, а не данные приложения, поэтому конфиг
+**не коммитится в этот репо**. Приложение мультипользовательское: каждый держит
+свой файл. Путь `$HOME`-anchored (работает под launchd, где cwd ненадёжен, см.
+`store.rs::open`):
+
+- **`~/.config/treadmill-bluetooth-macos/goals.json`** — дефолтный per-user путь.
+
+Формат минимальный, только список порогов (шаблон — `config/goals.example.json`):
 
 ```json
 { "goals": [8000, 10000, 12000] }
 ```
 
-**Резолвинг пути** (демон под launchd — надёжного cwd нет, см. рассуждение
-`store.rs::open`):
+**Резолвинг пути:**
 
-1. `TREADMILL_GOALS_CONFIG` (env) — если задан;
-2. `./config/goals.json` (относительно cwd) — удобство для `cargo run -- daemon`
-   из корня репо;
-3. иначе — вшитые дефолты `[8000, 10000, 12000]` + WARN (edge case).
+1. `TREADMILL_GOALS_CONFIG` (env) — override, если задан (тесты / нестандартный путь);
+2. `$HOME/.config/treadmill-bluetooth-macos/goals.json`;
+3. иначе — вшитые дефолты `[8000, 10000, 12000]`.
 
-`install-daemon.sh` прописывает `TREADMILL_GOALS_CONFIG` в plist, указывая на
-`${repo_root}/config/goals.json`. Так правки коммитнутого файла в репо
-**становятся активны на следующем рестарте демона**, без копирования в
-Application Support (где правки лежали бы инертно до переустановки). plist уже
-и так хардкодит repo-путь к бинарю, так что связность не растёт.
+Логирование edge cases: нет файла — это **норма** (INFO + дефолты), битый/нечитаемый
+файл — WARN. `install-daemon.sh` **ничего не прописывает** в plist (дефолтный путь
+работает сам). Пользователь приносит свой файл сам — напр. симлинком из личного
+dotfiles-репо (в случае оператора — `ankor-dotfiles/treadmill/goals.json` →
+`~/.config/treadmill-bluetooth-macos/goals.json`, симлинк ставит dotfiles
+`install.sh`).
 
 Битый/отсутствующий конфиг → дефолты + WARN (не падаем).
 
@@ -107,12 +112,12 @@ serde-зависимость.
 ## Затронутые файлы
 
 - `Cargo.toml` — `serde_json`.
-- `config/goals.json` — новый, коммитится.
+- `config/goals.example.json` — шаблон формата (реальный конфиг — per-user в `$HOME`, НЕ в репо).
 - `src/goals.rs` — новый модуль: загрузка/резолвинг, `assign_tiers`,
   `thresholds_to_celebrate`, тесты.
 - `src/store.rs` — таблица `goal_celebrations` + два метода + тесты.
 - `src/notify.rs` — `goal_reached`, звук в `toast`.
 - `src/daemon.rs` — проводка проверки целей.
 - `src/main.rs` — `goal_reached` в smoke-test `run_notify_test`.
-- `scripts/install-daemon.sh` — env-var `TREADMILL_GOALS_CONFIG` в plist.
+- `scripts/install-daemon.sh` — комментарий про per-user `$HOME`-путь (env больше не прописывается).
 </content>

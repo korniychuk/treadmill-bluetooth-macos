@@ -3,15 +3,21 @@
 //! Up to three goals (default 8000 / 10000 / 12000) each fire exactly one
 //! celebratory toast per calendar day when today's cumulative steps cross the
 //! threshold. This module owns three orthogonal, individually-testable pieces:
-//! loading/resolving the committed JSON config, mapping thresholds to
-//! celebration tiers, and the pure crossing decision. Persisting *which* goals
-//! were already celebrated today (restart safety) lives in [`crate::store`];
-//! delivering the toast lives in [`crate::notify`].
+//! loading/resolving the JSON config, mapping thresholds to celebration tiers,
+//! and the pure crossing decision. Persisting *which* goals were already
+//! celebrated today (restart safety) lives in [`crate::store`]; delivering the
+//! toast lives in [`crate::notify`].
+//!
+//! Config is per-user and lives OUTSIDE this repo — the goal set is the user's
+//! personal preference, not application data. It resolves to a `$HOME`-anchored
+//! path (see [`config_path`]); each user brings their own file (e.g. symlinked
+//! from a personal dotfiles repo). A missing file is normal and falls back to
+//! the compiled defaults.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Compiled-in fallback thresholds, used when the config file is missing or
 /// invalid so the daemon always has *some* goals (edge case → WARN, not fail).
@@ -22,16 +28,16 @@ const DEFAULT_THRESHOLDS: [i64; 3] = [8000, 10000, 12000];
 /// (lowest kept) with a WARN.
 const MAX_GOALS: usize = 3;
 
-/// Environment variable the LaunchAgent plist points at the repo-committed
-/// `config/goals.json` (see `scripts/install-daemon.sh`), so edits to the
-/// committed file take effect on the next daemon restart without a copy step.
+/// Optional environment variable to point at a goals config in a non-standard
+/// location (tests, or a user who does not want the `$HOME`-default path).
+/// Normally unset — the `$HOME`-anchored default is used.
 const CONFIG_ENV: &str = "TREADMILL_GOALS_CONFIG";
 
-/// Fallback config path relative to the current working directory — a
-/// convenience for `cargo run -- daemon` from the repo root. The daemon under
-/// launchd has no reliable cwd (see `store::open`), which is exactly why the
-/// plist sets [`CONFIG_ENV`] instead of relying on this.
-const CWD_CONFIG_PATH: &str = "config/goals.json";
+/// Per-user config path relative to `$HOME`. `$HOME`-anchored (not cwd) because
+/// the daemon runs under launchd with no reliable working directory — same
+/// reasoning as `store::open`. Users own this file (a personal dotfiles repo
+/// typically symlinks it here); it is intentionally NOT committed to this repo.
+const HOME_CONFIG_RELPATH: &str = ".config/treadmill-bluetooth-macos/goals.json";
 
 /// One configured daily step goal, with its celebration intensity tier
 /// (1 = quietest, 3 = loudest) derived from its rank among the goals.
@@ -47,26 +53,32 @@ pub struct Goal {
 /// to diagnose later.
 pub fn load_goals() -> Vec<Goal> {
     let thresholds = match config_path() {
-        Some(path) => read_thresholds(&path).unwrap_or_else(|| {
-            warn!(path = %path.display(), "goals config unreadable or invalid — using compiled-in defaults");
+        // Present but bad content is a genuine anomaly the user should notice.
+        Some(path) if path.exists() => read_thresholds(&path).unwrap_or_else(|| {
+            warn!(path = %path.display(), "goals config present but invalid — using compiled-in defaults");
             DEFAULT_THRESHOLDS.to_vec()
         }),
+        // No file is the normal case for a user who never customised goals.
+        Some(path) => {
+            info!(path = %path.display(), "no goals config file — using compiled-in defaults");
+            DEFAULT_THRESHOLDS.to_vec()
+        }
         None => {
-            warn!("no goals config path resolved — using compiled-in defaults");
+            warn!("could not resolve a goals config path ($HOME unset) — using compiled-in defaults");
             DEFAULT_THRESHOLDS.to_vec()
         }
     };
     assign_tiers(&thresholds)
 }
 
-/// Resolve the config file path: explicit env override first, then the cwd
-/// fallback if it exists. `None` means "use defaults".
+/// Resolve the config file path: explicit [`CONFIG_ENV`] override first, else
+/// the `$HOME`-anchored default. `None` only when `$HOME` is unset.
 fn config_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var(CONFIG_ENV) {
         return Some(PathBuf::from(path));
     }
-    let cwd_path = PathBuf::from(CWD_CONFIG_PATH);
-    cwd_path.exists().then_some(cwd_path)
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(HOME_CONFIG_RELPATH))
 }
 
 /// Read and parse `{ "goals": [8000, 10000, 12000] }`. Returns `None` on any
