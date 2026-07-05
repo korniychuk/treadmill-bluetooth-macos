@@ -447,6 +447,34 @@ impl Store {
         rows.collect::<rusqlite::Result<Vec<_>>>().context("collect all_workouts rows")
     }
 
+    /// Reconstruct the *raw* (pre-presence-filter) distance the belt moved over
+    /// a wall-clock window `[started_at, ended_at]`, in meters, from the
+    /// per-frame `raw_samples` device counter. Unlike the credited
+    /// `workouts.distance_m` (walking only), this includes the metres logged
+    /// while the belt spun with the operator off it — the amount presence
+    /// filtering drops (see `daemon::credit_or_hold`).
+    ///
+    /// Summing positive frame-to-frame deltas (rather than `MAX − MIN`) keeps
+    /// the figure correct when the treadmill power-cycles mid-window and its
+    /// cumulative counter resets to zero. Returns `None` when the window holds
+    /// no usable samples, so the caller can omit the hint rather than show 0.
+    pub fn raw_distance_m(&self, started_at: &str, ended_at: &str) -> Result<Option<i64>> {
+        let start_ms = DateTime::parse_from_rfc3339(started_at).context("parse workout started_at")?.timestamp_millis();
+        let end_ms = DateTime::parse_from_rfc3339(ended_at).context("parse workout ended_at")?.timestamp_millis();
+        let raw: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT SUM(CASE WHEN d > 0 THEN d ELSE 0 END) FROM (
+                    SELECT distance_m - LAG(distance_m) OVER (ORDER BY ts_ms) AS d
+                    FROM raw_samples WHERE ts_ms BETWEEN ?1 AND ?2
+                 )",
+                params![start_ms, end_ms],
+                |row| row.get(0),
+            )
+            .context("run raw_distance_m query")?;
+        Ok(raw)
+    }
+
     /// Upsert the single `daemon_status` row (id=0), same pattern as
     /// `device_baseline` — the daemon calls this on every observed
     /// transition (connect/disconnect, presence change, power mode change).

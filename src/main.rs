@@ -16,6 +16,8 @@ mod scan;
 mod sniff;
 mod store;
 
+use std::io::IsTerminal;
+
 use anyhow::Result;
 use btleplug::platform::Adapter;
 use chrono::{DateTime, Local, Utc};
@@ -217,18 +219,20 @@ fn run_stats(all: bool) -> Result<()> {
 }
 
 fn print_day(store: &store::Store, day: &store::DailyStats) -> Result<()> {
-    let minutes = day.walking_time_s / 60;
-    let seconds = day.walking_time_s % 60;
+    // The day header stays on filtered totals only: raw is shown per workout,
+    // where the [started_at, ended_at] window makes reconstruction exact. A
+    // day-level raw would have to sum workout spans, but `daily_stats` can
+    // credit activity that never became a `workouts` row (see the midnight /
+    // gap edge cases in `store`), so that sum would silently understate.
     println!(
-        "{}: {} steps, {:.2} km, {}m{:02}s walking",
+        "{}: {} steps, {:.2} km, {} walking",
         day.date,
         day.steps,
         day.distance_m as f64 / 1000.0,
-        minutes,
-        seconds
+        fmt_duration(day.walking_time_s),
     );
     for workout in store.workouts_for(&day.date)? {
-        print_workout_line(&workout, "");
+        print_workout_line(store, &workout, "");
     }
     Ok(())
 }
@@ -236,19 +240,73 @@ fn print_day(store: &store::Store, day: &store::DailyStats) -> Result<()> {
 /// One `workouts` row, indented under its day/status header. `marker` is
 /// appended verbatim (e.g. `" [in progress]"`) — empty for `stats`, which has
 /// no notion of "currently running".
-fn print_workout_line(workout: &store::Workout, marker: &str) {
-    let minutes = workout.walking_time_s / 60;
-    let seconds = workout.walking_time_s % 60;
+///
+/// The start→end range is spaced out with an arrow so the two clock times read
+/// as distinct endpoints, not one run-on token. A dim `(raw …)` hint after the
+/// distance and after the walking time shows the pre-filter figure — belt
+/// distance/time including the moments the operator stepped off while it kept
+/// spinning (see `store::raw_distance_m`); omitted when there's nothing extra.
+fn print_workout_line(store: &store::Store, workout: &store::Workout, marker: &str) {
+    let (raw_dist, raw_time) = workout_raw(store, workout);
+    let dist_hint = raw_hint(
+        raw_dist.is_some_and(|d| d > workout.distance_m),
+        &format!("{:.2}", raw_dist.unwrap_or(0) as f64 / 1000.0),
+    );
+    let time_hint = raw_hint(
+        raw_time.is_some_and(|t| t > workout.walking_time_s),
+        &fmt_duration(raw_time.unwrap_or(0)),
+    );
     println!(
-        "  #{} {}\u{2013}{}: {} steps, {:.2} km, {}m{:02}s{marker}",
+        "  #{}  {} \u{2192} {}   {} steps, {:.2} km{dist_hint}, {}{time_hint}{marker}",
         workout.id,
         format_local_time(&workout.started_at),
         format_local_time(&workout.ended_at),
         workout.steps,
         workout.distance_m as f64 / 1000.0,
-        minutes,
-        seconds
+        fmt_duration(workout.walking_time_s),
+        dist_hint = dist_hint,
+        time_hint = time_hint,
     );
+}
+
+/// Raw (pre-filter) distance (meters) and time (seconds) for a workout, or
+/// `None` for either when the reconstruction can't be trusted — no samples in
+/// the window, or a figure that came back *below* the filtered total (a sign
+/// of missing samples, since raw must be a superset of walking). The caller
+/// then omits that hint rather than showing a misleading value.
+fn workout_raw(store: &store::Store, workout: &store::Workout) -> (Option<i64>, Option<i64>) {
+    let dist = store
+        .raw_distance_m(&workout.started_at, &workout.ended_at)
+        .ok()
+        .flatten()
+        .filter(|&d| d >= workout.distance_m);
+    let time = raw_span_s(&workout.started_at, &workout.ended_at).filter(|&t| t >= workout.walking_time_s);
+    (dist, time)
+}
+
+/// Wall-clock span of a workout in seconds — its raw time, before presence
+/// filtering carves out the belt-spinning-but-not-walking gaps. `None` on an
+/// unparseable or negative span.
+fn raw_span_s(started_at: &str, ended_at: &str) -> Option<i64> {
+    let start = DateTime::parse_from_rfc3339(started_at).ok()?;
+    let end = DateTime::parse_from_rfc3339(ended_at).ok()?;
+    let secs = (end - start).num_seconds();
+    (secs >= 0).then_some(secs)
+}
+
+fn fmt_duration(seconds: i64) -> String {
+    format!("{}m{:02}s", seconds / 60, seconds % 60)
+}
+
+/// A dim `" (raw <value>)"` hint when `show` is true, else empty. Dimming uses
+/// the ANSI faint code, but only on a TTY — piping `tm stats` into a file or
+/// `grep` gets clean text with no escape sequences.
+fn raw_hint(show: bool, value: &str) -> String {
+    if !show {
+        return String::new();
+    }
+    let hint = format!(" (raw {value})");
+    if std::io::stdout().is_terminal() { format!("\x1b[2m{hint}\x1b[0m") } else { hint }
 }
 
 /// Duplicated from `daemon::WATCHDOG_STALE_THRESHOLD` (private to
@@ -323,7 +381,7 @@ fn run_status() -> Result<()> {
         let in_progress = status.as_ref().is_some_and(|s| s.connected && s.presence_state.as_deref() == Some("Walking"));
         for workout in &workouts {
             let marker = if in_progress && Some(workout.id) == last_id { " [in progress]" } else { "" };
-            print_workout_line(workout, marker);
+            print_workout_line(&store, workout, marker);
         }
     }
 
