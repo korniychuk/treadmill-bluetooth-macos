@@ -184,6 +184,40 @@ mod tests {
     }
 
     #[test]
+    fn read_thresholds_parses_a_non_default_config() {
+        // Non-default set so a silent fall-back to DEFAULT_THRESHOLDS (the same
+        // as the committed config) can't disguise a parse regression.
+        let dir = std::env::temp_dir().join(format!("tm-goals-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("goals.json");
+        std::fs::write(&path, r#"{ "goals": [5000, 7000] }"#).unwrap();
+
+        let parsed = read_thresholds(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(parsed, Some(vec![5000, 7000]));
+    }
+
+    #[test]
+    fn read_thresholds_rejects_junk_and_empty() {
+        let dir = std::env::temp_dir().join(format!("tm-goals-junk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("bad.json");
+        std::fs::write(&bad, "not json at all").unwrap();
+        assert_eq!(read_thresholds(&bad), None, "malformed JSON → None (caller uses defaults)");
+
+        let empty = dir.join("empty.json");
+        std::fs::write(&empty, r#"{ "goals": [] }"#).unwrap();
+        assert_eq!(read_thresholds(&empty), None, "no usable thresholds → None");
+
+        let missing = dir.join("does-not-exist.json");
+        assert_eq!(read_thresholds(&missing), None, "missing file → None");
+
+        std::fs::remove_file(&bad).ok();
+        std::fs::remove_file(&empty).ok();
+    }
+
+    #[test]
     fn subset_of_goals_only_celebrates_configured_ones() {
         // Only two goals configured — 12k is not a goal, so 12100 steps still
         // only celebrates the configured 10k (8k already done).
