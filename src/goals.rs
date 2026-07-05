@@ -23,6 +23,12 @@ use tracing::{info, warn};
 /// invalid so the daemon always has *some* goals (edge case → WARN, not fail).
 const DEFAULT_THRESHOLDS: [i64; 3] = [8000, 10000, 12000];
 
+/// Default workout-gap in minutes (задача 014): adjacent activity segments
+/// separated by a read-time gap ≤ this render as one workout. Used when the
+/// config file is missing, the `workout_gap_minutes` key is absent, or its
+/// value is invalid.
+pub const DEFAULT_WORKOUT_GAP_MINUTES: i64 = 15;
+
 /// Hard cap on configured goals — three tiers of celebration copy exist, so a
 /// fourth goal has nowhere sensible to land. Extra thresholds are dropped
 /// (lowest kept) with a WARN.
@@ -89,6 +95,66 @@ fn read_thresholds(path: &std::path::Path) -> Option<Vec<i64>> {
     let goals = value.get("goals")?.as_array()?;
     let thresholds: Vec<i64> = goals.iter().filter_map(|v| v.as_i64()).filter(|&t| t > 0).collect();
     (!thresholds.is_empty()).then_some(thresholds)
+}
+
+/// Parse outcome of the optional `workout_gap_minutes` key. The three cases are
+/// kept distinct so the caller can log the *anomalous* one (present-but-invalid)
+/// without spamming on the *normal* one (key absent — every pre-014 config lacks
+/// it) on the hot `tm widget` poll path. See [`load_workout_gap_minutes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GapSetting {
+    /// Key present and a positive integer.
+    Configured(i64),
+    /// Key present but not a positive integer, or the file is unreadable/malformed.
+    Invalid,
+    /// Key absent (normal for a config written before this key existed).
+    Unset,
+}
+
+/// Read `workout_gap_minutes` from the per-user config. Pure and unit-tested —
+/// the logging/fallback decision lives in [`load_workout_gap_minutes`].
+fn read_workout_gap_minutes(path: &std::path::Path) -> GapSetting {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return GapSetting::Invalid;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return GapSetting::Invalid;
+    };
+    match value.get("workout_gap_minutes") {
+        None => GapSetting::Unset,
+        Some(v) => match v.as_i64() {
+            Some(n) if n > 0 => GapSetting::Configured(n),
+            _ => GapSetting::Invalid,
+        },
+    }
+}
+
+/// Load the configured workout-gap (minutes), falling back to
+/// [`DEFAULT_WORKOUT_GAP_MINUTES`] when unconfigured or invalid. This is a
+/// READ-TIME parameter (задача 014): it groups adjacent activity segments into
+/// displayed workouts, so it is loaded by the read commands (`stats`, `status`,
+/// `widget`), not the segment-writing daemon.
+///
+/// Logging is deliberately quiet on the common paths — this runs on `widget`'s
+/// ~2s poll: an absent key (every pre-014 config) and a missing file are normal
+/// and silent; only a present-but-invalid value is an anomaly worth a WARN.
+pub fn load_workout_gap_minutes() -> i64 {
+    match config_path() {
+        Some(path) if path.exists() => match read_workout_gap_minutes(&path) {
+            GapSetting::Configured(minutes) => minutes,
+            GapSetting::Unset => DEFAULT_WORKOUT_GAP_MINUTES,
+            GapSetting::Invalid => {
+                warn!(
+                    path = %path.display(),
+                    default = DEFAULT_WORKOUT_GAP_MINUTES,
+                    "workout_gap_minutes present but not a positive integer — using default",
+                );
+                DEFAULT_WORKOUT_GAP_MINUTES
+            }
+        },
+        // No file / no resolvable path is the normal uncustomised case.
+        _ => DEFAULT_WORKOUT_GAP_MINUTES,
+    }
 }
 
 /// Turn raw thresholds into tiered [`Goal`]s: sort ascending, dedup, cap to
@@ -227,6 +293,41 @@ mod tests {
 
         std::fs::remove_file(&bad).ok();
         std::fs::remove_file(&empty).ok();
+    }
+
+    #[test]
+    fn read_workout_gap_minutes_distinguishes_configured_absent_and_invalid() {
+        let dir = std::env::temp_dir().join(format!("tm-gap-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let good = dir.join("good.json");
+        std::fs::write(&good, r#"{ "goals": [8000], "workout_gap_minutes": 20 }"#).unwrap();
+        assert_eq!(read_workout_gap_minutes(&good), GapSetting::Configured(20));
+
+        // Key absent — normal for a config written before задача 014.
+        let absent = dir.join("absent.json");
+        std::fs::write(&absent, r#"{ "goals": [8000] }"#).unwrap();
+        assert_eq!(read_workout_gap_minutes(&absent), GapSetting::Unset);
+
+        // Present but not a positive integer → Invalid (caller WARNs + defaults).
+        let zero = dir.join("zero.json");
+        std::fs::write(&zero, r#"{ "workout_gap_minutes": 0 }"#).unwrap();
+        assert_eq!(read_workout_gap_minutes(&zero), GapSetting::Invalid);
+        let neg = dir.join("neg.json");
+        std::fs::write(&neg, r#"{ "workout_gap_minutes": -5 }"#).unwrap();
+        assert_eq!(read_workout_gap_minutes(&neg), GapSetting::Invalid);
+        let str_val = dir.join("str.json");
+        std::fs::write(&str_val, r#"{ "workout_gap_minutes": "15" }"#).unwrap();
+        assert_eq!(read_workout_gap_minutes(&str_val), GapSetting::Invalid);
+
+        // Malformed JSON → Invalid.
+        let junk = dir.join("junk.json");
+        std::fs::write(&junk, "not json").unwrap();
+        assert_eq!(read_workout_gap_minutes(&junk), GapSetting::Invalid);
+
+        for f in [good, absent, zero, neg, str_val, junk] {
+            std::fs::remove_file(f).ok();
+        }
     }
 
     #[test]

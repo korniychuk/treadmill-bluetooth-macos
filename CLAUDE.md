@@ -25,9 +25,17 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
 - `src/presence.rs` — детекция присутствия: лента крутится, но шаги не растут → `AwayWhileRunning`.
 - `src/store.rs` — SQLite (`~/Library/Application Support/treadmill-bluetooth-macos/treadmill.db`),
   дневная статистика (шаги/дистанция/время ходьбы), restart-safe дельта-накопление.
+  Тренировки хранятся как порог-независимые **сегменты** (`activity_segments`,
+  задача 014) — непрерывное зачтённое шагание; отображаемые тренировки
+  выводятся на **чтении** чистой `merge_segments(&[Segment], gap_minutes)`, так
+  что `workout_gap_minutes` меняется ретроактивно без пересчёта. `daily_stats`
+  — строго календарный, не тронут. Старая таблица `workouts` оставлена архивом
+  (сид сегментов из неё одноразовый, ничто в неё больше не пишет).
 - `src/daemon.rs` — фоновый цикл (LaunchAgent): авто-скан/коннект/реконнект +
-  presence + toast; на resume после паузы авто-восстанавливает pre-pause
-  скорость ленты через `control.rs` (bounded BLE-write, см. `docs/tasks/012`).
+  presence + toast; открывает/продлевает **сегмент** активности на зачтённом
+  шаге и закрывает его (in-memory `current_segment=None`) в presence-переходе
+  при уходе из `Walking` (задача 014); на resume после паузы авто-восстанавливает
+  pre-pause скорость ленты через `control.rs` (bounded BLE-write, см. `docs/tasks/012`).
   Единственный владелец BLE-линка: команды управления (`tm speed`/`start`/`stop`)
   от CLI идут через SQLite-очередь `control_commands` и исполняются здесь на живом
   подключении (задача 013). CLI напрямую открывает BLE только если демон не держит линк.
@@ -38,6 +46,8 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
   toast'ы presence/goal, компактный форматтер длительности `humanize_short`.
 - `src/goals.rs` — дневные step-goal вехи: загрузка `config/goals.json`,
   присвоение tier'ов (1–3), чистая функция «какие пороги праздновать сейчас».
+  Плюс `load_workout_gap_minutes()` — read-time порог склейки сегментов в
+  тренировки из того же `goals.json` (задача 014, дефолт 15).
 - `src/logger.rs` — сырой JSONL-лог телеметрии (source-of-truth параллельно с SQLite).
 
 ## Протокол
@@ -82,7 +92,11 @@ scripts/build-icon.sh        # перегенерировать macos/AppIcon.ic
 Дневные цели по шагам (до 3) — **per-user**, конфиг живёт **не в этом репо**, а в
 домашней директории: **`~/.config/treadmill-bluetooth-macos/goals.json`**
 (`$HOME`-anchored, работает под launchd). Формат — см. `config/goals.example.json`:
-`{ "goals": [8000, 10000, 12000] }`. Резолвинг: env `TREADMILL_GOALS_CONFIG`
+`{ "goals": [8000, 10000, 12000], "workout_gap_minutes": 15 }`. Опциональный
+`workout_gap_minutes` (задача 014, дефолт 15) — read-time порог: соседние
+сегменты активности с разрывом ≤ него показываются одной тренировкой; меняется
+ретроактивно (без пересчёта). Отсутствует/битый ключ → дефолт (absent — тихо,
+т.к. `widget` читает раз в 2 с; невалидное значение → WARN). Резолвинг: env `TREADMILL_GOALS_CONFIG`
 (override пути) → `$HOME/.config/.../goals.json` → вшитые дефолты
 `[8000,10000,12000]`. Нет файла — норма (INFO + дефолты); битый файл — WARN.
 Каждый пользователь приносит свой файл (например, симлинком из личного dotfiles-

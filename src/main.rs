@@ -61,13 +61,14 @@ enum Commands {
     /// never opens the BLE adapter itself, so it cannot contend with a
     /// running daemon for it (see docs/tasks/006, задача B).
     Status,
-    /// Emit a compact, machine-readable snapshot of the current workout for a
-    /// status-bar widget (tmux/Dracula). Prints one TSV line
-    /// `state\twalking_s\tsteps\tdistance_m` while the treadmill is connected
-    /// and the daemon heartbeat is fresh, or nothing at all otherwise (so the
-    /// widget hides). `walking_s` is the presence-filtered walking time (no
+    /// Emit a compact, machine-readable snapshot for a status-bar widget
+    /// (tmux/Dracula). Prints one TSV line `state\tworkout_count\tcur_walking_s\t
+    /// cur_steps\tcur_distance_m\tday_walking_s\tday_steps\tday_distance_m` while
+    /// the treadmill is connected and the daemon heartbeat is fresh, or nothing
+    /// at all otherwise (so the widget hides). `cur_*` is the current workout,
+    /// `day_*` today's calendar totals; both are presence-filtered walking (no
     /// step-away/pause). Like `status`, never opens the BLE adapter. See
-    /// docs/tasks/009.
+    /// docs/tasks/009 and 014.
     Widget,
     /// Start the belt via the FTMS Control Point.
     Start,
@@ -251,22 +252,25 @@ fn run_notify_test() -> Result<()> {
 /// each followed by its per-workout breakdown (see docs/tasks/006, задача C).
 fn run_stats(all: bool) -> Result<()> {
     let store = store::Store::open()?;
+    // Read-time workout grouping threshold (задача 014); daily totals below are
+    // unaffected (strictly calendar, straight from `daily_stats`).
+    let gap_minutes = goals::load_workout_gap_minutes();
     if all {
         for day in store.all_stats()? {
-            print_day(&store, &day)?;
+            print_day(&store, &day, gap_minutes)?;
         }
     } else {
-        print_day(&store, &store.today_stats()?)?;
+        print_day(&store, &store.today_stats()?, gap_minutes)?;
     }
     Ok(())
 }
 
-fn print_day(store: &store::Store, day: &store::DailyStats) -> Result<()> {
+fn print_day(store: &store::Store, day: &store::DailyStats, gap_minutes: i64) -> Result<()> {
     // The day header stays on filtered totals only: raw is shown per workout,
     // where the [started_at, ended_at] window makes reconstruction exact. A
     // day-level raw would have to sum workout spans, but `daily_stats` can
-    // credit activity that never became a `workouts` row (see the midnight /
-    // gap edge cases in `store`), so that sum would silently understate.
+    // credit activity that never landed under this day's workouts (see the
+    // midnight edge case in `store`), so that sum would silently understate.
     println!(
         "{}: {} steps, {:.2} km, {} walking",
         day.date,
@@ -274,7 +278,7 @@ fn print_day(store: &store::Store, day: &store::DailyStats) -> Result<()> {
         day.distance_m as f64 / 1000.0,
         fmt_duration(day.walking_time_s),
     );
-    for workout in store.workouts_for(&day.date)? {
+    for workout in store.workouts_for(&day.date, gap_minutes)? {
         print_workout_line(store, &workout, "");
     }
     Ok(())
@@ -359,8 +363,8 @@ fn raw_hint(show: bool, value: &str) -> String {
 const WATCHDOG_STALE_THRESHOLD_S: i64 = 15 /* scan */ + 20 /* connect */ + 60 /* margin */;
 
 /// Print daemon/treadmill/power state and today's workouts, reading only
-/// SQLite (`daemon_status` + `workouts`) and `launchctl` — never touches the
-/// BLE adapter, so it cannot contend with a running daemon for it.
+/// SQLite (`daemon_status` + `activity_segments`) and `launchctl` — never
+/// touches the BLE adapter, so it cannot contend with a running daemon for it.
 fn run_status() -> Result<()> {
     let store = store::Store::open()?;
     let status = store.daemon_status()?;
@@ -416,7 +420,7 @@ fn run_status() -> Result<()> {
     println!();
     println!("today's workouts:");
     let today = Local::now().format("%Y-%m-%d").to_string();
-    let workouts = store.workouts_for(&today)?;
+    let workouts = store.workouts_for(&today, goals::load_workout_gap_minutes())?;
     if workouts.is_empty() {
         println!("  (none yet today)");
     } else {
@@ -434,6 +438,17 @@ fn run_status() -> Result<()> {
 /// Emit one TSV line for the status-bar widget, or nothing at all when the
 /// treadmill is not on/connected (so the widget hides). Read-only, no BLE —
 /// mirrors `run_status`'s constraint. See docs/tasks/009.
+///
+/// The line is tab-separated with 8 fields (задача 014 extension):
+/// `state \t workout_count \t cur_walking_s \t cur_steps \t cur_distance_m \t
+/// day_walking_s \t day_steps \t day_distance_m`.
+/// - `state` — `walking | away | paused | unknown`.
+/// - `workout_count` — number of TODAY's *merged* workouts (reflects the
+///   configured `workout_gap_minutes`), so the widget can pick a single- vs
+///   multi-workout layout.
+/// - `cur_*` — the current (latest) workout's aggregates (sum of its segments).
+/// - `day_*` — today's `daily_stats` totals (credited walking only, so already
+///   free of step-away/pauses). `cur_* ≤ day_*` by construction.
 fn run_widget() -> Result<()> {
     let store = store::Store::open()?;
 
@@ -448,17 +463,26 @@ fn run_widget() -> Result<()> {
     };
 
     let state = widget_state(status.presence_state.as_deref());
-    // `walking_time_s` is the *credited* walking time — the presence filter has
-    // already excluded step-away and paused stretches (this is the `36m27s`, not
-    // the `raw 41m42s`, that `stats` prints). It also auto-freezes when not
-    // walking, since nothing is credited then. Exactly the "filtered" time the
-    // widget should show.
-    let (walking_s, steps, distance_m) = match store.latest_workout()? {
+    let gap_minutes = goals::load_workout_gap_minutes();
+
+    // Current (latest) workout: `walking_time_s` is the *credited* walking time —
+    // the presence filter has already excluded step-away and paused stretches
+    // (the `36m27s`, not the `raw 41m42s`, that `stats` prints). It auto-freezes
+    // when not walking, since nothing is credited then.
+    let (cur_walking_s, cur_steps, cur_distance_m) = match store.latest_workout(gap_minutes)? {
         Some(workout) => (workout.walking_time_s, workout.steps, workout.distance_m),
         None => (0, 0, 0),
     };
 
-    println!("{state}\t{walking_s}\t{steps}\t{distance_m}");
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let workout_count = store.workouts_for(&today, gap_minutes)?.len();
+    // Today's calendar totals, straight from `daily_stats` (credited walking).
+    let day = store.today_stats()?;
+
+    println!(
+        "{state}\t{workout_count}\t{cur_walking_s}\t{cur_steps}\t{cur_distance_m}\t{}\t{}\t{}",
+        day.walking_time_s, day.steps, day.distance_m,
+    );
     Ok(())
 }
 

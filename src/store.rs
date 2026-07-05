@@ -33,10 +33,6 @@ use crate::ftms::TreadmillData;
 /// the daemon's 30s staleness guard, so a still-relevant row is never dropped.
 const CONTROL_COMMAND_RETENTION: Duration = Duration::minutes(5);
 
-/// Gap between two credited activity bursts past which we consider it a new
-/// workout rather than a continuation (see module docs on `credit_activity`).
-const WORKOUT_GAP_THRESHOLD_S: i64 = 15 * 60;
-
 /// Aggregated totals for a single calendar day (local time).
 #[derive(Debug, Clone, Default)]
 pub struct DailyStats {
@@ -46,14 +42,38 @@ pub struct DailyStats {
     pub walking_time_s: i64,
 }
 
-/// One contiguous burst of walking, split from adjacent bursts by a gap of
-/// more than [`WORKOUT_GAP_THRESHOLD_S`] with no credited activity.
+/// One continuous credited-walking spell (задача 014). A segment is OPEN while
+/// the operator is walking and CLOSED the moment presence leaves `Walking` (a
+/// pause `speed=0` or a step-away `AwayWhileRunning`); the daemon tracks the
+/// open segment's id in memory and closes it on the presence transition. This
+/// is the threshold-*independent* storage grain — displayed workouts are
+/// derived from segments at read time by [`merge_segments`], so the workout-gap
+/// can change retroactively without any rewrite.
 ///
-/// `date` is fixed to the calendar date (local time) of `started_at` and
-/// never changes, even if the workout is still open when the credit that
-/// extends `ended_at` crosses into the next calendar day — see
-/// `credit_activity` docs for the midnight-crossing edge case this implies
-/// for `daily_stats` vs. `workouts` reconciliation.
+/// `date` is fixed to the calendar date (local time) of `started_at` and never
+/// changes, even if a credited burst extends `ended_at` past local midnight.
+#[derive(Debug, Clone, Default)]
+pub struct Segment {
+    pub id: i64,
+    pub date: String,
+    pub started_at: String,
+    pub ended_at: String,
+    pub distance_m: i64,
+    pub steps: i64,
+    pub walking_time_s: i64,
+}
+
+/// One displayed workout: the merge of adjacent [`Segment`]s whose inter-segment
+/// gap is ≤ the configured `workout_gap_minutes` (see [`merge_segments`]). This
+/// is a read-time projection, never stored.
+///
+/// `date` is the start day of the first segment (workout attribution stays by
+/// start-date), so on a midnight-crossing workout the day's `daily_stats` total
+/// need not equal the sum of the workouts shown under it — that is intentional;
+/// `daily_stats` is split strictly by calendar day, independent of workouts.
+///
+/// `id` is the id of the workout's first segment — stable and unique, so the
+/// `status` "in progress" marker and the `#N` label stay meaningful.
 #[derive(Debug, Clone, Default)]
 pub struct Workout {
     pub id: i64,
@@ -188,6 +208,16 @@ impl Store {
                     walking_time_s INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_workouts_date ON workouts(date);
+                CREATE TABLE IF NOT EXISTS activity_segments (
+                    id INTEGER PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    distance_m INTEGER NOT NULL DEFAULT 0,
+                    steps INTEGER NOT NULL DEFAULT 0,
+                    walking_time_s INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_activity_segments_date ON activity_segments(date);
                 CREATE TABLE IF NOT EXISTS daemon_status (
                     id INTEGER PRIMARY KEY CHECK (id = 0),
                     connected INTEGER NOT NULL,
@@ -216,6 +246,39 @@ impl Store {
                 ",
             )
             .context("run schema migration")?;
+        self.seed_segments_from_workouts()?;
+        Ok(())
+    }
+
+    /// One-time seed of `activity_segments` from the legacy `workouts` table
+    /// (задача 014). Each historical workout becomes a single segment; older
+    /// history is not re-split finer than its original 15-min grain but *is*
+    /// re-merged by the current gap at read time, which is acceptable (history
+    /// is tiny). Guarded on an empty `activity_segments` so it runs exactly
+    /// once and never after the daemon has begun writing real segments.
+    ///
+    /// The `workouts` table is intentionally kept (not dropped) as an untouched
+    /// archive: seeding is then non-destructive and fully reversible on review —
+    /// see `docs/tasks/014`. Nothing writes to `workouts` anymore.
+    fn seed_segments_from_workouts(&self) -> Result<()> {
+        let segment_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM activity_segments", [], |row| row.get(0))
+            .context("count activity_segments for seeding")?;
+        if segment_count > 0 {
+            return Ok(());
+        }
+        let seeded = self
+            .conn
+            .execute(
+                "INSERT INTO activity_segments (id, started_at, ended_at, date, distance_m, steps, walking_time_s)
+                 SELECT id, started_at, ended_at, date, distance_m, steps, walking_time_s FROM workouts",
+                [],
+            )
+            .context("seed activity_segments from workouts")?;
+        if seeded > 0 {
+            tracing::info!(seeded, "seeded activity_segments from legacy workouts table (задача 014, one-time)");
+        }
         Ok(())
     }
 
@@ -293,28 +356,35 @@ impl Store {
     }
 
     /// Credit an already-decided amount of walking to both today's totals
-    /// (`daily_stats`, unchanged behavior) and the current workout
-    /// (`workouts`), splitting into a new workout row when the gap since the
-    /// most recently credited activity exceeds [`WORKOUT_GAP_THRESHOLD_S`]
-    /// (or none has been credited yet). Both updates happen in one
-    /// transaction so a crash mid-credit cannot leave them disagreeing.
+    /// (`daily_stats`, unchanged calendar-split behavior) and the currently-open
+    /// activity segment (`activity_segments`), in one transaction so a crash
+    /// mid-credit cannot leave them disagreeing.
     ///
-    /// `now` is threaded through explicitly (rather than calling
-    /// `Utc::now()` internally, like the rest of this module) so the workout
-    /// split/continue decision is deterministic in tests.
+    /// `open_segment` is the id of the segment the daemon considers open (from
+    /// its in-memory `current_segment`): `Some(id)` extends it, `None` opens a
+    /// new segment. Returns the id of the segment credited (the existing one, or
+    /// the freshly inserted one), which the caller stores back as its open
+    /// segment. There is no `open` flag in the DB — "open" lives in daemon
+    /// memory, so a daemon restart simply starts a new segment and read-time
+    /// [`merge_segments`] re-joins it to the pre-restart one if the gap is under
+    /// the configured threshold (same restart reasoning as `device_baseline`).
     ///
-    /// There is no explicit "closed" flag on `workouts` rows — the most
-    /// recently started row is implicitly the open one; "closing" it just
-    /// means the next credit starts a new row instead of extending it.
+    /// `now` is threaded through explicitly (rather than calling `Utc::now()`
+    /// internally, like the rest of this module) so the segment start/extend is
+    /// deterministic in tests.
     ///
-    /// Midnight-crossing edge case: `workouts.date` is fixed to the calendar
-    /// date of `started_at` and never changes while the workout is extended,
-    /// even past local midnight. So "daily total == sum of that day's
-    /// workouts" holds for the day a workout *started* in, but not
-    /// necessarily for the day it *ended* in if those differ — `daily_stats`
-    /// still gets the correct split by calendar day of each individual
-    /// credit, since it does not know about workout boundaries at all.
-    pub fn credit_activity(&mut self, steps: i64, distance_m: i64, walking_time_s: i64, now: DateTime<Utc>) -> Result<()> {
+    /// Midnight-crossing edge case: a segment's `date` is fixed to the calendar
+    /// date of `started_at` and never changes while it is extended, even past
+    /// local midnight. `daily_stats`, in contrast, gets the correct split by
+    /// calendar day of each individual credit — it knows nothing about segments.
+    pub fn credit_activity(
+        &mut self,
+        steps: i64,
+        distance_m: i64,
+        walking_time_s: i64,
+        now: DateTime<Utc>,
+        open_segment: Option<i64>,
+    ) -> Result<i64> {
         let today = now.with_timezone(&Local).format("%Y-%m-%d").to_string();
         let tx = self.conn.transaction().context("begin credit_activity transaction")?;
 
@@ -329,47 +399,48 @@ impl Store {
         )
         .context("credit daily_stats")?;
 
-        let latest: Option<(i64, String)> = tx
-            .query_row("SELECT id, ended_at FROM workouts ORDER BY id DESC LIMIT 1", [], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .optional()
-            .context("read latest workout")?;
-
-        let continues_latest = latest.as_ref().is_some_and(|(_, ended_at)| {
-            match DateTime::parse_from_rfc3339(ended_at) {
-                Ok(prev) => now - prev.with_timezone(&Utc) <= Duration::seconds(WORKOUT_GAP_THRESHOLD_S),
-                Err(err) => {
-                    // Corrupt/foreign timestamp — treat as a gap rather than
-                    // fail the whole credit; log so it's not silently masked.
-                    tracing::warn!(%err, ended_at, "workouts.ended_at not RFC3339, starting a new workout");
-                    false
+        // Extend the open segment if the daemon still holds one *and* it really
+        // exists (a stale id — e.g. a wiped DB under a long-lived daemon — must
+        // not silently no-op the UPDATE and lose the credit); otherwise open a
+        // new segment.
+        let extended = match open_segment {
+            Some(id) => {
+                let rows = tx
+                    .execute(
+                        "UPDATE activity_segments SET
+                            ended_at = ?1,
+                            distance_m = distance_m + ?2,
+                            steps = steps + ?3,
+                            walking_time_s = walking_time_s + ?4
+                         WHERE id = ?5",
+                        params![now.to_rfc3339(), distance_m, steps, walking_time_s, id],
+                    )
+                    .context("extend activity segment")?;
+                if rows == 0 {
+                    tracing::warn!(id, "open segment id not found — opening a new segment instead");
+                    None
+                } else {
+                    Some(id)
                 }
             }
-        });
+            None => None,
+        };
 
-        if let Some((id, _)) = latest.filter(|_| continues_latest) {
-            tx.execute(
-                "UPDATE workouts SET
-                    ended_at = ?1,
-                    distance_m = distance_m + ?2,
-                    steps = steps + ?3,
-                    walking_time_s = walking_time_s + ?4
-                 WHERE id = ?5",
-                params![now.to_rfc3339(), distance_m, steps, walking_time_s, id],
-            )
-            .context("extend workout")?;
-        } else {
-            tx.execute(
-                "INSERT INTO workouts (date, started_at, ended_at, distance_m, steps, walking_time_s)
-                 VALUES (?1, ?2, ?2, ?3, ?4, ?5)",
-                params![today, now.to_rfc3339(), distance_m, steps, walking_time_s],
-            )
-            .context("insert workout")?;
-        }
+        let segment_id = match extended {
+            Some(id) => id,
+            None => {
+                tx.execute(
+                    "INSERT INTO activity_segments (started_at, ended_at, date, distance_m, steps, walking_time_s)
+                     VALUES (?1, ?1, ?2, ?3, ?4, ?5)",
+                    params![now.to_rfc3339(), today, distance_m, steps, walking_time_s],
+                )
+                .context("insert activity segment")?;
+                tx.last_insert_rowid()
+            }
+        };
 
         tx.commit().context("commit credit_activity transaction")?;
-        Ok(())
+        Ok(segment_id)
     }
 
     /// Persist one decoded Treadmill Data (`0x2ACD`) sample verbatim.
@@ -462,44 +533,40 @@ impl Store {
         rows.collect::<rusqlite::Result<Vec<_>>>().context("collect all_stats rows")
     }
 
-    /// Workouts whose `date` (start day) is the given `YYYY-MM-DD`, oldest first.
-    pub fn workouts_for(&self, date: &str) -> Result<Vec<Workout>> {
+    /// All recorded activity segments, oldest first (by `started_at`). The
+    /// storage grain behind every displayed workout — few rows per day, so
+    /// loading all of them and merging in memory is cheap (see the merge
+    /// call sites). Ordered ascending so [`merge_segments`] sees them
+    /// chronologically.
+    fn all_segments_asc(&self) -> Result<Vec<Segment>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT id, date, started_at, ended_at, distance_m, steps, walking_time_s
-                 FROM workouts WHERE date = ?1 ORDER BY id ASC",
+                 FROM activity_segments ORDER BY started_at ASC, id ASC",
             )
-            .context("prepare workouts_for query")?;
-        let rows = stmt.query_map(params![date], workout_from_row).context("run workouts_for query")?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().context("collect workouts_for rows")
+            .context("prepare all_segments query")?;
+        let rows = stmt.query_map([], segment_from_row).context("run all_segments query")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("collect all_segments rows")
     }
 
-    /// All recorded workouts, most recently started first.
-    pub fn all_workouts(&self) -> Result<Vec<Workout>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT id, date, started_at, ended_at, distance_m, steps, walking_time_s
-                 FROM workouts ORDER BY id DESC",
-            )
-            .context("prepare all_workouts query")?;
-        let rows = stmt.query_map([], workout_from_row).context("run all_workouts query")?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().context("collect all_workouts rows")
+    /// Workouts whose start day is the given `YYYY-MM-DD`, oldest first, derived
+    /// by merging segments at the configured `gap_minutes` (задача 014). Merging
+    /// spans the whole segment history (not just this day's) so a workout that
+    /// began just before local midnight correctly absorbs the after-midnight
+    /// segments before the day filter is applied.
+    pub fn workouts_for(&self, date: &str, gap_minutes: i64) -> Result<Vec<Workout>> {
+        let merged = merge_segments(&self.all_segments_asc()?, gap_minutes);
+        Ok(merged.into_iter().filter(|w| w.date == date).collect())
     }
 
-    /// The most recently started workout, or `None` if none recorded. Backs the
-    /// `widget` command, which surfaces the current session's live metrics.
-    pub fn latest_workout(&self) -> Result<Option<Workout>> {
-        self.conn
-            .query_row(
-                "SELECT id, date, started_at, ended_at, distance_m, steps, walking_time_s
-                 FROM workouts ORDER BY id DESC LIMIT 1",
-                [],
-                workout_from_row,
-            )
-            .optional()
-            .context("query latest_workout")
+    /// The most recently started (derived) workout, or `None` if none recorded.
+    /// Backs the `widget` command, which surfaces the current session's live
+    /// metrics; its `walking_time_s`/`steps`/`distance_m` are the sum over the
+    /// segments merged into that newest workout. Merges the whole (tiny) segment
+    /// history each call — fine at this scale, and simpler than a partial merge.
+    pub fn latest_workout(&self, gap_minutes: i64) -> Result<Option<Workout>> {
+        Ok(merge_segments(&self.all_segments_asc()?, gap_minutes).pop())
     }
 
     /// Reconstruct the *raw* (pre-presence-filter) distance the belt moved over
@@ -712,8 +779,8 @@ impl Store {
     }
 }
 
-fn workout_from_row(row: &rusqlite::Row) -> rusqlite::Result<Workout> {
-    Ok(Workout {
+fn segment_from_row(row: &rusqlite::Row) -> rusqlite::Result<Segment> {
+    Ok(Segment {
         id: row.get(0)?,
         date: row.get(1)?,
         started_at: row.get(2)?,
@@ -722,6 +789,79 @@ fn workout_from_row(row: &rusqlite::Row) -> rusqlite::Result<Workout> {
         steps: row.get(5)?,
         walking_time_s: row.get(6)?,
     })
+}
+
+/// Merge chronologically-ordered activity segments into displayed workouts
+/// (задача 014): adjacent segments whose inter-segment gap (`next.started_at −
+/// prev.ended_at`) is ≤ `gap_minutes` are joined into one [`Workout`]; a larger
+/// gap starts a new workout. Pure and unit-tested — the read-time projection
+/// that makes the workout-gap retroactively configurable.
+///
+/// The boundary is inclusive (`<=`): a gap exactly at `gap_minutes` continues
+/// the workout, matching the legacy split so seeded history re-merges identically
+/// at the default 15-minute gap. `segments` must be sorted ascending by
+/// `started_at`. A segment with an unparseable timestamp starts a new workout
+/// (logged WARN) rather than corrupting the merge. Returned oldest-first.
+pub fn merge_segments(segments: &[Segment], gap_minutes: i64) -> Vec<Workout> {
+    let gap = Duration::minutes(gap_minutes.max(0));
+    let mut workouts: Vec<Workout> = Vec::new();
+    let mut prev_end: Option<DateTime<Utc>> = None;
+
+    for segment in segments {
+        let started = match DateTime::parse_from_rfc3339(&segment.started_at) {
+            Ok(dt) => dt.with_timezone(&Utc),
+            Err(err) => {
+                tracing::warn!(%err, started_at = %segment.started_at, id = segment.id, "segment started_at not RFC3339 — starting a new workout");
+                push_or_extend_new(&mut workouts, segment);
+                prev_end = parse_end(segment);
+                continue;
+            }
+        };
+
+        let continues = match prev_end {
+            Some(end) => started.signed_duration_since(end) <= gap,
+            None => false,
+        };
+
+        if continues && let Some(current) = workouts.last_mut() {
+            current.ended_at = segment.ended_at.clone();
+            current.distance_m += segment.distance_m;
+            current.steps += segment.steps;
+            current.walking_time_s += segment.walking_time_s;
+        } else {
+            push_or_extend_new(&mut workouts, segment);
+        }
+        // A merged segment's own end anchors the gap to the next segment.
+        prev_end = parse_end(segment).or(prev_end);
+    }
+
+    workouts
+}
+
+/// Start a fresh workout from a single segment (its start day, its endpoints,
+/// its totals). The workout `id` is the seeding segment's id — stable/unique.
+fn push_or_extend_new(workouts: &mut Vec<Workout>, segment: &Segment) {
+    workouts.push(Workout {
+        id: segment.id,
+        date: segment.date.clone(),
+        started_at: segment.started_at.clone(),
+        ended_at: segment.ended_at.clone(),
+        distance_m: segment.distance_m,
+        steps: segment.steps,
+        walking_time_s: segment.walking_time_s,
+    });
+}
+
+/// Parse a segment's `ended_at`; `None` (logged WARN) makes the next segment
+/// start a fresh workout rather than merge against a bogus anchor.
+fn parse_end(segment: &Segment) -> Option<DateTime<Utc>> {
+    match DateTime::parse_from_rfc3339(&segment.ended_at) {
+        Ok(dt) => Some(dt.with_timezone(&Utc)),
+        Err(err) => {
+            tracing::warn!(%err, ended_at = %segment.ended_at, id = segment.id, "segment ended_at not RFC3339 — next segment will not merge into this one");
+            None
+        }
+    }
 }
 
 /// Delta of a monotonically-increasing device counter since the last sample.
@@ -787,69 +927,109 @@ mod tests {
         Store::open_at(Path::new(":memory:")).expect("open in-memory store")
     }
 
-    #[test]
-    fn credit_activity_continues_workout_within_gap_threshold() {
-        let mut store = memory_store();
-        let t0 = Utc.with_ymd_and_hms(2026, 7, 5, 10, 0, 0).unwrap();
-        let t1 = t0 + Duration::minutes(10); // < 15 min threshold
+    /// Credit one walking burst, threading the daemon's open-segment id.
+    fn credit(store: &mut Store, steps: i64, dist: i64, time: i64, now: DateTime<Utc>, open: Option<i64>) -> i64 {
+        store.credit_activity(steps, dist, time, now, open).unwrap()
+    }
 
-        store.credit_activity(5, 10, 30, t0).unwrap();
-        store.credit_activity(5, 10, 30, t1).unwrap();
-
-        let workouts = store.all_workouts().unwrap();
-        assert_eq!(workouts.len(), 1, "single continuous workout, not two");
-        assert_eq!(workouts[0].steps, 10);
-        assert_eq!(workouts[0].distance_m, 20);
-        assert_eq!(workouts[0].walking_time_s, 60);
-        assert_eq!(workouts[0].started_at, t0.to_rfc3339());
-        assert_eq!(workouts[0].ended_at, t1.to_rfc3339());
+    /// A segment for the pure `merge_segments` tests. `date` is the UTC start
+    /// day (tests fix `TZ=UTC`), distance is `2×steps` to keep sums distinct.
+    fn seg(id: i64, start: DateTime<Utc>, end: DateTime<Utc>, steps: i64) -> Segment {
+        Segment {
+            id,
+            date: start.format("%Y-%m-%d").to_string(),
+            started_at: start.to_rfc3339(),
+            ended_at: end.to_rfc3339(),
+            distance_m: steps * 2,
+            steps,
+            walking_time_s: steps,
+        }
     }
 
     #[test]
-    fn credit_activity_splits_after_gap_exceeds_threshold() {
+    fn credit_activity_extends_open_segment_when_id_threaded() {
         let mut store = memory_store();
         let t0 = Utc.with_ymd_and_hms(2026, 7, 5, 10, 0, 0).unwrap();
-        let t1 = t0 + Duration::minutes(20); // > 15 min threshold
+        let t1 = t0 + Duration::minutes(10);
 
-        store.credit_activity(5, 10, 30, t0).unwrap();
-        store.credit_activity(5, 10, 30, t1).unwrap();
+        // Same open segment across both bursts (daemon never left Walking).
+        let id = credit(&mut store, 5, 10, 30, t0, None);
+        let id2 = credit(&mut store, 5, 10, 30, t1, Some(id));
 
-        let workouts = store.all_workouts().unwrap();
-        assert_eq!(workouts.len(), 2, "gap past the threshold must start a new workout");
-        // all_workouts is most-recent-first.
-        assert_eq!(workouts[0].started_at, t1.to_rfc3339());
-        assert_eq!(workouts[1].started_at, t0.to_rfc3339());
+        assert_eq!(id, id2, "extending, not opening a new segment");
+        let segs = store.all_segments_asc().unwrap();
+        assert_eq!(segs.len(), 1, "single continuous segment");
+        assert_eq!(segs[0].steps, 10);
+        assert_eq!(segs[0].distance_m, 20);
+        assert_eq!(segs[0].walking_time_s, 60);
+        assert_eq!(segs[0].started_at, t0.to_rfc3339());
+        assert_eq!(segs[0].ended_at, t1.to_rfc3339());
     }
 
     #[test]
-    fn credit_activity_first_workout_of_day_has_no_prior_activity() {
+    fn credit_activity_none_open_starts_a_new_segment() {
         let mut store = memory_store();
         let t0 = Utc.with_ymd_and_hms(2026, 7, 5, 10, 0, 0).unwrap();
+        let t1 = t0 + Duration::minutes(20);
 
-        store.credit_activity(5, 10, 30, t0).unwrap();
+        // The daemon closed the first segment (presence left Walking), so the
+        // second burst is credited with `None` → a brand-new segment.
+        let id = credit(&mut store, 5, 10, 30, t0, None);
+        let id2 = credit(&mut store, 5, 10, 30, t1, None);
 
-        let workouts = store.all_workouts().unwrap();
-        assert_eq!(workouts.len(), 1);
-        assert_eq!(workouts[0].date, "2026-07-05");
-        assert_eq!(workouts[0].steps, 5);
+        assert_ne!(id, id2);
+        assert_eq!(store.all_segments_asc().unwrap().len(), 2, "close-and-new yields two segments");
+    }
+
+    #[test]
+    fn credit_activity_stale_open_id_opens_new_segment_without_losing_credit() {
+        let mut store = memory_store();
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 5, 10, 0, 0).unwrap();
+        let t1 = t0 + Duration::minutes(5);
+        credit(&mut store, 5, 10, 30, t0, None);
+
+        // A bogus open id (e.g. DB wiped under a long-lived daemon) must open a
+        // new segment rather than silently no-op the UPDATE and drop the credit.
+        let id2 = credit(&mut store, 7, 14, 42, t1, Some(999_999));
+        assert_ne!(id2, 999_999);
+        let segs = store.all_segments_asc().unwrap();
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs.iter().map(|s| s.steps).sum::<i64>(), 12, "both credits landed");
+    }
+
+    #[test]
+    fn credit_activity_first_of_day_sets_segment_start_date() {
+        let mut store = memory_store();
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 5, 10, 0, 0).unwrap();
+        credit(&mut store, 5, 10, 30, t0, None);
+        let segs = store.all_segments_asc().unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].date, "2026-07-05");
+        assert_eq!(segs[0].steps, 5);
     }
 
     #[test]
     fn credit_activity_across_midnight_keeps_start_date_but_splits_daily_stats() {
         let mut store = memory_store();
-        // One continuous workout (each gap well under 15 min) that starts
-        // before local midnight and ends after it.
+        // One continuous open segment that starts before local midnight and is
+        // extended past it (daemon never left Walking).
         let before_midnight = Utc.with_ymd_and_hms(2026, 7, 5, 23, 50, 0).unwrap();
-        let after_midnight = Utc.with_ymd_and_hms(2026, 7, 6, 0, 0, 0).unwrap(); // 10 min gap, < 15 min threshold
+        let after_midnight = Utc.with_ymd_and_hms(2026, 7, 6, 0, 0, 0).unwrap();
 
-        store.credit_activity(10, 20, 60, before_midnight).unwrap();
-        store.credit_activity(20, 40, 120, after_midnight).unwrap();
+        let id = credit(&mut store, 10, 20, 60, before_midnight, None);
+        credit(&mut store, 20, 40, 120, after_midnight, Some(id));
 
-        let workouts = store.all_workouts().unwrap();
-        assert_eq!(workouts.len(), 1, "single workout spanning midnight");
-        assert_eq!(workouts[0].date, "2026-07-05", "date is fixed to the start day");
-        assert_eq!(workouts[0].steps, 30);
-        assert_eq!(workouts[0].ended_at, after_midnight.to_rfc3339());
+        let segs = store.all_segments_asc().unwrap();
+        assert_eq!(segs.len(), 1, "single segment spanning midnight");
+        assert_eq!(segs[0].date, "2026-07-05", "date fixed to the start day");
+        assert_eq!(segs[0].steps, 30);
+        assert_eq!(segs[0].ended_at, after_midnight.to_rfc3339());
+
+        // The derived workout is attributed to the start day only.
+        let day5 = store.workouts_for("2026-07-05", 15).unwrap();
+        assert_eq!(day5.len(), 1);
+        assert_eq!(day5[0].steps, 30);
+        assert!(store.workouts_for("2026-07-06", 15).unwrap().is_empty(), "attributed to start day, not end day");
 
         // daily_stats, in contrast, is genuinely split by calendar day.
         let day1 = store.stats_for("2026-07-05").unwrap().expect("day1 stats present");
@@ -858,6 +1038,83 @@ mod tests {
         let day2 = store.stats_for("2026-07-06").unwrap().expect("day2 stats present");
         assert_eq!(day2.steps, 20);
         assert_eq!(day2.distance_m, 40);
+    }
+
+    #[test]
+    fn merge_segments_empty_is_empty() {
+        assert!(merge_segments(&[], 15).is_empty());
+    }
+
+    #[test]
+    fn merge_segments_joins_within_gap_and_sums() {
+        let a_start = Utc.with_ymd_and_hms(2026, 7, 5, 10, 0, 0).unwrap();
+        let a_end = a_start + Duration::minutes(5);
+        let b_start = a_end + Duration::minutes(10); // 10 min gap ≤ 15
+        let b_end = b_start + Duration::minutes(5);
+        let segs = [seg(1, a_start, a_end, 100), seg(2, b_start, b_end, 200)];
+
+        let workouts = merge_segments(&segs, 15);
+        assert_eq!(workouts.len(), 1, "gap under threshold merges");
+        assert_eq!(workouts[0].id, 1, "workout id is its first segment's id");
+        assert_eq!(workouts[0].steps, 300);
+        assert_eq!(workouts[0].distance_m, 600);
+        assert_eq!(workouts[0].walking_time_s, 300);
+        assert_eq!(workouts[0].started_at, a_start.to_rfc3339());
+        assert_eq!(workouts[0].ended_at, b_end.to_rfc3339());
+    }
+
+    #[test]
+    fn merge_segments_splits_beyond_gap() {
+        let a_start = Utc.with_ymd_and_hms(2026, 7, 5, 10, 0, 0).unwrap();
+        let a_end = a_start + Duration::minutes(5);
+        let b_start = a_end + Duration::minutes(20); // 20 min gap > 15
+        let b_end = b_start + Duration::minutes(5);
+        let workouts = merge_segments(&[seg(1, a_start, a_end, 100), seg(2, b_start, b_end, 200)], 15);
+        assert_eq!(workouts.len(), 2);
+        assert_eq!(workouts[0].id, 1);
+        assert_eq!(workouts[1].id, 2);
+    }
+
+    #[test]
+    fn merge_segments_boundary_is_inclusive() {
+        let a_start = Utc.with_ymd_and_hms(2026, 7, 5, 10, 0, 0).unwrap();
+        let a_end = a_start + Duration::minutes(5);
+        // Gap exactly at the threshold merges; one second over splits.
+        let at_threshold = a_end + Duration::minutes(15);
+        let over = a_end + Duration::minutes(15) + Duration::seconds(1);
+
+        let merged = merge_segments(&[seg(1, a_start, a_end, 1), seg(2, at_threshold, at_threshold, 1)], 15);
+        assert_eq!(merged.len(), 1, "gap == threshold continues the workout");
+
+        let split = merge_segments(&[seg(1, a_start, a_end, 1), seg(2, over, over, 1)], 15);
+        assert_eq!(split.len(), 2, "one second past the threshold splits");
+    }
+
+    #[test]
+    fn merge_segments_regroups_retroactively_with_the_gap() {
+        // Same three segments, spaced 10 min apart, regroup purely by the gap.
+        let s0 = Utc.with_ymd_and_hms(2026, 7, 5, 10, 0, 0).unwrap();
+        let segs = [
+            seg(1, s0, s0 + Duration::minutes(1), 10),
+            seg(2, s0 + Duration::minutes(11), s0 + Duration::minutes(12), 10),
+            seg(3, s0 + Duration::minutes(22), s0 + Duration::minutes(23), 10),
+        ];
+        assert_eq!(merge_segments(&segs, 5).len(), 3, "tight gap → three separate workouts");
+        assert_eq!(merge_segments(&segs, 15).len(), 1, "loose gap → one merged workout");
+    }
+
+    #[test]
+    fn merge_segments_joins_across_midnight_under_start_date() {
+        let s1 = Utc.with_ymd_and_hms(2026, 7, 5, 23, 50, 0).unwrap();
+        let e1 = Utc.with_ymd_and_hms(2026, 7, 5, 23, 55, 0).unwrap();
+        let s2 = Utc.with_ymd_and_hms(2026, 7, 6, 0, 0, 0).unwrap(); // 5 min gap
+        let e2 = Utc.with_ymd_and_hms(2026, 7, 6, 0, 5, 0).unwrap();
+
+        let workouts = merge_segments(&[seg(1, s1, e1, 10), seg(2, s2, e2, 20)], 15);
+        assert_eq!(workouts.len(), 1, "cross-midnight, gap under threshold, merges");
+        assert_eq!(workouts[0].date, "2026-07-05", "attributed to the start day");
+        assert_eq!(workouts[0].steps, 30);
+        assert_eq!(workouts[0].ended_at, e2.to_rfc3339());
     }
 
     #[test]
