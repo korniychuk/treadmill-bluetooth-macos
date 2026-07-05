@@ -6,6 +6,11 @@
 set -euo pipefail
 
 readonly LABEL="com.korniychuk.treadmill-bluetooth-macos.daemon"
+readonly BIN_NAME="treadmill-bluetooth-macos"
+# Must match install-daemon.sh.
+LINK_DIR="${LINK_DIR:-$HOME/.bin}"
+LINK_NAME="${LINK_NAME:-tm}"
+
 plist="$HOME/Library/LaunchAgents/${LABEL}.plist"
 
 if [[ -f "$plist" ]]; then
@@ -14,4 +19,12 @@ if [[ -f "$plist" ]]; then
   echo "removed: $plist"
 else
   echo "not installed: $plist"
+fi
+
+# Remove the `tm` alias only if it is our symlink — never touch a real file or
+# someone else's `tm` that happens to sit at the same path.
+link="$LINK_DIR/$LINK_NAME"
+if [[ -L "$link" && "$(readlink "$link")" == *"/${BIN_NAME}" ]]; then
+  rm "$link"
+  echo "removed: $link"
 fi

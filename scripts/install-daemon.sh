@@ -25,6 +25,11 @@ readonly BUNDLE_ID="com.korniychuk.treadmill-bluetooth-macos"
 readonly LABEL="${BUNDLE_ID}.daemon"
 readonly BIN_NAME="treadmill-bluetooth-macos"
 IDENTITY="${IDENTITY:-AnKor Treadmill BLE Dev}"
+# Short CLI alias symlinked into a PATH dir so `tm stats`/`tm status` work from
+# anywhere. Points at the release artifact, so it tracks every rebuild. Set
+# LINK_NAME="" to skip. Keep in sync with uninstall-daemon.sh.
+LINK_DIR="${LINK_DIR:-$HOME/.bin}"
+LINK_NAME="${LINK_NAME:-tm}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
@@ -40,6 +45,24 @@ codesign --force --sign "$IDENTITY" --identifier "$BUNDLE_ID" "$bin"
 if [[ "$IDENTITY" == "-" ]]; then
   echo "note: ad-hoc signed — macOS may re-prompt for Bluetooth after a rebuild." >&2
   echo "      set IDENTITY=<cert name> for a rebuild-stable grant." >&2
+fi
+
+# Install/refresh the `tm` alias. `ln -sfn` replaces our own stale symlink in
+# place, but we refuse to clobber a real file that happens to share the name.
+link=""
+if [[ -n "$LINK_NAME" ]]; then
+  link="$LINK_DIR/$LINK_NAME"
+  mkdir -p "$LINK_DIR"
+  if [[ -e "$link" && ! -L "$link" ]]; then
+    echo "warning: $link exists and is not a symlink — leaving it alone" >&2
+    link=""
+  else
+    ln -sfn "$bin" "$link"
+    case ":$PATH:" in
+      *":$LINK_DIR:"*) ;;
+      *) echo "note: $LINK_DIR is not in your PATH — add it to call '$LINK_NAME' directly." >&2 ;;
+    esac
+  fi
 fi
 
 app_support="$HOME/Library/Application Support/treadmill-bluetooth-macos"
@@ -88,6 +111,7 @@ launchctl unload "$plist" 2>/dev/null || true
 launchctl load "$plist"
 
 echo "installed: $plist"
+[[ -n "$link" ]] && echo "alias:     $link -> $bin"
 echo "logs:      $log_dir/daemon.log"
 echo "db:        $app_support/treadmill.db"
 echo "uninstall: scripts/uninstall-daemon.sh"

@@ -59,6 +59,13 @@ scripts/uninstall-daemon.sh  # снять LaunchAgent (данные в Applicati
 scripts/build-icon.sh        # перегенерировать macos/AppIcon.icns из SF Symbol (см. generate-icon.swift)
 ```
 
+Короткий алиас `tm` — симлинк на release-бинарь в `~/.bin` (в `PATH`), чтобы
+звать `tm stats` / `tm status` откуда угодно. Его **создаёт/обновляет
+`install-daemon.sh` и снимает `uninstall-daemon.sh`** (переопределяется через
+`LINK_DIR`/`LINK_NAME`, `LINK_NAME=""` — пропустить). Симлинк указывает на
+артефакт сборки, поэтому подхватывает свежий бинарь после каждого rebuild.
+Вручную (без демона): `ln -sfn "$PWD/target/release/treadmill-bluetooth-macos" ~/.bin/tm`.
+
 ## Заметки по macOS
 
 - Первый запуск запросит разрешение на Bluetooth (CoreBluetooth). Без него скан пуст.
