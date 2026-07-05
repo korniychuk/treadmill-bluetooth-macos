@@ -105,6 +105,10 @@ impl Store {
     /// Open a database at an arbitrary path (e.g. `:memory:` in tests).
     pub(crate) fn open_at(path: &std::path::Path) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+        // A short-lived reader (e.g. the 2s `widget` poll) can open the DB while
+        // the daemon is mid-write; wait out the write lock instead of erroring
+        // with SQLITE_BUSY.
+        conn.busy_timeout(std::time::Duration::from_secs(3)).context("set busy_timeout")?;
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -445,6 +449,20 @@ impl Store {
             .context("prepare all_workouts query")?;
         let rows = stmt.query_map([], workout_from_row).context("run all_workouts query")?;
         rows.collect::<rusqlite::Result<Vec<_>>>().context("collect all_workouts rows")
+    }
+
+    /// The most recently started workout, or `None` if none recorded. Backs the
+    /// `widget` command, which surfaces the current session's live metrics.
+    pub fn latest_workout(&self) -> Result<Option<Workout>> {
+        self.conn
+            .query_row(
+                "SELECT id, date, started_at, ended_at, distance_m, steps, walking_time_s
+                 FROM workouts ORDER BY id DESC LIMIT 1",
+                [],
+                workout_from_row,
+            )
+            .optional()
+            .context("query latest_workout")
     }
 
     /// Reconstruct the *raw* (pre-presence-filter) distance the belt moved over

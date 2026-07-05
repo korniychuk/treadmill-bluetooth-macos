@@ -49,6 +49,7 @@ cargo run             # = scan: перечислить BLE-устройства 
 cargo run -- connect  # подключиться к первой FTMS-дорожке и стримить данные
 cargo run -- daemon    # фоновый режим: авто-коннект + presence + toast (для интерактивной проверки)
 cargo run -- stats     # статистика за сегодня; `stats --all` — за все дни
+cargo run -- widget    # компактный TSV текущей тренировки для status-bar виджета; пусто если дорожка off (см. docs/tasks/009)
 cargo run -- --help    # полный список команд
 cargo test             # юнит-тесты
 cargo clippy           # линт

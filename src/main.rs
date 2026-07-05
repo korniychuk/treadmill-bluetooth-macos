@@ -56,6 +56,14 @@ enum Commands {
     /// never opens the BLE adapter itself, so it cannot contend with a
     /// running daemon for it (see docs/tasks/006, задача B).
     Status,
+    /// Emit a compact, machine-readable snapshot of the current workout for a
+    /// status-bar widget (tmux/Dracula). Prints one TSV line
+    /// `state\twalking_s\tsteps\tdistance_m` while the treadmill is connected
+    /// and the daemon heartbeat is fresh, or nothing at all otherwise (so the
+    /// widget hides). `walking_s` is the presence-filtered walking time (no
+    /// step-away/pause). Like `status`, never opens the BLE adapter. See
+    /// docs/tasks/009.
+    Widget,
     /// Start the belt via the FTMS Control Point.
     Start,
     /// Stop the belt via the FTMS Control Point.
@@ -111,6 +119,9 @@ async fn main() -> Result<()> {
     if let Commands::Status = command {
         return run_status();
     }
+    if let Commands::Widget = command {
+        return run_widget();
+    }
     if let Commands::NotifyTest = command {
         return run_notify_test();
     }
@@ -140,7 +151,7 @@ async fn main() -> Result<()> {
             let fs = fitshow::FitShow::attach(&peripheral).await?;
             fs.set_speed_incline(kmh, incline_level).await?;
         }
-        Commands::Stats { .. } | Commands::Status | Commands::NotifyTest => {
+        Commands::Stats { .. } | Commands::Status | Commands::Widget | Commands::NotifyTest => {
             unreachable!("handled above, before the adapter was opened")
         }
     }
@@ -388,6 +399,61 @@ fn run_status() -> Result<()> {
     Ok(())
 }
 
+/// Emit one TSV line for the status-bar widget, or nothing at all when the
+/// treadmill is not on/connected (so the widget hides). Read-only, no BLE —
+/// mirrors `run_status`'s constraint. See docs/tasks/009.
+fn run_widget() -> Result<()> {
+    let store = store::Store::open()?;
+
+    // Visibility gate: a `daemon_status` row that is `connected` and whose
+    // heartbeat (`updated_at`) is fresh. The daemon touches `updated_at` every
+    // idle tick (≤30s) and every telemetry sample (~1s), so a stale row means
+    // the daemon is gone or hung — hide rather than show frozen data. This is
+    // why no `launchctl`/pid probe is needed on the hot 2s poll path.
+    let status = match store.daemon_status()? {
+        Some(status) if status.connected && !widget_status_stale(&status) => status,
+        _ => return Ok(()),
+    };
+
+    let state = widget_state(status.presence_state.as_deref());
+    // `walking_time_s` is the *credited* walking time — the presence filter has
+    // already excluded step-away and paused stretches (this is the `36m27s`, not
+    // the `raw 41m42s`, that `stats` prints). It also auto-freezes when not
+    // walking, since nothing is credited then. Exactly the "filtered" time the
+    // widget should show.
+    let (walking_s, steps, distance_m) = match store.latest_workout()? {
+        Some(workout) => (workout.walking_time_s, workout.steps, workout.distance_m),
+        None => (0, 0, 0),
+    };
+
+    println!("{state}\t{walking_s}\t{steps}\t{distance_m}");
+    Ok(())
+}
+
+/// Is the daemon heartbeat too old to trust? An unparseable timestamp counts as
+/// stale (hide) — a malformed row is not evidence the treadmill is on.
+fn widget_status_stale(status: &store::DaemonStatus) -> bool {
+    match DateTime::parse_from_rfc3339(&status.updated_at) {
+        Ok(updated_at) => (Utc::now() - updated_at.with_timezone(&Utc)).num_seconds() > WATCHDOG_STALE_THRESHOLD_S,
+        Err(err) => {
+            tracing::warn!(%err, updated_at = %status.updated_at, "widget: unparseable updated_at, hiding widget");
+            true
+        }
+    }
+}
+
+/// Map the persisted presence label to the widget's compact state token. The
+/// shell presentation layer keys its icon/colour off this string, so the set is
+/// a stable contract: `walking | away | paused | unknown`.
+fn widget_state(presence_state: Option<&str>) -> &'static str {
+    match presence_state {
+        Some("Walking") => "walking",
+        Some("AwayWhileRunning") => "away",
+        Some("Paused") => "paused",
+        _ => "unknown",
+    }
+}
+
 /// `now (Xm ago)`-style rendering of an RFC3339 timestamp in local time.
 fn describe_timestamp(rfc3339: &str) -> String {
     match DateTime::parse_from_rfc3339(rfc3339) {
@@ -480,4 +546,20 @@ fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("treadmill_bluetooth_macos=info,warn"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn widget_state_maps_every_presence_label() {
+        assert_eq!(widget_state(Some("Walking")), "walking");
+        assert_eq!(widget_state(Some("AwayWhileRunning")), "away");
+        assert_eq!(widget_state(Some("Paused")), "paused");
+        assert_eq!(widget_state(Some("Unknown")), "unknown");
+        assert_eq!(widget_state(None), "unknown");
+        // An unrecognised label degrades to `unknown` rather than leaking through.
+        assert_eq!(widget_state(Some("Bogus")), "unknown");
+    }
 }
