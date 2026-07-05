@@ -176,6 +176,12 @@ impl Store {
                     power_mode_since TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS goal_celebrations (
+                    date TEXT NOT NULL,
+                    threshold INTEGER NOT NULL,
+                    celebrated_at TEXT NOT NULL,
+                    PRIMARY KEY (date, threshold)
+                );
                 ",
             )
             .context("run schema migration")?;
@@ -549,6 +555,31 @@ impl Store {
             .optional()
             .context("query daemon_status")
     }
+
+    /// Step-goal thresholds already celebrated on the given `YYYY-MM-DD`
+    /// (local calendar date). Read before deciding what to fire so a daemon
+    /// restart mid-day never re-celebrates a goal (задача 011).
+    pub fn celebrated_thresholds(&self, date: &str) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT threshold FROM goal_celebrations WHERE date = ?1")
+            .context("prepare celebrated_thresholds query")?;
+        let rows = stmt.query_map(params![date], |row| row.get(0)).context("run celebrated_thresholds query")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("collect celebrated_thresholds rows")
+    }
+
+    /// Mark a goal threshold celebrated for `date`. `INSERT OR IGNORE` keeps
+    /// it idempotent — a re-fire attempt (e.g. a race across a restart) is a
+    /// no-op rather than a duplicate row or an error.
+    pub fn mark_goal_celebrated(&self, date: &str, threshold: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO goal_celebrations (date, threshold, celebrated_at) VALUES (?1, ?2, ?3)",
+                params![date, threshold, Utc::now().to_rfc3339()],
+            )
+            .context("insert goal_celebrations row")?;
+        Ok(())
+    }
 }
 
 fn workout_from_row(row: &rusqlite::Row) -> rusqlite::Result<Workout> {
@@ -724,5 +755,23 @@ mod tests {
         store.upsert_daemon_status(&status2).unwrap();
         let read_back2 = store.daemon_status().unwrap().expect("status row present");
         assert!(!read_back2.connected);
+    }
+
+    #[test]
+    fn goal_celebrations_are_idempotent_and_scoped_to_date() {
+        let store = memory_store();
+        assert!(store.celebrated_thresholds("2026-07-05").unwrap().is_empty());
+
+        store.mark_goal_celebrated("2026-07-05", 8000).unwrap();
+        store.mark_goal_celebrated("2026-07-05", 10000).unwrap();
+        // Re-marking the same (date, threshold) must not duplicate or error.
+        store.mark_goal_celebrated("2026-07-05", 8000).unwrap();
+
+        let mut today = store.celebrated_thresholds("2026-07-05").unwrap();
+        today.sort_unstable();
+        assert_eq!(today, vec![8000, 10000]);
+
+        // A different day starts fresh.
+        assert!(store.celebrated_thresholds("2026-07-06").unwrap().is_empty());
     }
 }

@@ -23,11 +23,16 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
 - `src/presence.rs` — детекция присутствия: лента крутится, но шаги не растут → `AwayWhileRunning`.
 - `src/store.rs` — SQLite (`~/Library/Application Support/treadmill-bluetooth-macos/treadmill.db`),
   дневная статистика (шаги/дистанция/время ходьбы), restart-safe дельта-накопление.
-- `src/daemon.rs` — фоновый цикл (LaunchAgent): авто-скан/коннект/реконнект + presence + toast.
+- `src/daemon.rs` — фоновый цикл (LaunchAgent): авто-скан/коннект/реконнект +
+  presence + toast; на resume после паузы авто-восстанавливает pre-pause
+  скорость ленты через `control.rs` (bounded BLE-write, см. `docs/tasks/012`).
 - `src/power.rs` — детекция AC-питания (`pmset -g batt`); на батарее и без
   подключённой дорожки демон не сканирует, чтобы не сажать аккумулятор.
 - `src/notify.rs` — нативные macOS-уведомления (`mac-notification-sys`,
-  чистый Rust, без Swift в рантайме) с иконкой и именем "Treadmill".
+  чистый Rust, без Swift в рантайме) с иконкой и именем "Treadmill";
+  toast'ы presence/goal, компактный форматтер длительности `humanize_short`.
+- `src/goals.rs` — дневные step-goal вехи: загрузка `config/goals.json`,
+  присвоение tier'ов (1–3), чистая функция «какие пороги праздновать сейчас».
 - `src/logger.rs` — сырой JSONL-лог телеметрии (source-of-truth параллельно с SQLite).
 
 ## Протокол
@@ -66,6 +71,18 @@ scripts/build-icon.sh        # перегенерировать macos/AppIcon.ic
 `LINK_DIR`/`LINK_NAME`, `LINK_NAME=""` — пропустить). Симлинк указывает на
 артефакт сборки, поэтому подхватывает свежий бинарь после каждого rebuild.
 Вручную (без демона): `ln -sfn "$PWD/target/release/treadmill-bluetooth-macos" ~/.bin/tm`.
+
+## Конфиг целей (step goals)
+
+Дневные цели по шагам (до 3) живут в **`config/goals.json`** (коммитится в репо):
+`{ "goals": [8000, 10000, 12000] }`. Демон резолвит путь так: env
+`TREADMILL_GOALS_CONFIG` → `./config/goals.json` (cwd, для `cargo run`) →
+вшитые дефолты `[8000,10000,12000]` + WARN. `install-daemon.sh` прописывает
+`TREADMILL_GOALS_CONFIG` в plist на repo-путь, так что **правки коммитнутого
+файла активны после рестарта демона** (`launchctl kickstart -k` или переустановка).
+Tier (яркость toast'а) выводится из ранга по возрастанию: низший порог → tier 1.
+Каждая цель празднуется ровно раз в день (local date, restart-safe через таблицу
+`goal_celebrations`). См. `docs/tasks/011-...md`.
 
 ## Заметки по macOS
 

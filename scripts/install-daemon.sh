@@ -102,6 +102,10 @@ cat > "$plist" <<EOF
     <dict>
         <key>RUST_LOG</key>
         <string>treadmill_bluetooth_macos=info,warn</string>
+        <!-- Point the daemon at the repo-committed step-goal config so edits
+             to it take effect on the next daemon restart (see src/goals.rs). -->
+        <key>TREADMILL_GOALS_CONFIG</key>
+        <string>${repo_root}/config/goals.json</string>
     </dict>
 </dict>
 </plist>

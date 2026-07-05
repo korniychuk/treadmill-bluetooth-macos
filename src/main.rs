@@ -8,6 +8,7 @@ mod daemon;
 mod discover;
 mod fitshow;
 mod ftms;
+mod goals;
 mod logger;
 mod notify;
 mod power;
@@ -199,13 +200,24 @@ async fn run_daemon(adapter: &Adapter) -> Result<()> {
 /// Fire every toast once, spaced out so they render as separate banners
 /// instead of collapsing into one Notification Center group.
 fn run_notify_test() -> Result<()> {
-    let toasts: [(&str, fn()); 6] = [
-        ("found", notify::treadmill_found),
-        ("lost", notify::treadmill_lost),
-        ("away", notify::walker_away),
-        ("resumed (from away)", notify::walker_resumed),
-        ("paused", notify::treadmill_paused),
-        ("resumed (from pause)", notify::treadmill_resumed),
+    // Closures wrap the toasts whose signatures now take arguments (away/pause
+    // duration, goal tier) so they still fit the uniform `fn()` smoke-test
+    // table. Sample durations/goals are illustrative — this path never touches
+    // BLE or the real presence state.
+    let sample_away = std::time::Duration::from_secs(157);
+    let toasts: [(&str, &dyn Fn()); 9] = [
+        ("found", &notify::treadmill_found),
+        ("lost", &notify::treadmill_lost),
+        ("away", &notify::walker_away),
+        ("resumed (from away, with duration)", &(|| notify::walker_resumed(Some(sample_away)))),
+        ("paused", &notify::treadmill_paused),
+        (
+            "resumed (from pause, duration + speed restore)",
+            &(|| notify::treadmill_resumed(Some(sample_away), Some(notify::SpeedRestore { from_kmh: 0.5, to_kmh: 2.5 }))),
+        ),
+        ("goal tier 1", &(|| notify::goal_reached(8000, 1))),
+        ("goal tier 2", &(|| notify::goal_reached(10000, 2))),
+        ("goal tier 3", &(|| notify::goal_reached(12000, 3))),
     ];
     for (label, send) in toasts {
         println!("sending: {label}");

@@ -57,17 +57,19 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use btleplug::api::Peripheral as _;
 use btleplug::platform::{Adapter, Peripheral};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use futures::StreamExt;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
+use crate::control::Controller;
 use crate::ftms;
+use crate::goals::{self, Goal};
 use crate::logger::WorkoutLogger;
 use crate::notify;
 use crate::power::{self, PowerEvent};
-use crate::presence::{PresenceState, PresenceTracker};
+use crate::presence::{self, PresenceState, PresenceTracker};
 use crate::scan;
 use crate::store::{DaemonStatus, RawDeltas, Store};
 
@@ -96,6 +98,18 @@ const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// sleep cannot false-positive here.
 const WATCHDOG_STALE_THRESHOLD: Duration = Duration::from_secs(120);
 
+/// Upper bound on the whole pause-resume speed-restore round-trip (take
+/// control + set speed, задача 012). Every BLE await in it must be bounded —
+/// the watchdog convention (задача 007) — so a wedged CoreBluetooth call here
+/// cannot silently stall the stream. Well under [`WATCHDOG_STALE_THRESHOLD`]
+/// so a slow-but-legitimate restore never trips the watchdog.
+const SPEED_RESTORE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Minimum km/h by which the pre-pause speed must exceed the resumed speed to
+/// bother restoring — avoids a redundant Control Point write (and a misleading
+/// toast) when the machine did not actually slow down on resume.
+const SPEED_RESTORE_EPSILON_KMH: f32 = 0.05;
+
 /// Exit code used when the watchdog kills the process on a detected hang —
 /// distinct from panics/normal errors so `launchctl print` / log forensics
 /// can tell watchdog restarts apart.
@@ -107,6 +121,10 @@ const WATCHDOG_EXIT_CODE: i32 = 86;
 pub async fn run(adapter: &Adapter) -> Result<()> {
     let mut power_events = power::spawn_power_event_listener();
     let mut store = Store::open()?;
+    // Loaded once here (not per session): config edits take effect on the next
+    // daemon restart, matching the "edit the committed repo file" workflow.
+    let step_goals = goals::load_goals();
+    info!(goals = ?step_goals, "loaded daily step goals");
     let watchdog = Watchdog::new();
     watchdog.spawn_monitor();
     // Refreshes `daemon_status.updated_at` (and the watchdog) while idle, so
@@ -224,9 +242,16 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                         state.last_connected_at = Some(Utc::now().to_rfc3339());
                         state.persist(&store, &watchdog)?;
 
-                        if let Err(err) =
-                            stream_with_presence(&peripheral, &mut power_events, &mut store, &mut state, &watchdog, &mut on_ac)
-                                .await
+                        if let Err(err) = stream_with_presence(
+                            &peripheral,
+                            &mut power_events,
+                            &mut store,
+                            &mut state,
+                            &watchdog,
+                            &mut on_ac,
+                            &step_goals,
+                        )
+                        .await
                         {
                             warn!(%err, "presence stream ended with an error");
                         }
@@ -266,6 +291,7 @@ async fn stream_with_presence(
     state: &mut DaemonState,
     watchdog: &Watchdog,
     on_ac: &mut bool,
+    step_goals: &[Goal],
 ) -> Result<()> {
     scan::subscribe_treadmill_data(peripheral).await?;
     scan::subscribe_treadmill_status(peripheral).await?;
@@ -281,6 +307,16 @@ async fn stream_with_presence(
     // today's totals — see `credit_or_hold` for why this can't be applied the
     // instant a sample arrives.
     let mut pending = PendingCredit::default();
+    // When the current away/pause spell began, for the return toasts (задача
+    // 010). `Instant` on macOS does not advance across sleep, but a session
+    // that sleeps mid-away drops the BLE link and re-enters here fresh anyway.
+    let mut away_since: Option<Instant> = None;
+    let mut paused_since: Option<Instant> = None;
+    // Last non-zero belt speed seen (the walking speed), and the value snapshotted
+    // when a pause begins — used to auto-restore speed on resume (задача 012),
+    // since the machine resets the belt to a crawl (~0.5 km/h) after a pause.
+    let mut last_walking_speed: Option<f32> = None;
+    let mut pre_pause_speed: Option<f32> = None;
 
     loop {
         tokio::select! {
@@ -348,22 +384,38 @@ async fn stream_with_presence(
 
                 let deltas = store.advance_baseline(data.steps, data.total_distance_m, data.elapsed_s)?;
 
+                // Remember the walking speed so it can be restored after a pause
+                // (the machine resets the belt to a crawl on resume — задача 012).
+                if let Some(speed) = data.speed_kmh
+                    && speed > 0.0
+                {
+                    last_walking_speed = Some(speed);
+                }
+
                 let prev_state = presence.state();
                 if let Some(next_state) = presence.observe(data.speed_kmh, data.steps) {
                     info!(?prev_state, ?next_state, "presence transition");
                     state.presence_state = Some(format!("{next_state:?}"));
                     match next_state {
-                        PresenceState::AwayWhileRunning => notify::walker_away(),
+                        PresenceState::AwayWhileRunning => {
+                            away_since = Some(Instant::now());
+                            notify::walker_away();
+                        }
                         PresenceState::Walking if prev_state == PresenceState::AwayWhileRunning => {
-                            notify::walker_resumed();
+                            notify::walker_resumed(away_duration(away_since.take()));
                         }
                         PresenceState::Walking if prev_state == PresenceState::Paused => {
-                            notify::treadmill_resumed();
+                            let paused_for = paused_since.take().map(|since| since.elapsed());
+                            let resumed_speed = data.speed_kmh.unwrap_or(0.0);
+                            let restore = try_restore_speed(peripheral, pre_pause_speed.take(), resumed_speed).await;
+                            notify::treadmill_resumed(paused_for, restore);
                         }
                         // Skip the very first sample after connecting: PresenceState
                         // starts Unknown, so a treadmill discovered already stopped
                         // must not immediately toast "paused".
                         PresenceState::Paused if prev_state != PresenceState::Unknown => {
+                            paused_since = Some(Instant::now());
+                            pre_pause_speed = last_walking_speed;
                             notify::treadmill_paused();
                         }
                         _ => {}
@@ -371,6 +423,12 @@ async fn stream_with_presence(
                 }
 
                 credit_or_hold(store, &mut pending, presence.state(), deltas)?;
+                // Daily totals can only have grown when a step was actually
+                // credited, so gate the goal check on that to avoid a query
+                // every idle second.
+                if deltas.steps > 0 {
+                    celebrate_reached_goals(store, step_goals)?;
+                }
                 state.persist(store, watchdog)?;
             }
         }
@@ -418,6 +476,79 @@ fn credit_or_hold(store: &mut Store, pending: &mut PendingCredit, state: Presenc
         PresenceState::AwayWhileRunning | PresenceState::Paused | PresenceState::Unknown => {
             *pending = PendingCredit::default();
         }
+    }
+    Ok(())
+}
+
+/// True away span for the return toast: the belt was already running without a
+/// step for [`presence::AWAY_THRESHOLD`] *before* the tracker confirmed the
+/// absence (it flips only once that window elapses), so `away_since` is
+/// back-dated by that much to report the honest "how long the belt ran while
+/// I wasn't walking" the operator asked for (задача 010). `None` if we somehow
+/// lost the start instant — the toast then omits the figure.
+fn away_duration(away_since: Option<Instant>) -> Option<Duration> {
+    away_since.map(|since| since.elapsed() + presence::AWAY_THRESHOLD)
+}
+
+/// The pre-pause walking speed to re-send on resume, or `None` when there is
+/// nothing worth restoring: the machine did not actually slow down (resumed at
+/// the pre-pause speed or faster, within [`SPEED_RESTORE_EPSILON_KMH`]). Pure
+/// and unit-tested — the BLE write lives in [`restore_speed`].
+fn speed_restore_target(pre_pause_kmh: f32, resumed_kmh: f32) -> Option<f32> {
+    (pre_pause_kmh > resumed_kmh + SPEED_RESTORE_EPSILON_KMH).then_some(pre_pause_kmh)
+}
+
+/// Best-effort restore of the pre-pause belt speed on a pause→walk resume
+/// (задача 012, Task D). Returns the applied restore for the toast, or `None`
+/// (with a WARN on the abnormal paths) when nothing was applied — a missing
+/// captured speed, a no-op, or a failed/timed-out Control Point write must all
+/// leave the session running, never crash it.
+async fn try_restore_speed(peripheral: &Peripheral, pre_pause: Option<f32>, resumed_kmh: f32) -> Option<notify::SpeedRestore> {
+    let Some(pre_pause) = pre_pause else {
+        // Daemon started already paused, or the pause preceded any walking.
+        warn!("resume without a captured pre-pause speed — skipping speed restore");
+        return None;
+    };
+    let target = speed_restore_target(pre_pause, resumed_kmh)?;
+
+    match tokio::time::timeout(SPEED_RESTORE_TIMEOUT, restore_speed(peripheral, target)).await {
+        Ok(Ok(())) => {
+            info!(from = resumed_kmh, to = target, "restored pre-pause belt speed on resume");
+            Some(notify::SpeedRestore { from_kmh: resumed_kmh, to_kmh: target })
+        }
+        Ok(Err(err)) => {
+            warn!(%err, target, "failed to restore pre-pause speed — leaving resume toast without the restore line");
+            None
+        }
+        Err(_) => {
+            warn!(timeout_s = SPEED_RESTORE_TIMEOUT.as_secs(), target, "speed restore timed out (possible CoreBluetooth hang)");
+            None
+        }
+    }
+}
+
+/// Take FTMS control and set the target speed. Split from [`try_restore_speed`]
+/// so the whole round-trip can be wrapped in one bounded `timeout` there.
+async fn restore_speed(peripheral: &Peripheral, target_kmh: f32) -> Result<()> {
+    let controller = Controller::take_control(peripheral).await?;
+    controller.set_speed(target_kmh).await
+}
+
+/// After a step credit, fire a toast for each configured goal today's steps
+/// have newly reached and persist that it was celebrated, so a mid-day daemon
+/// restart never re-fires it (задача 011). A goal-check failure must not tear
+/// down an otherwise-healthy session, so problems are logged, not propagated.
+fn celebrate_reached_goals(store: &Store, step_goals: &[Goal]) -> Result<()> {
+    if step_goals.is_empty() {
+        return Ok(());
+    }
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let today_steps = store.today_stats()?.steps;
+    let already: std::collections::HashSet<i64> = store.celebrated_thresholds(&today)?.into_iter().collect();
+    for goal in goals::thresholds_to_celebrate(today_steps, step_goals, &already) {
+        info!(threshold = goal.threshold, tier = goal.tier, steps = today_steps, "daily step goal reached");
+        notify::goal_reached(goal.threshold, goal.tier);
+        store.mark_goal_celebrated(&today, goal.threshold)?;
     }
     Ok(())
 }
@@ -623,6 +754,28 @@ mod tests {
         assert!(status.connected);
         assert_eq!(status.presence_state.as_deref(), Some("Walking"));
         assert_eq!(status.power_mode, "ac_scanning");
+    }
+
+    #[test]
+    fn speed_restore_target_restores_only_a_real_slowdown() {
+        // Typical case: paused at 2.5, machine resumed at 0.5 → restore 2.5.
+        assert_eq!(speed_restore_target(2.5, 0.5), Some(2.5));
+        // No slowdown (resumed at the same speed) → nothing to restore.
+        assert_eq!(speed_restore_target(2.5, 2.5), None);
+        // Resumed faster than before → nothing to restore.
+        assert_eq!(speed_restore_target(2.5, 3.0), None);
+        // Within epsilon → treated as no change.
+        assert_eq!(speed_restore_target(2.5, 2.48), None);
+    }
+
+    #[test]
+    fn away_duration_adds_the_confirmation_window() {
+        // None start instant → no figure.
+        assert_eq!(away_duration(None), None);
+        // The reported span includes AWAY_THRESHOLD (the pre-confirmation gap),
+        // so it is always at least that long.
+        let reported = away_duration(Some(Instant::now())).expect("some");
+        assert!(reported >= presence::AWAY_THRESHOLD);
     }
 
     #[test]
