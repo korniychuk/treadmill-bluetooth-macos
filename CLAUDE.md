@@ -22,7 +22,17 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
 - `src/control.rs` — FTMS Control Point (start/stop/speed).
 - `src/control_command.rs` — `ControlCommand` тип (`start`/`stop`/`speed:<kmh>`),
   парс/формат и staleness-проверка для очереди команд (задача 013).
-- `src/presence.rs` — детекция присутствия: лента крутится, но шаги не растут → `AwayWhileRunning`.
+- `src/presence.rs` — детекция присутствия: лента крутится, но шаги не растут →
+  `AwayWhileRunning`. `observe(now, speed, steps)` — время инъектируется (демон
+  даёт `Instant::now()`, replay — синтез из `ts_ms`), единый источник 10с-away-порога.
+- `src/activity.rs` — общий движок presence+credit+сегменты (`ActivityAccumulator`,
+  `credit_or_hold`), которым гоняют **и** живой демон, **и** replay (задача 015) —
+  сегментация идентична by construction, не форкается.
+- `src/recompute.rs` — команда `recompute-segments`: проигрывает `raw_samples`
+  через тот же `ActivityAccumulator` (scratch in-memory `Store` переиспользует
+  `advance_baseline`+`credit_activity` verbatim) и транзакционно/идемпотентно
+  перестраивает `activity_segments` из ground-truth. `daily_stats`/`raw_samples`/
+  `workouts` не трогает. Read-only по BLE (задача 015).
 - `src/store.rs` — SQLite (`~/Library/Application Support/treadmill-bluetooth-macos/treadmill.db`),
   дневная статистика (шаги/дистанция/время ходьбы), restart-safe дельта-накопление.
   Тренировки хранятся как порог-независимые **сегменты** (`activity_segments`,
@@ -70,6 +80,7 @@ cargo run -- connect  # подключиться к первой FTMS-дорож
 cargo run -- daemon    # фоновый режим: авто-коннект + presence + toast (для интерактивной проверки)
 cargo run -- stats     # статистика за сегодня; `stats --all` — за все дни
 cargo run -- widget    # компактный TSV текущей тренировки для status-bar виджета; пусто если дорожка off (см. docs/tasks/009)
+cargo run -- recompute-segments  # пересобрать activity_segments из raw_samples (без BLE, идемпотентно; docs/tasks/015)
 cargo run -- --help    # полный список команд
 cargo test             # юнит-тесты
 cargo clippy           # линт

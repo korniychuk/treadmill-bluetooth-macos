@@ -110,6 +110,21 @@ pub struct RawDeltas {
     pub elapsed_s: i64,
 }
 
+/// One decoded `raw_samples` row, in the shape the offline replay
+/// (`crate::recompute`) needs to re-drive the presence + credit engine: the
+/// device session it belongs to, its wall-clock timestamp, and the *cumulative*
+/// device counters (already decoded back from their wire scale). See
+/// `docs/tasks/015`.
+#[derive(Debug, Clone)]
+pub struct RawSample {
+    pub session_id: i64,
+    pub ts_ms: i64,
+    pub speed_kmh: Option<f32>,
+    pub distance_m: Option<u32>,
+    pub elapsed_s: Option<u16>,
+    pub steps: Option<u32>,
+}
+
 /// `control_commands.status` values. Kept as short string literals (not an
 /// enum column) matching the rest of the schema's text-status style.
 const CONTROL_STATUS_PENDING: &str = "pending";
@@ -548,7 +563,7 @@ impl Store {
     /// loading all of them and merging in memory is cheap (see the merge
     /// call sites). Ordered ascending so [`merge_segments`] sees them
     /// chronologically.
-    fn all_segments_asc(&self) -> Result<Vec<Segment>> {
+    pub(crate) fn all_segments_asc(&self) -> Result<Vec<Segment>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -605,6 +620,76 @@ impl Store {
             )
             .context("run raw_distance_m query")?;
         Ok(raw)
+    }
+
+    /// All `raw_samples` rows in true processing order (`ts_ms`, then `id` as a
+    /// stable tiebreaker for same-millisecond frames), decoded back from their
+    /// stored wire scale into the cumulative device counters. Backs the offline
+    /// segment replay (`crate::recompute`): sessions can't interleave (one BLE
+    /// central at a time), so a change in `session_id` cleanly marks a session
+    /// boundary as the caller walks the rows. `raw_frame` is not re-parsed —
+    /// the daemon already dropped undecodable frames before insert, so the
+    /// stored columns are the authoritative decode.
+    pub fn raw_samples_ordered(&self) -> Result<Vec<RawSample>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, ts_ms, speed_centikmh, distance_m, elapsed_s, steps
+                 FROM raw_samples ORDER BY ts_ms ASC, id ASC",
+            )
+            .context("prepare raw_samples_ordered query")?;
+        let rows = stmt
+            .query_map([], |row| {
+                let speed_centikmh: Option<i64> = row.get(2)?;
+                let distance_m: Option<i64> = row.get(3)?;
+                let elapsed_s: Option<i64> = row.get(4)?;
+                let steps: Option<i64> = row.get(5)?;
+                Ok(RawSample {
+                    session_id: row.get(0)?,
+                    ts_ms: row.get(1)?,
+                    // Stored as centi-km/h (0.01 km/h) integer — mirror the
+                    // encode in `insert_raw_sample`.
+                    speed_kmh: speed_centikmh.map(|c| c as f32 / 100.0),
+                    distance_m: distance_m.map(|v| v as u32),
+                    elapsed_s: elapsed_s.map(|v| v as u16),
+                    steps: steps.map(|v| v as u32),
+                })
+            })
+            .context("run raw_samples_ordered query")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("collect raw_samples_ordered rows")
+    }
+
+    /// Atomically replace the entire `activity_segments` table with `segments`
+    /// (задача 015 recompute): clear it, then re-insert the given rows with
+    /// their explicit ids, all in one transaction so a crash mid-rebuild leaves
+    /// the old set intact. Idempotent when fed a deterministically-computed set
+    /// (the replay produces identical ids/columns each run). Touches nothing
+    /// else — `daily_stats`, `raw_samples`, and `workouts` are out of scope.
+    pub fn replace_activity_segments(&mut self, segments: &[Segment]) -> Result<()> {
+        let tx = self.conn.transaction().context("begin replace_activity_segments transaction")?;
+        tx.execute("DELETE FROM activity_segments", []).context("clear activity_segments")?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO activity_segments (id, started_at, ended_at, date, distance_m, steps, walking_time_s)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .context("prepare activity_segments insert")?;
+            for segment in segments {
+                stmt.execute(params![
+                    segment.id,
+                    segment.started_at,
+                    segment.ended_at,
+                    segment.date,
+                    segment.distance_m,
+                    segment.steps,
+                    segment.walking_time_s,
+                ])
+                .context("insert rebuilt activity segment")?;
+            }
+        }
+        tx.commit().context("commit replace_activity_segments transaction")?;
+        Ok(())
     }
 
     /// Upsert the single `daemon_status` row (id=0), same pattern as

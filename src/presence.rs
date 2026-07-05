@@ -39,9 +39,14 @@ impl PresenceTracker {
 
     /// Feed one telemetry sample; returns `Some(new_state)` only on a
     /// transition, `None` if the state is unchanged.
-    pub fn observe(&mut self, speed_kmh: Option<f32>, steps: Option<u32>) -> Option<PresenceState> {
-        let now = Instant::now();
-
+    ///
+    /// `now` is injected rather than read internally so the exact same
+    /// away-threshold logic drives both the live daemon (which passes
+    /// `Instant::now()`) and the historical replay in `crate::recompute`
+    /// (which passes an instant synthesized from a sample's `ts_ms`). This is
+    /// the single source of truth for the 10s away detection — see
+    /// `docs/tasks/015`.
+    pub fn observe(&mut self, now: Instant, speed_kmh: Option<f32>, steps: Option<u32>) -> Option<PresenceState> {
         if let Some(steps) = steps
             && self.last_steps != Some(steps)
         {
@@ -103,7 +108,7 @@ mod tests {
     #[test]
     fn walking_when_speed_and_steps_present() {
         let mut tracker = PresenceTracker::new();
-        let transition = tracker.observe(Some(2.5), Some(10));
+        let transition = tracker.observe(Instant::now(), Some(2.5), Some(10));
         assert_eq!(transition, Some(PresenceState::Walking));
         assert_eq!(tracker.state(), PresenceState::Walking);
     }
@@ -111,16 +116,16 @@ mod tests {
     #[test]
     fn paused_when_speed_zero() {
         let mut tracker = PresenceTracker::new();
-        tracker.observe(Some(2.5), Some(10));
-        let transition = tracker.observe(Some(0.0), Some(10));
+        tracker.observe(Instant::now(), Some(2.5), Some(10));
+        let transition = tracker.observe(Instant::now(), Some(0.0), Some(10));
         assert_eq!(transition, Some(PresenceState::Paused));
     }
 
     #[test]
     fn no_transition_reported_when_state_unchanged() {
         let mut tracker = PresenceTracker::new();
-        tracker.observe(Some(2.5), Some(10));
-        let transition = tracker.observe(Some(2.5), Some(11));
+        tracker.observe(Instant::now(), Some(2.5), Some(10));
+        let transition = tracker.observe(Instant::now(), Some(2.5), Some(11));
         assert_eq!(transition, None);
         assert_eq!(tracker.state(), PresenceState::Walking);
     }
@@ -128,19 +133,19 @@ mod tests {
     #[test]
     fn away_after_threshold_without_step_change() {
         let mut tracker = PresenceTracker::new();
-        tracker.observe(Some(2.5), Some(10));
+        tracker.observe(Instant::now(), Some(2.5), Some(10));
         // Simulate the threshold elapsing without any step increase by
         // back-dating last_step_change directly (no real sleep in tests).
         tracker.last_step_change = Some(Instant::now() - AWAY_THRESHOLD - Duration::from_secs(1));
-        let transition = tracker.observe(Some(2.5), Some(10));
+        let transition = tracker.observe(Instant::now(), Some(2.5), Some(10));
         assert_eq!(transition, Some(PresenceState::AwayWhileRunning));
     }
 
     #[test]
     fn resuming_after_a_long_pause_reads_as_walking_not_away() {
         let mut tracker = PresenceTracker::new();
-        tracker.observe(Some(2.5), Some(10));
-        let paused = tracker.observe(Some(0.0), Some(10));
+        tracker.observe(Instant::now(), Some(2.5), Some(10));
+        let paused = tracker.observe(Instant::now(), Some(0.0), Some(10));
         assert_eq!(paused, Some(PresenceState::Paused));
 
         // Back-date last_step_change to simulate a pause far longer than
@@ -150,9 +155,9 @@ mod tests {
         tracker.last_step_change = Some(Instant::now() - AWAY_THRESHOLD - Duration::from_secs(60));
         // One more paused sample, as would arrive from a real long pause,
         // must re-pin the clock before resuming.
-        tracker.observe(Some(0.0), Some(10));
+        tracker.observe(Instant::now(), Some(0.0), Some(10));
 
-        let resumed = tracker.observe(Some(2.5), Some(10));
+        let resumed = tracker.observe(Instant::now(), Some(2.5), Some(10));
         assert_eq!(resumed, Some(PresenceState::Walking));
     }
 }

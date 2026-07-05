@@ -64,6 +64,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
+use crate::activity::ActivityAccumulator;
 use crate::control::Controller;
 use crate::control_command::{self, ControlCommand};
 use crate::ftms;
@@ -71,9 +72,9 @@ use crate::goals::{self, Goal};
 use crate::logger::WorkoutLogger;
 use crate::notify;
 use crate::power::{self, PowerEvent};
-use crate::presence::{self, PresenceState, PresenceTracker};
+use crate::presence::{self, PresenceState};
 use crate::scan;
-use crate::store::{DaemonStatus, RawDeltas, Store};
+use crate::store::{DaemonStatus, Store};
 
 /// Delay before retrying discovery after a scan/connect failure, so a
 /// transient Bluetooth hiccup does not spin the CPU in a tight loop.
@@ -327,17 +328,12 @@ async fn stream_with_presence(
 
     let session_id = store.start_session()?;
     let mut logger = WorkoutLogger::create()?;
-    let mut presence = PresenceTracker::new();
-    // Distance/time seen since the last *confirmed* step, not yet credited to
-    // today's totals — see `credit_or_hold` for why this can't be applied the
-    // instant a sample arrives.
-    let mut pending = PendingCredit::default();
-    // The open activity segment's id, or `None` when no segment is open
-    // (задача 014). Extended by each credited step, closed (set to `None`) on
-    // the presence transition leaving `Walking`. Fresh per session, so a daemon
-    // restart mid-walk just opens a new segment; read-time `merge_segments`
-    // re-joins it to the pre-restart one when the gap is under threshold.
-    let mut current_segment: Option<i64> = None;
+    // Presence + pending-credit + open-segment state, all fresh per session (a
+    // daemon restart mid-walk just opens a new segment; read-time
+    // `merge_segments` re-joins it to the pre-restart one when the gap is under
+    // threshold). This is the *same* engine the offline replay runs — see
+    // `crate::activity` and `docs/tasks/015`.
+    let mut accumulator = ActivityAccumulator::new();
     // When the current away/pause spell began, for the return toasts (задача
     // 010). `Instant` on macOS does not advance across sleep, but a session
     // that sleeps mid-away drops the BLE link and re-enters here fresh anyway.
@@ -442,8 +438,8 @@ async fn stream_with_presence(
                     }
                 }
 
-                let prev_state = presence.state();
-                if let Some(next_state) = presence.observe(data.speed_kmh, data.steps) {
+                let prev_state = accumulator.state();
+                if let Some(next_state) = accumulator.observe(Instant::now(), data.speed_kmh, data.steps) {
                     info!(?prev_state, ?next_state, "presence transition");
                     state.presence_state = Some(format!("{next_state:?}"));
                     match next_state {
@@ -474,16 +470,16 @@ async fn stream_with_presence(
                         }
                         _ => {}
                     }
-                    // Close the open activity segment on any transition leaving
-                    // Walking (Paused/AwayWhileRunning): the next credited step
-                    // opens a fresh one, and read-time merge regroups by gap
-                    // (задача 014). No DB write — "open" lives only here.
-                    if next_state != PresenceState::Walking {
-                        current_segment = None;
-                    }
+                    // The open segment is closed inside `accumulator.observe`
+                    // on any transition leaving Walking (Paused/AwayWhileRunning):
+                    // the next credited step opens a fresh one, and read-time
+                    // merge regroups by gap (задача 014). No DB write.
                 }
 
-                credit_or_hold(store, &mut pending, &mut current_segment, presence.state(), deltas)?;
+                // Credit this sample. `Utc::now()` matches the timestamp already
+                // stored on the raw sample above (same loop iteration), which is
+                // exactly what the offline replay feeds back — see `docs/tasks/015`.
+                accumulator.credit(store, Utc::now(), deltas)?;
                 // Daily totals can only have grown when a step was actually
                 // credited, so gate the goal check on that to avoid a query
                 // every idle second.
@@ -506,60 +502,6 @@ async fn stream_with_presence(
     logger.finish();
     store.end_session()?;
     error!("notification stream ended (device disconnected?)");
-    Ok(())
-}
-
-/// Distance/time accrued since the last confirmed step, held back from
-/// `daily_stats`/`workouts` until either a new step confirms it was real
-/// walking, or the operator is confirmed away and it gets discarded.
-#[derive(Default)]
-struct PendingCredit {
-    distance_m: i64,
-    elapsed_s: i64,
-}
-
-/// Decide what to do with this sample's raw deltas.
-///
-/// Steps only ever advance when a step is genuinely registered, so a
-/// non-zero `deltas.steps` is itself the confirmation signal — crediting it
-/// immediately is always correct. Distance/time are different: the belt
-/// keeps moving and `elapsed_s` keeps ticking during the up-to-
-/// `presence::AWAY_THRESHOLD` window before an absence is confirmed, so they
-/// are held in `pending` and only flushed to `daily_stats`/`activity_segments`
-/// alongside a confirming step. If the away threshold fires first, `pending`
-/// is dropped instead of committed — otherwise every departure would silently
-/// credit an extra `AWAY_THRESHOLD` worth of phantom distance/time.
-///
-/// `current_segment` is the daemon's in-memory open-segment id (задача 014):
-/// each confirming step extends it (or opens one if `None`), and the returned
-/// id is stored back. The segment is *closed* elsewhere — on the presence
-/// transition leaving `Walking` (see the caller), which just clears this to
-/// `None` so the next step opens a fresh segment.
-fn credit_or_hold(
-    store: &mut Store,
-    pending: &mut PendingCredit,
-    current_segment: &mut Option<i64>,
-    state: PresenceState,
-    deltas: RawDeltas,
-) -> Result<()> {
-    match state {
-        PresenceState::Walking => {
-            pending.distance_m += deltas.distance_m;
-            pending.elapsed_s += deltas.elapsed_s;
-            if deltas.steps > 0 {
-                // TODO(006/daemon.rs stage): pass the real sample timestamp instead of
-                // `Utc::now()` once the daemon plumbs one through, so cross-segment gaps
-                // match wall-clock precisely rather than processing time.
-                let id =
-                    store.credit_activity(deltas.steps, pending.distance_m, pending.elapsed_s, chrono::Utc::now(), *current_segment)?;
-                *current_segment = Some(id);
-                *pending = PendingCredit::default();
-            }
-        }
-        PresenceState::AwayWhileRunning | PresenceState::Paused | PresenceState::Unknown => {
-            *pending = PendingCredit::default();
-        }
-    }
     Ok(())
 }
 
@@ -861,52 +803,6 @@ mod tests {
 
     fn memory_store() -> Store {
         Store::open_at(Path::new(":memory:")).expect("open in-memory store")
-    }
-
-    #[test]
-    fn confirmed_step_flushes_pending_distance_and_time() {
-        let mut store = memory_store();
-        let mut pending = PendingCredit::default();
-        let mut segment: Option<i64> = None;
-
-        // Ambiguous gap: belt moved 3m/1s but no step registered yet.
-        credit_or_hold(&mut store, &mut pending, &mut segment, PresenceState::Walking, RawDeltas { steps: 0, distance_m: 3, elapsed_s: 1 })
-            .unwrap();
-        assert_eq!(pending.distance_m, 3);
-        assert!(segment.is_none(), "no segment opened until a step confirms walking");
-
-        // A step now confirms the whole gap was real walking — flush it.
-        credit_or_hold(&mut store, &mut pending, &mut segment, PresenceState::Walking, RawDeltas { steps: 1, distance_m: 1, elapsed_s: 1 })
-            .unwrap();
-        assert_eq!(pending.distance_m, 0);
-        assert!(segment.is_some(), "the confirming step opens the segment");
-        let today = store.today_stats().unwrap();
-        assert_eq!(today.distance_m, 4);
-        assert_eq!(today.steps, 1);
-        assert_eq!(today.walking_time_s, 2);
-    }
-
-    #[test]
-    fn confirmed_away_discards_pending_instead_of_crediting_it() {
-        let mut store = memory_store();
-        let mut pending = PendingCredit::default();
-        let mut segment: Option<i64> = None;
-
-        // The belt kept moving for the whole confirmation window before the
-        // tracker flips to AwayWhileRunning — this must never reach daily_stats.
-        for _ in 0..10 {
-            credit_or_hold(&mut store, &mut pending, &mut segment, PresenceState::Walking, RawDeltas { steps: 0, distance_m: 1, elapsed_s: 1 })
-                .unwrap();
-        }
-        assert_eq!(pending.distance_m, 10);
-
-        credit_or_hold(&mut store, &mut pending, &mut segment, PresenceState::AwayWhileRunning, RawDeltas { steps: 0, distance_m: 1, elapsed_s: 1 })
-            .unwrap();
-
-        assert_eq!(pending.distance_m, 0);
-        let today = store.today_stats().unwrap();
-        assert_eq!(today.distance_m, 0);
-        assert_eq!(today.walking_time_s, 0);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! Run with `--help` for the full command list. `scan` (list nearby BLE
 //! devices) is the default when no subcommand is given.
 
+mod activity;
 mod control;
 mod control_command;
 mod daemon;
@@ -14,6 +15,7 @@ mod logger;
 mod notify;
 mod power;
 mod presence;
+mod recompute;
 mod scan;
 mod sniff;
 mod store;
@@ -61,6 +63,10 @@ enum Commands {
     /// never opens the BLE adapter itself, so it cannot contend with a
     /// running daemon for it (see docs/tasks/006, задача B).
     Status,
+    /// Rebuild `activity_segments` from `raw_samples` by replaying the live
+    /// presence + credit engine over history (задача 015). One-off, no BLE;
+    /// idempotent; leaves `daily_stats`/`raw_samples`/`workouts` untouched.
+    RecomputeSegments,
     /// Emit a compact, machine-readable snapshot for a status-bar widget
     /// (tmux/Dracula). Prints one TSV line `state\tworkout_count\tcur_walking_s\t
     /// cur_steps\tcur_distance_m\tday_walking_s\tday_steps\tday_distance_m` while
@@ -125,6 +131,9 @@ async fn main() -> Result<()> {
     if let Commands::Status = command {
         return run_status();
     }
+    if let Commands::RecomputeSegments = command {
+        return recompute::run();
+    }
     if let Commands::Widget = command {
         return run_widget();
     }
@@ -169,6 +178,7 @@ async fn main() -> Result<()> {
         }
         Commands::Stats { .. }
         | Commands::Status
+        | Commands::RecomputeSegments
         | Commands::Widget
         | Commands::NotifyTest
         | Commands::Start
