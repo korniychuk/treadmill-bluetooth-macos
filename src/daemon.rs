@@ -52,6 +52,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -109,6 +110,23 @@ const SPEED_RESTORE_TIMEOUT: Duration = Duration::from_secs(15);
 /// bother restoring — avoids a redundant Control Point write (and a misleading
 /// toast) when the machine did not actually slow down on resume.
 const SPEED_RESTORE_EPSILON_KMH: f32 = 0.05;
+
+/// How much of the speed history just before a pause to ignore when estimating
+/// the walking ("cruising") speed to restore. The belt ramps itself down to a
+/// stop over a couple of seconds when paused (measured ~2-3s on the W2 Pro;
+/// margin to 10s), so those trailing samples are the deceleration, not the
+/// speed the operator was actually walking at. Without this we would capture
+/// the ~0.6 km/h tail instead of the real 2.5 (see задача 012 follow-up).
+const SPEED_CRUISE_DECEL_SKIP: Duration = Duration::from_secs(10);
+
+/// Samples slower than this are ramp/idle, not walking, and are excluded from
+/// the cruising estimate (the belt minimum sits around 0.5 km/h).
+const SPEED_CRUISE_FLOOR_KMH: f32 = 0.8;
+
+/// How long to retain recent speed samples for the cruising estimate. Covers
+/// the decel-skip plus a useful averaging window before it; older samples are
+/// pruned every telemetry tick so the buffer stays tiny.
+const SPEED_HISTORY_RETENTION: Duration = Duration::from_secs(45);
 
 /// Exit code used when the watchdog kills the process on a detected hang —
 /// distinct from panics/normal errors so `launchctl print` / log forensics
@@ -312,9 +330,14 @@ async fn stream_with_presence(
     // that sleeps mid-away drops the BLE link and re-enters here fresh anyway.
     let mut away_since: Option<Instant> = None;
     let mut paused_since: Option<Instant> = None;
-    // Last non-zero belt speed seen (the walking speed), and the value snapshotted
-    // when a pause begins — used to auto-restore speed on resume (задача 012),
-    // since the machine resets the belt to a crawl (~0.5 km/h) after a pause.
+    // Recent (timestamp, belt speed) samples, used to estimate the walking
+    // ("cruising") speed to restore on resume — snapshotted when a pause begins.
+    // The machine resets the belt to a crawl (~0.5 km/h) after a pause, and it
+    // also ramps *itself* down over a couple of seconds before the pause, so we
+    // cannot just take the last non-zero sample (that is the decel tail). See
+    // `cruising_speed` (задача 012 follow-up). `last_walking_speed` is the plain
+    // last-non-zero fallback for a session too short to have a cruising window.
+    let mut speed_history: VecDeque<(Instant, f32)> = VecDeque::new();
     let mut last_walking_speed: Option<f32> = None;
     let mut pre_pause_speed: Option<f32> = None;
 
@@ -384,12 +407,23 @@ async fn stream_with_presence(
 
                 let deltas = store.advance_baseline(data.steps, data.total_distance_m, data.elapsed_s)?;
 
-                // Remember the walking speed so it can be restored after a pause
-                // (the machine resets the belt to a crawl on resume — задача 012).
-                if let Some(speed) = data.speed_kmh
-                    && speed > 0.0
-                {
-                    last_walking_speed = Some(speed);
+                // Record the belt speed so it can be restored after a pause (the
+                // machine resets the belt to a crawl on resume — задача 012).
+                // Keep a short rolling history for the cruising estimate, plus the
+                // plain last-non-zero value as a fallback.
+                if let Some(speed) = data.speed_kmh {
+                    let now = Instant::now();
+                    speed_history.push_back((now, speed));
+                    while let Some(&(t, _)) = speed_history.front() {
+                        if now.saturating_duration_since(t) > SPEED_HISTORY_RETENTION {
+                            speed_history.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+                    if speed > 0.0 {
+                        last_walking_speed = Some(speed);
+                    }
                 }
 
                 let prev_state = presence.state();
@@ -415,7 +449,11 @@ async fn stream_with_presence(
                         // must not immediately toast "paused".
                         PresenceState::Paused if prev_state != PresenceState::Unknown => {
                             paused_since = Some(Instant::now());
-                            pre_pause_speed = last_walking_speed;
+                            // Estimate the walking speed from before the belt began
+                            // ramping down, not the decel tail; fall back to the
+                            // last non-zero sample for a too-short session.
+                            pre_pause_speed =
+                                cruising_speed(speed_history.make_contiguous(), Instant::now()).or(last_walking_speed);
                             notify::treadmill_paused();
                         }
                         _ => {}
@@ -488,6 +526,38 @@ fn credit_or_hold(store: &mut Store, pending: &mut PendingCredit, state: Presenc
 /// lost the start instant — the toast then omits the figure.
 fn away_duration(away_since: Option<Instant>) -> Option<Duration> {
     away_since.map(|since| since.elapsed() + presence::AWAY_THRESHOLD)
+}
+
+/// Estimate the walking ("cruising") speed to restore on resume from recent
+/// `(timestamp, speed)` samples, ignoring the deceleration tail in the last
+/// [`SPEED_CRUISE_DECEL_SKIP`] before the pause and any sub-[`SPEED_CRUISE_FLOOR_KMH`]
+/// ramp/idle samples. Returns the median of the qualifying "walking" samples;
+/// if the session was too short to have any (everything is inside the decel
+/// window), falls back to the fastest walking sample seen (the belt only ramps
+/// *down* into a pause, so the peak is the cruising speed). `None` only when no
+/// sample reached the floor at all — the caller then uses its own fallback.
+/// Pure and unit-tested; the buffer plumbing lives in the daemon loop.
+fn cruising_speed(samples: &[(Instant, f32)], pause_at: Instant) -> Option<f32> {
+    let mut walking: Vec<f32> = samples
+        .iter()
+        .filter(|(t, kmh)| {
+            *kmh >= SPEED_CRUISE_FLOOR_KMH && pause_at.saturating_duration_since(*t) >= SPEED_CRUISE_DECEL_SKIP
+        })
+        .map(|(_, kmh)| *kmh)
+        .collect();
+
+    if walking.is_empty() {
+        // Too short for a cruising window — use the peak walking speed instead
+        // of the decel tail (the belt only slows down going into a pause).
+        return samples
+            .iter()
+            .map(|(_, kmh)| *kmh)
+            .filter(|kmh| *kmh >= SPEED_CRUISE_FLOOR_KMH)
+            .fold(None, |acc, kmh| Some(acc.map_or(kmh, |m: f32| m.max(kmh))));
+    }
+
+    walking.sort_by(|a, b| a.partial_cmp(b).expect("belt speeds are never NaN"));
+    Some(walking[walking.len() / 2])
 }
 
 /// The pre-pause walking speed to re-send on resume, or `None` when there is
@@ -766,6 +836,56 @@ mod tests {
         assert_eq!(speed_restore_target(2.5, 3.0), None);
         // Within epsilon → treated as no change.
         assert_eq!(speed_restore_target(2.5, 2.48), None);
+    }
+
+    #[test]
+    fn cruising_speed_ignores_the_deceleration_tail() {
+        // arr — steady 2.5 walk, then the belt ramps itself down over the last
+        // ~3s into the pause (the real W2 Pro pattern from the logs).
+        let pause = Instant::now();
+        let mut samples: Vec<(Instant, f32)> = Vec::new();
+        for secs_ago in 11..=40 {
+            samples.push((pause - Duration::from_secs(secs_ago), 2.5)); // cruising, before decel
+        }
+        samples.push((pause - Duration::from_secs(3), 1.8)); // decel tail — inside the skip window
+        samples.push((pause - Duration::from_secs(2), 1.0));
+        samples.push((pause - Duration::from_secs(1), 0.6));
+
+        // act / assert — the tail is excluded, so we get the real walking speed.
+        assert_eq!(cruising_speed(&samples, pause), Some(2.5));
+    }
+
+    #[test]
+    fn cruising_speed_takes_the_median_of_varied_walking() {
+        let pause = Instant::now();
+        let samples = [
+            (pause - Duration::from_secs(30), 2.0),
+            (pause - Duration::from_secs(25), 2.5),
+            (pause - Duration::from_secs(20), 3.0),
+        ];
+        assert_eq!(cruising_speed(&samples, pause), Some(2.5));
+    }
+
+    #[test]
+    fn cruising_speed_falls_back_to_peak_for_a_short_session() {
+        // Every sample is inside the decel-skip window (walked only ~5s), so the
+        // median path finds nothing and we take the fastest walking sample seen —
+        // never the decel tail.
+        let pause = Instant::now();
+        let samples = [
+            (pause - Duration::from_secs(5), 2.5),
+            (pause - Duration::from_secs(2), 1.2),
+            (pause - Duration::from_secs(1), 0.6),
+        ];
+        assert_eq!(cruising_speed(&samples, pause), Some(2.5));
+    }
+
+    #[test]
+    fn cruising_speed_is_none_without_any_walking_sample() {
+        // Belt never got above the floor (pure idle/ramp) → caller must fall back.
+        let pause = Instant::now();
+        let samples = [(pause - Duration::from_secs(20), 0.5), (pause - Duration::from_secs(2), 0.6)];
+        assert_eq!(cruising_speed(&samples, pause), None);
     }
 
     #[test]
