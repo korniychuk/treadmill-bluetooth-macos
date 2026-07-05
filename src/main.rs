@@ -288,8 +288,8 @@ fn print_day(store: &store::Store, day: &store::DailyStats, gap_minutes: i64) ->
         day.distance_m as f64 / 1000.0,
         fmt_duration(day.walking_time_s),
     );
-    for workout in store.workouts_for(&day.date, gap_minutes)? {
-        print_workout_line(store, &workout, "");
+    for (i, workout) in store.workouts_for(&day.date, gap_minutes)?.iter().enumerate() {
+        print_workout_line(store, i + 1, workout, "");
     }
     Ok(())
 }
@@ -303,7 +303,7 @@ fn print_day(store: &store::Store, day: &store::DailyStats, gap_minutes: i64) ->
 /// distance and after the walking time shows the pre-filter figure — belt
 /// distance/time including the moments the operator stepped off while it kept
 /// spinning (see `store::raw_distance_m`); omitted when there's nothing extra.
-fn print_workout_line(store: &store::Store, workout: &store::Workout, marker: &str) {
+fn print_workout_line(store: &store::Store, num: usize, workout: &store::Workout, marker: &str) {
     let (raw_dist, raw_time) = workout_raw(store, workout);
     let dist_hint = raw_hint(
         raw_dist.is_some_and(|d| d > workout.distance_m),
@@ -313,9 +313,10 @@ fn print_workout_line(store: &store::Store, workout: &store::Workout, marker: &s
         raw_time.is_some_and(|t| t > workout.walking_time_s),
         &fmt_duration(raw_time.unwrap_or(0)),
     );
+    // `num` is the workout's 1-based position within its day, not `workout.id`
+    // (which is its first segment's id — not sequential after задача 014/015).
     println!(
-        "  #{}  {} \u{2192} {}   {} steps, {:.2} km{dist_hint}, {}{time_hint}{marker}",
-        workout.id,
+        "  #{num}  {} \u{2192} {}   {} steps, {:.2} km{dist_hint}, {}{time_hint}{marker}",
         format_local_time(&workout.started_at),
         format_local_time(&workout.ended_at),
         workout.steps,
@@ -436,9 +437,9 @@ fn run_status() -> Result<()> {
     } else {
         let last_id = workouts.last().map(|w| w.id);
         let in_progress = status.as_ref().is_some_and(|s| s.connected && s.presence_state.as_deref() == Some("Walking"));
-        for workout in &workouts {
+        for (i, workout) in workouts.iter().enumerate() {
             let marker = if in_progress && Some(workout.id) == last_id { " [in progress]" } else { "" };
-            print_workout_line(&store, workout, marker);
+            print_workout_line(&store, i + 1, workout, marker);
         }
     }
 
