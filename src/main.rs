@@ -480,7 +480,15 @@ fn run_widget() -> Result<()> {
     // the presence filter has already excluded step-away and paused stretches
     // (the `36m27s`, not the `raw 41m42s`, that `stats` prints). It auto-freezes
     // when not walking, since nothing is credited then.
-    let latest = store.latest_workout(gap_minutes)?;
+    //
+    // Freshness gate: only treat the newest workout as the *current* one while a
+    // step now would still merge into it — i.e. its last activity ended ≤
+    // `gap_minutes` ago (`workout_is_live`). Otherwise `latest` is a *finished*
+    // workout from before the gap; showing it as "current" is how reconnecting
+    // after a long pause surfaced a stale 9-step workout as if in progress. When
+    // filtered out, `cur_* = 0` (no live workout) and the day context falls back
+    // to today.
+    let latest = store.latest_workout(gap_minutes)?.filter(|w| workout_is_live(w, gap_minutes, Utc::now()));
     let (cur_walking_s, cur_steps, cur_distance_m) = match &latest {
         Some(workout) => (workout.walking_time_s, workout.steps, workout.distance_m),
         None => (0, 0, 0),
@@ -507,6 +515,24 @@ fn run_widget() -> Result<()> {
         "{state}\t{workout_count}\t{cur_walking_s}\t{cur_steps}\t{cur_distance_m}\t{day_walking_s}\t{day_steps}\t{day_distance_m}",
     );
     Ok(())
+}
+
+/// Is the newest merged workout still the *current* (live) one at `now`? True
+/// only while a step now would merge into it — its last activity ended no more
+/// than `gap_minutes` ago. Mirrors `merge_segments`' inclusive gap boundary, so
+/// the widget stops showing a finished workout as "current" exactly when a fresh
+/// step would open a new one (e.g. after reconnecting past a long pause). An
+/// unparseable `ended_at` is an anomaly (we always write RFC3339) → treat as not
+/// live, so a corrupt row never masquerades as an in-progress workout. `now` is
+/// injected so the boundary is unit-testable.
+fn workout_is_live(workout: &store::Workout, gap_minutes: i64, now: DateTime<Utc>) -> bool {
+    match DateTime::parse_from_rfc3339(&workout.ended_at) {
+        Ok(ended_at) => now - ended_at.with_timezone(&Utc) <= chrono::Duration::minutes(gap_minutes),
+        Err(err) => {
+            tracing::warn!(%err, ended_at = %workout.ended_at, "widget: unparseable workout ended_at, treating as not live");
+            false
+        },
+    }
 }
 
 /// Is the daemon heartbeat too old to trust? An unparseable timestamp counts as
@@ -741,5 +767,27 @@ mod tests {
         assert_eq!(widget_state(None), "unknown");
         // An unrecognised label degrades to `unknown` rather than leaking through.
         assert_eq!(widget_state(Some("Bogus")), "unknown");
+    }
+
+    fn workout_ending_at(ended_at: &str) -> store::Workout {
+        store::Workout { ended_at: ended_at.to_string(), ..Default::default() }
+    }
+
+    #[test]
+    fn workout_is_live_tracks_the_merge_gap_boundary() {
+        let now = DateTime::parse_from_rfc3339("2026-07-05T18:40:00Z").unwrap().with_timezone(&Utc);
+        let gap = 15;
+
+        // Ended just now / within the gap → still the current workout.
+        assert!(workout_is_live(&workout_ending_at("2026-07-05T18:40:00Z"), gap, now));
+        assert!(workout_is_live(&workout_ending_at("2026-07-05T18:30:00Z"), gap, now)); // 10m ago
+        // Exactly on the (inclusive) boundary → still live, mirroring merge_segments.
+        assert!(workout_is_live(&workout_ending_at("2026-07-05T18:25:00Z"), gap, now)); // 15m ago
+        // Past the gap → finished; the widget must not show it as current. This is
+        // the reconnect-after-long-pause case that surfaced the stale workout.
+        assert!(!workout_is_live(&workout_ending_at("2026-07-05T18:24:59Z"), gap, now));
+        assert!(!workout_is_live(&workout_ending_at("2026-07-05T18:00:00Z"), gap, now)); // 40m ago
+        // A corrupt timestamp is never treated as a live workout.
+        assert!(!workout_is_live(&workout_ending_at("not-a-timestamp"), gap, now));
     }
 }
