@@ -260,6 +260,15 @@ impl Store {
     /// The `workouts` table is intentionally kept (not dropped) as an untouched
     /// archive: seeding is then non-destructive and fully reversible on review —
     /// see `docs/tasks/014`. Nothing writes to `workouts` anymore.
+    ///
+    /// Race safety: on the first-ever open after this deploy, two processes (the
+    /// launchd-restarted daemon and a concurrent `tm widget`/`stats`) can both
+    /// pass the `COUNT` check before either commits. So the seed does not rely on
+    /// that check alone — the `WHERE NOT EXISTS` inside the INSERT makes it
+    /// idempotent under the write lock: whichever process commits second sees the
+    /// first's rows and inserts nothing, so history is never doubled. The `COUNT`
+    /// early-return stays purely as the steady-state optimization (skip re-
+    /// scanning `workouts` on every startup).
     fn seed_segments_from_workouts(&self) -> Result<()> {
         let segment_count: i64 = self
             .conn
@@ -272,7 +281,8 @@ impl Store {
             .conn
             .execute(
                 "INSERT INTO activity_segments (id, started_at, ended_at, date, distance_m, steps, walking_time_s)
-                 SELECT id, started_at, ended_at, date, distance_m, steps, walking_time_s FROM workouts",
+                 SELECT id, started_at, ended_at, date, distance_m, steps, walking_time_s FROM workouts
+                 WHERE NOT EXISTS (SELECT 1 FROM activity_segments)",
                 [],
             )
             .context("seed activity_segments from workouts")?;
