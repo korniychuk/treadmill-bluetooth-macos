@@ -213,16 +213,6 @@ impl Store {
                     raw_frame BLOB NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_status_events_session ON status_events(session_id);
-                CREATE TABLE IF NOT EXISTS workouts (
-                    id INTEGER PRIMARY KEY,
-                    date TEXT NOT NULL,
-                    started_at TEXT NOT NULL,
-                    ended_at TEXT NOT NULL,
-                    distance_m INTEGER NOT NULL DEFAULT 0,
-                    steps INTEGER NOT NULL DEFAULT 0,
-                    walking_time_s INTEGER NOT NULL DEFAULT 0
-                );
-                CREATE INDEX IF NOT EXISTS idx_workouts_date ON workouts(date);
                 CREATE TABLE IF NOT EXISTS activity_segments (
                     id INTEGER PRIMARY KEY,
                     started_at TEXT NOT NULL,
@@ -261,49 +251,6 @@ impl Store {
                 ",
             )
             .context("run schema migration")?;
-        self.seed_segments_from_workouts()?;
-        Ok(())
-    }
-
-    /// One-time seed of `activity_segments` from the legacy `workouts` table
-    /// (задача 014). Each historical workout becomes a single segment; older
-    /// history is not re-split finer than its original 15-min grain but *is*
-    /// re-merged by the current gap at read time, which is acceptable (history
-    /// is tiny). Guarded on an empty `activity_segments` so it runs exactly
-    /// once and never after the daemon has begun writing real segments.
-    ///
-    /// The `workouts` table is intentionally kept (not dropped) as an untouched
-    /// archive: seeding is then non-destructive and fully reversible on review —
-    /// see `docs/tasks/014`. Nothing writes to `workouts` anymore.
-    ///
-    /// Race safety: on the first-ever open after this deploy, two processes (the
-    /// launchd-restarted daemon and a concurrent `tm widget`/`stats`) can both
-    /// pass the `COUNT` check before either commits. So the seed does not rely on
-    /// that check alone — the `WHERE NOT EXISTS` inside the INSERT makes it
-    /// idempotent under the write lock: whichever process commits second sees the
-    /// first's rows and inserts nothing, so history is never doubled. The `COUNT`
-    /// early-return stays purely as the steady-state optimization (skip re-
-    /// scanning `workouts` on every startup).
-    fn seed_segments_from_workouts(&self) -> Result<()> {
-        let segment_count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM activity_segments", [], |row| row.get(0))
-            .context("count activity_segments for seeding")?;
-        if segment_count > 0 {
-            return Ok(());
-        }
-        let seeded = self
-            .conn
-            .execute(
-                "INSERT INTO activity_segments (id, started_at, ended_at, date, distance_m, steps, walking_time_s)
-                 SELECT id, started_at, ended_at, date, distance_m, steps, walking_time_s FROM workouts
-                 WHERE NOT EXISTS (SELECT 1 FROM activity_segments)",
-                [],
-            )
-            .context("seed activity_segments from workouts")?;
-        if seeded > 0 {
-            tracing::info!(seeded, "seeded activity_segments from legacy workouts table (задача 014, one-time)");
-        }
         Ok(())
     }
 
