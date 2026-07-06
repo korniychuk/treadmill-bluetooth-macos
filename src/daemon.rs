@@ -51,7 +51,7 @@
 //! daemon wasn't already losing. See `docs/tasks/007-...md`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -101,6 +101,17 @@ const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// on macOS does not advance during system sleep, so waking from a long
 /// sleep cannot false-positive here.
 const WATCHDOG_STALE_THRESHOLD: Duration = Duration::from_secs(120);
+
+/// Tighter staleness threshold that applies only while telemetry is actively
+/// streaming (задача 018). A connected treadmill sends a sample ~1/s, so silence
+/// this long means the link is dead even though CoreBluetooth never fired a
+/// disconnect (the fast power-cycle case: btleplug wedged in a blocking FFI call,
+/// so even [`NOTIFICATION_TIMEOUT`] can't fire because the executor thread is
+/// stuck). Above `NOTIFICATION_TIMEOUT` (20s) so the normal in-loop reconnect
+/// still wins when the executor is *not* blocked; far below the general
+/// [`WATCHDOG_STALE_THRESHOLD`], which must stay generous for the scan/connect
+/// phase. Cuts the untracked window from ~133s (observed) to ~44s.
+const STREAMING_STALE_THRESHOLD: Duration = Duration::from_secs(40);
 
 /// Upper bound on the whole pause-resume speed-restore round-trip (take
 /// control + set speed, задача 012). Every BLE await in it must be bounded —
@@ -298,6 +309,11 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                         {
                             warn!(%err, "presence stream ended with an error");
                         }
+                        // Streaming is over (by any exit path). Lift the tight
+                        // watchdog threshold before the potentially-slow
+                        // disconnect below (whose own hang stays under the general
+                        // 120s threshold, as in задача 007). See задача 018.
+                        watchdog.set_streaming(false);
                         // Toast + status update must come *before* the BLE
                         // teardown: on a hard power-off `disconnect()` was
                         // observed to hang for hours (задача 007), and the
@@ -342,6 +358,13 @@ async fn stream_with_presence(
     let mut notifications = tokio::time::timeout(scan::CONNECT_TIMEOUT, peripheral.notifications())
         .await
         .map_err(|_| anyhow!("opening notification stream timed out (possible CoreBluetooth hang)"))??;
+
+    // From here on telemetry should arrive ~1/s. Switch the watchdog to its
+    // tight streaming threshold (задача 018) and reset the clock so the
+    // (possibly slow) subscribe phase above doesn't count against it. `run()`
+    // clears streaming the moment this function returns, by any path.
+    watchdog.touch();
+    watchdog.set_streaming(true);
 
     let session_id = store.start_session()?;
     let mut logger = WorkoutLogger::create()?;
@@ -873,6 +896,10 @@ struct Watchdog {
     /// Milliseconds since `anchor` at the moment of the last `touch()`,
     /// shared with the monitor task.
     last_touch_ms: Arc<AtomicU64>,
+    /// Whether telemetry is actively streaming (задача 018). Selects the tighter
+    /// [`STREAMING_STALE_THRESHOLD`] over the general [`WATCHDOG_STALE_THRESHOLD`],
+    /// shared with the monitor task.
+    streaming: Arc<AtomicBool>,
 }
 
 impl Watchdog {
@@ -880,6 +907,7 @@ impl Watchdog {
         Self {
             anchor: Instant::now(),
             last_touch_ms: Arc::new(AtomicU64::new(0)),
+            streaming: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -888,13 +916,31 @@ impl Watchdog {
         self.last_touch_ms.store(elapsed_ms, Ordering::Relaxed);
     }
 
-    /// Whether the last touch is older than [`WATCHDOG_STALE_THRESHOLD`],
-    /// given the current elapsed-since-anchor time. Split from
-    /// `spawn_monitor` so the threshold logic is unit-testable without a
+    /// Mark whether telemetry is actively streaming, switching which staleness
+    /// threshold the monitor applies (задача 018). Set true once the
+    /// notification stream is open, false the moment the session ends.
+    fn set_streaming(&self, streaming: bool) {
+        self.streaming.store(streaming, Ordering::Relaxed);
+    }
+
+    /// The staleness threshold for the current phase: tight while streaming
+    /// (a connected treadmill is never silent that long), generous otherwise
+    /// (scan/connect/teardown have legitimately long gaps).
+    fn stale_threshold(&self) -> Duration {
+        if self.streaming.load(Ordering::Relaxed) {
+            STREAMING_STALE_THRESHOLD
+        } else {
+            WATCHDOG_STALE_THRESHOLD
+        }
+    }
+
+    /// Whether the last touch is older than the current-phase threshold
+    /// ([`Self::stale_threshold`]), given the elapsed-since-anchor time. Split
+    /// from `spawn_monitor` so the threshold logic is unit-testable without a
     /// runtime or real waiting.
     fn is_stale_at(&self, elapsed_since_anchor: Duration) -> bool {
         let last_touch = Duration::from_millis(self.last_touch_ms.load(Ordering::Relaxed));
-        elapsed_since_anchor.saturating_sub(last_touch) > WATCHDOG_STALE_THRESHOLD
+        elapsed_since_anchor.saturating_sub(last_touch) > self.stale_threshold()
     }
 
     /// Start the independent monitor task. On detected staleness it logs an
@@ -903,7 +949,8 @@ impl Watchdog {
     fn spawn_monitor(&self) {
         let anchor = self.anchor;
         let last_touch_ms = Arc::clone(&self.last_touch_ms);
-        let probe = Self { anchor, last_touch_ms };
+        let streaming = Arc::clone(&self.streaming);
+        let probe = Self { anchor, last_touch_ms, streaming };
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(WATCHDOG_CHECK_INTERVAL);
             loop {
@@ -913,7 +960,8 @@ impl Watchdog {
                     let last_touch = Duration::from_millis(probe.last_touch_ms.load(Ordering::Relaxed));
                     error!(
                         stale_s = (elapsed - last_touch).as_secs(),
-                        threshold_s = WATCHDOG_STALE_THRESHOLD.as_secs(),
+                        threshold_s = probe.stale_threshold().as_secs(),
+                        streaming = probe.streaming.load(Ordering::Relaxed),
                         exit_code = WATCHDOG_EXIT_CODE,
                         "silent hang detected — exiting so launchd restarts the daemon"
                     );
@@ -956,6 +1004,25 @@ mod tests {
         assert!(status.connected);
         assert_eq!(status.presence_state.as_deref(), Some("Walking"));
         assert_eq!(status.power_mode, "ac_scanning");
+    }
+
+    #[test]
+    fn watchdog_uses_tighter_threshold_while_streaming() {
+        let watchdog = Watchdog::new();
+        // A gap between the two thresholds: stale while streaming, fine otherwise.
+        let between = (STREAMING_STALE_THRESHOLD + WATCHDOG_STALE_THRESHOLD) / 2;
+        assert!(STREAMING_STALE_THRESHOLD < between && between < WATCHDOG_STALE_THRESHOLD);
+
+        // Not streaming (scan/connect phase): the generous threshold applies.
+        assert!(!watchdog.is_stale_at(between));
+        // Streaming: the same gap is now a dead link.
+        watchdog.set_streaming(true);
+        assert!(watchdog.is_stale_at(between));
+        assert_eq!(watchdog.stale_threshold(), STREAMING_STALE_THRESHOLD);
+        // Lifting streaming restores the generous threshold (teardown/reconnect).
+        watchdog.set_streaming(false);
+        assert!(!watchdog.is_stale_at(between));
+        assert_eq!(watchdog.stale_threshold(), WATCHDOG_STALE_THRESHOLD);
     }
 
     #[test]
