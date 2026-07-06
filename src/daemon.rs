@@ -87,10 +87,19 @@ const RETRY_DELAY: Duration = Duration::from_secs(5);
 /// power-off well before a human would otherwise notice.
 const NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// How often the standalone watchdog task checks for staleness. Coarser than
-/// the scan cycle since this is just a liveness check, not where the real
-/// work happens.
-const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the idle loop refreshes `daemon_status.updated_at` (and touches the
+/// watchdog) while nothing else is happening, so a quiet-but-healthy stretch
+/// never looks stale to `status`. Coarse — this is just a heartbeat, not where
+/// the real work happens.
+const PERSIST_TICK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How often the standalone watchdog task polls for staleness. Much finer than
+/// the persist heartbeat: detection latency is `threshold + up-to-this`, so a
+/// coarse poll would dominate the recovery time (a live re-test fired at
+/// `stale_s=69` against a 40s threshold purely because the previous poll landed
+/// at ~39s and the next was 30s later — задача 018 follow-up). A poll is just an
+/// atomic load + `Instant::elapsed`, so 5s is essentially free.
+const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How stale the watchdog's last touch may get before we treat it as a
 /// silent hang and exit for launchd to restart us (задача 007). Generous
@@ -110,8 +119,12 @@ const WATCHDOG_STALE_THRESHOLD: Duration = Duration::from_secs(120);
 /// stuck). Above `NOTIFICATION_TIMEOUT` (20s) so the normal in-loop reconnect
 /// still wins when the executor is *not* blocked; far below the general
 /// [`WATCHDOG_STALE_THRESHOLD`], which must stay generous for the scan/connect
-/// phase. Cuts the untracked window from ~133s (observed) to ~44s.
-const STREAMING_STALE_THRESHOLD: Duration = Duration::from_secs(40);
+/// phase. With the 5s [`WATCHDOG_POLL_INTERVAL`], detection is ~30-35s and total
+/// recovery ~34s (was ~133s before задача 018). The 10s margin over
+/// `NOTIFICATION_TIMEOUT` keeps the graceful in-loop reconnect first when the
+/// executor is not blocked (the loop sets `streaming` false at 20s, so this
+/// threshold never trips for a clean disconnect).
+const STREAMING_STALE_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// Upper bound on the whole pause-resume speed-restore round-trip (take
 /// control + set speed, задача 012). Every BLE await in it must be bounded —
@@ -183,7 +196,7 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
     watchdog.spawn_monitor();
     // Refreshes `daemon_status.updated_at` (and the watchdog) while idle, so
     // quiet-but-healthy stretches never look like a hang to `status`.
-    let mut persist_tick = tokio::time::interval(WATCHDOG_CHECK_INTERVAL);
+    let mut persist_tick = tokio::time::interval(PERSIST_TICK_INTERVAL);
 
     // The listener always sends the current AC/battery state as its first
     // event (see `power::spawn_power_event_listener`), so this seeds `on_ac`
@@ -952,7 +965,7 @@ impl Watchdog {
         let streaming = Arc::clone(&self.streaming);
         let probe = Self { anchor, last_touch_ms, streaming };
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(WATCHDOG_CHECK_INTERVAL);
+            let mut tick = tokio::time::interval(WATCHDOG_POLL_INTERVAL);
             loop {
                 tick.tick().await;
                 let elapsed = probe.anchor.elapsed();
