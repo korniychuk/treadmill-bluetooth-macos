@@ -1,2 +1,5 @@
 /target
 /workouts
+
+# Claude Code runtime locks (machine-specific session metadata)
+.claude/*.lock

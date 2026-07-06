@@ -2,6 +2,7 @@
 name = "treadmill-bluetooth-macos"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
 description = "macOS Bluetooth Low Energy connector for a Yesoul treadmill"
 license = "MIT"
 repository = "https://github.com/korniychuk/treadmill-bluetooth-macos"

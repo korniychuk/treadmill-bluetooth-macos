@@ -39,10 +39,9 @@
 
 Логирование edge cases: нет файла — это **норма** (INFO + дефолты), битый/нечитаемый
 файл — WARN. `install-daemon.sh` **ничего не прописывает** в plist (дефолтный путь
-работает сам). Пользователь приносит свой файл сам — напр. симлинком из личного
-dotfiles-репо (в случае оператора — `ankor-dotfiles/treadmill/goals.json` →
-`~/.config/treadmill-bluetooth-macos/goals.json`, симлинк ставит dotfiles
-`install.sh`).
+работает сам). Пользователь приносит свой файл сам — напр. симлинком из своего
+dotfiles-конфига на `~/.config/treadmill-bluetooth-macos/goals.json`, который
+ставит его собственный `install.sh` (у автора это делает *AnKor Dotfiles*).
 
 Битый/отсутствующий конфиг → дефолты + WARN (не падаем).
 

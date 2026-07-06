@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --verbose
+
+      - name: Package release archive
+        id: package
+        run: |
+          set -euo pipefail
+
+          version="${GITHUB_REF_NAME}"
+          arch="$(uname -m)"
+          stage_dir="treadmill-bluetooth-macos-${version}-macos-${arch}"
+          archive_name="${stage_dir}.tar.gz"
+
+          mkdir -p "${stage_dir}/scripts" "${stage_dir}/macos"
+
+          cp target/release/treadmill-bluetooth-macos "${stage_dir}/"
+          cp scripts/install-daemon.sh "${stage_dir}/scripts/"
+          cp scripts/uninstall-daemon.sh "${stage_dir}/scripts/"
+          cp scripts/register-notification-identity.sh "${stage_dir}/scripts/"
+          cp macos/AppIcon.icns "${stage_dir}/macos/"
+          cp README.md "${stage_dir}/"
+          cp LICENSE "${stage_dir}/"
+
+          tar -czf "${archive_name}" "${stage_dir}"
+          rm -rf "${stage_dir}"
+
+          echo "archive_name=${archive_name}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package.outputs.archive_name }}
+          generate_release_notes: true
+          body: |
+            ## Unsigned, ad-hoc build
+
+            This binary is **not notarized by Apple** (no paid developer account).
+            It is ad-hoc code-signed only, so Gatekeeper will quarantine it on
+            first download.
+
+            Before running it, remove the quarantine attribute:
+
+            ```bash
+            xattr -d com.apple.quarantine treadmill-bluetooth-macos
+            ```
+
+            Or skip this entirely and build/install locally instead, which also
+            registers the LaunchAgent and notification identity for you:
+
+            ```bash
+            scripts/install-daemon.sh
+            ```
+
+            See [README.md](https://github.com/${{ github.repository }}/blob/main/README.md)
+            for setup and usage details.

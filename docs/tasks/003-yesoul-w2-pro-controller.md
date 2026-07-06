@@ -109,7 +109,7 @@ already-pinned versions and the global `~`-only version policy before adopting:
 
 1. Full Yesoul W2 Pro BLE protocol documentation.
 2. Working Rust logging + control app.
-3. Foundation for later integration into the larger **ReQuant** / LifeOS effort.
+3. Foundation for later integration into the author's larger **Life OS** effort.
 
 ## Open questions (resolve before impl)
 

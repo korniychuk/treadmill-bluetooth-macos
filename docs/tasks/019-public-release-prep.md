@@ -4,7 +4,7 @@
 - **Owner:** Anton
 - **Депендси:** —
 - **Затрагивает:** README, `docs/`, `.gitignore`, `scripts/`, `.github/workflows/`,
-  `Cargo.toml`, внешний репо `ankor-dotfiles` (симлинк tmux-виджета)
+  `Cargo.toml`, внешний dotfiles-конфиг автора *AnKor Dotfiles* (симлинк tmux-виджета)
 
 ## Цель
 
@@ -53,8 +53,8 @@
 |---|-----|-----|--------------|
 | P1 | Serial-подобное BLE-имя `YS_W2PRO_02395` + CoreBluetooth peripheral UUID | `docs/research/gatt-snapshot.json`, `docs/research/001`, `docs/tasks/005` | Заменить на плейсхолдер (`YS_W2PRO_xxxxx`) — не переносимо на чужой хост, но зачем светить конкретный unit. **Recommended: заменить.** |
 | P2 | Имя self-signed identity `"AnKor Treadmill BLE Dev"` (дефолт в скриптах) | `scripts/install-daemon.sh`, `scripts/run.sh`, docs | Это ник/бренд, не секрет. Оставить как дефолт, но параметризовать через `IDENTITY` (уже параметризован ✅) и в README показать generic-пример. |
-| P3 | Упоминания `ReQuant`/`LifeOS` | `docs/tasks/003:112` | Обобщить формулировку («личная экосистема автора») — не раскрывать названия смежных приватных проектов. |
-| P4 | Внутренняя структура `ankor-dotfiles` (`treadmill/goals.json`, `install.sh`) | `docs/tasks/009:16,73`, `docs/tasks/011:43` | Переписать под публичную инструкцию «симлинк из вашего конфига» без раскрытия чужой раскладки. |
+| P3 | Упоминание смежного приватного проекта (не связан с этим репо) | `docs/tasks/003:112` | Убрать — оставить только нейтральное «личная экосистема автора (Life OS)». |
+| P4 | Внутренняя структура личного dotfiles-конфига (пути `goals.json`, `install.sh`) | `docs/tasks/009`, `docs/tasks/011` | Переписать под публичную инструкцию «симлинк из вашего конфига»; называть внешний конфиг нейтрально *AnKor Dotfiles*, не раскрывая, что это приватный репо/где хранится. |
 
 ### B. Случайно застейдженный / трекнутый мусор ⚠️
 
@@ -81,10 +81,10 @@
   `STATE  WORKOUT_COUNT  CUR_WALKING_S  CUR_STEPS  CUR_DISTANCE_M  DAY_WALKING_S  DAY_STEPS  DAY_DISTANCE_M`.
   `STATE ∈ walking|paused|away|unknown`. Пустой вывод + exit 0 = «скрыть сегмент»
   (когда дорожка off / heartbeat старше 95с). Read-only, BLE не открывает.
-- Презентация живёт в `ankor-dotfiles/tmux/treadmill-widget.sh` — Dracula
-  **custom-plugin** скрипт (`custom:treadmill.sh`), рендерит цветную powerline-pill.
-  Ставится симлинком в `~/.tmux/plugins/tmux/scripts/treadmill.sh` через
-  `ankor-dotfiles/install.sh`.
+- Презентация живёт во внешнем dotfiles-конфиге автора (*AnKor Dotfiles*) —
+  Dracula **custom-plugin** скрипт (`custom:treadmill.sh`), рендерит цветную
+  powerline-pill. Ставится симлинком в `~/.tmux/plugins/tmux/scripts/treadmill.sh`
+  собственным `install.sh` этого конфига.
 - **Это НЕ TPM-плагин** (у TPM-плагина нужен `<name>.tmux` entry-point + свой репо).
   Это скрипт для Dracula, работает только если Dracula уже статус-бар.
 
@@ -145,7 +145,7 @@
 
 - [ ] P1: заменить `YS_W2PRO_02395` и peripheral UUID на плейсхолдеры в
       `docs/research/*` и `docs/tasks/005` (если решено — D1).
-- [ ] P3: обобщить упоминание `ReQuant`/`LifeOS` в `docs/tasks/003`.
+- [ ] P3: убрать упоминание смежного проекта в `docs/tasks/003`, оставить нейтральное «Life OS».
 - [ ] P4: переписать «two repos» разделы в `docs/tasks/009`, `011` под публичную
       формулировку (нейтральный «ваш dotfiles/конфиг»).
 
@@ -174,7 +174,7 @@
       не Dracula. Описать 8-полевой контракт и «пусто = скрыть».
 - [ ] Обновить `docs/tasks/009` — «lives here now: `scripts/tmux/...`; dotfiles
       только симлинкует».
-- [ ] **Внешний репо `ankor-dotfiles`** (отдельно от этого репо): поменять
+- [ ] **Внешний dotfiles-конфиг автора (*AnKor Dotfiles*, отдельно от этого репо)**: поменять
       `ln -sf` источник в `install.sh` на checkout этого репо. Личный workflow
       владельца не ломается — он по-прежнему правит рабочий файл через симлинк,
       просто цель указывает в этот репо. (Делается вне данного репо — отметить в
@@ -219,8 +219,10 @@
   плейсхолдеры в `docs/research/*`? *(Рекоменд.: да — деперсонализировать.)*
 - **D2.** Оставить ли имя `"AnKor Treadmill BLE Dev"` как дефолтный `IDENTITY` в
   скриптах? *(Рекоменд.: оставить — это ник/бренд, уже параметризовано.)*
-- **D3.** Обобщать ли упоминания `ReQuant`/`LifeOS`/`ankor-dotfiles` в docs?
-  *(Рекоменд.: да, нейтральные формулировки.)*
+- **D3.** Обобщать ли упоминания смежных личных проектов и dotfiles в docs?
+  *(РЕШЕНО: убрать `ReQuant` как несвязанный; dotfiles называть нейтрально
+  *AnKor Dotfiles*, не раскрывая хранилище; `YS_W2PRO_02395` и `IDENTITY 'AnKor'`
+  оставить.)*
 - **D4.** Брать ли Apple Developer ID ($99/год) для нотаризации релизов, или
   публиковать unsigned + инструкция снять quarantine? *(Рекоменд.: пока unsigned +
   инструкция; нотаризация позже при желании.)*

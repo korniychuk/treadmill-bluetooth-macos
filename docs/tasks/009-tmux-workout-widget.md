@@ -12,8 +12,12 @@
   - `away` — сошёл с ленты, лента крутится (`AwayWhileRunning`);
   - `unknown` — связь есть, данных ещё нет.
 
-Живёт в двух репозиториях: данные — здесь (`treadmill-bluetooth-macos`),
-презентация (иконки/цвета/формат) — в `ankor-dotfiles`.
+Данные и презентация теперь живут **в этом репозитории**: контракт — команда
+`tm widget` (см. ниже), презентационный скрипт — `scripts/tmux/treadmill-widget.sh`
+(+ `scripts/tmux/README.md` с рецептами подключения). Личный конфиг оператора
+(AnKor Dotfiles) просто симлинкует этот скрипт к себе — подробности вынесены
+из этого документа, т.к. это внешний по отношению к треку публичного релиза
+приватный конфиг.
 
 ## Контракт (важно)
 
@@ -49,9 +53,9 @@ STATE  WORKOUT_COUNT  CUR_WALKING_S  CUR_STEPS  CUR_DISTANCE_M  DAY_WALKING_S  D
 - `DAY_*` — **сегодняшние** календарные итоги из `daily_stats` (тоже только
   зачтённая ходьба). `CUR_* ≤ DAY_*` по построению (текущая тренировка ⊆ дня).
 
-> Shell-скрипт `tmux/treadmill-widget.sh` живёт в **отдельном dotfiles-репо**
-> (не в этом репозитории) и парсит этот контракт — при изменении числа/порядка
-> полей его нужно обновить там.
+> Shell-скрипт `scripts/tmux/treadmill-widget.sh` (этот репозиторий) парсит
+> этот контракт — при изменении числа/порядка полей его нужно обновить вместе
+> с ним (и с `scripts/tmux/README.md`).
 
 ### Условие видимости
 
@@ -69,19 +73,24 @@ STATE  WORKOUT_COUNT  CUR_WALKING_S  CUR_STEPS  CUR_DISTANCE_M  DAY_WALKING_S  D
   на открытии соединения — 2-секундный poll читает БД, пока демон пишет, и не
   должен ловить `SQLITE_BUSY`.
 - `main.rs`: команда `Widget`, `run_widget()`, чистый `widget_state()` под тест.
+- `scripts/tmux/treadmill-widget.sh` — презентация: зовёт `tm widget`, парсит
+  TSV, рисует **цветной по состоянию** pill (`#[bg=…]` в выводе). Глифы и
+  цвета — переменными сверху (тюнинг под свою тему). Состояние
+  двойное-кодировано: цвет фона + форма иконки (walking=зелёный/`run`,
+  paused=жёлтый/`pause`, away=оранжевый/`alert`, unknown=серый/`help`).
+- `scripts/tmux/README.md` — контракт `tm widget`, рецепт подключения как
+  Dracula custom-plugin и рецепт для обычного tmux (`status-right`).
 
-### `ankor-dotfiles`
+### AnKor Dotfiles
 
-- `tmux/treadmill-widget.sh` — презентация: зовёт `tm widget`, парсит TSV,
-  рисует **цветной по состоянию** pill (`#[bg=…]` в выводе). Глифы и цвета —
-  переменными сверху. Состояние двойное-кодировано: цвет фона + форма иконки
-  (walking=зелёный/`run`, paused=жёлтый/`pause`, away=оранжевый/`alert`,
-  unknown=серый/`help`).
-- `.tmux.conf`: `custom:treadmill.sh` первым в `@dracula-plugins`,
-  `@dracula-custom-plugin-colors "gray white"`, `@dracula-refresh-rate 2`.
-- `install.sh`: симлинк `tmux/treadmill-widget.sh` →
+Личный конфиг оператора — внешний по отношению к этому репозиторию, публично
+не публикуется. Он просто:
+
+- симлинкует `scripts/tmux/treadmill-widget.sh` (из этого репозитория) →
   `~/.tmux/plugins/tmux/scripts/treadmill.sh` (Dracula ищет custom-скрипты
-  только в своём `scripts/`; `git pull` TPM untracked-симлинк не трогает).
+  только в своём `scripts/`; `git pull` TPM untracked-симлинк не трогает);
+- задаёт `.tmux.conf`: `custom:treadmill.sh` первым в `@dracula-plugins`,
+  `@dracula-custom-plugin-colors "gray white"`, `@dracula-refresh-rate 2`.
 
 ## Ключевые решения / ловушки (дорого дались)
 
