@@ -31,7 +31,11 @@ impl WorkoutLogger {
         let path = PathBuf::from(format!("{WORKOUTS_DIR}/workout-{stamp}.jsonl"));
         let file = File::create(&path).with_context(|| format!("create {}", path.display()))?;
         info!(path = %path.display(), "workout log started");
-        Ok(Self { writer: BufWriter::new(file), path, samples: 0 })
+        Ok(Self {
+            writer: BufWriter::new(file),
+            path,
+            samples: 0,
+        })
     }
 
     /// Append one telemetry sample with a wall-clock timestamp.

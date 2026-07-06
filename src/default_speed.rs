@@ -74,7 +74,10 @@ pub fn compute_default_speed(store: &Store, gap_minutes: i64) -> Result<Option<D
             }
             // Long enough by time but no usable speed samples (e.g. a gap in
             // raw_samples) — anomalous; skip to an older qualifying workout.
-            None => warn!(id = workout.id, "qualifying workout has no usable speed samples — trying an older one"),
+            None => warn!(
+                id = workout.id,
+                "qualifying workout has no usable speed samples — trying an older one"
+            ),
         }
     }
     Ok(None)
@@ -86,7 +89,11 @@ pub fn compute_default_speed(store: &Store, gap_minutes: i64) -> Result<Option<D
 /// is too small for the trim to leave anything, averages the whole floored set
 /// (fallback) rather than returning `None`. Rounded to 0.1 km/h. Pure and
 /// unit-tested — the trigger/BLE write live in `crate::daemon`.
-pub fn trimmed_mean_speed(speeds: &[f32], floor_kmh: f32, trim_fraction: f32) -> Option<TrimmedSpeed> {
+pub fn trimmed_mean_speed(
+    speeds: &[f32],
+    floor_kmh: f32,
+    trim_fraction: f32,
+) -> Option<TrimmedSpeed> {
     let mut walking: Vec<f32> = speeds.iter().copied().filter(|&s| s >= floor_kmh).collect();
     if walking.is_empty() {
         return None;
@@ -96,10 +103,18 @@ pub fn trimmed_mean_speed(speeds: &[f32], floor_kmh: f32, trim_fraction: f32) ->
     let n = walking.len();
     let trim = (n as f32 * trim_fraction).floor() as usize;
     // Trimming both ends must leave at least one sample; otherwise average all.
-    let kept = if 2 * trim < n { &walking[trim..n - trim] } else { &walking[..] };
+    let kept = if 2 * trim < n {
+        &walking[trim..n - trim]
+    } else {
+        &walking[..]
+    };
 
     let mean = kept.iter().sum::<f32>() / kept.len() as f32;
-    Some(TrimmedSpeed { mean_kmh: round_to_tenth(mean), walking_samples: n, kept_samples: kept.len() })
+    Some(TrimmedSpeed {
+        mean_kmh: round_to_tenth(mean),
+        walking_samples: n,
+        kept_samples: kept.len(),
+    })
 }
 
 /// Round to one decimal place (0.1 km/h) — walking targets are naturally coarse
@@ -134,20 +149,31 @@ mod tests {
         speeds.extend(std::iter::repeat_n(6.0, 5));
 
         let result = trimmed_mean_speed(&speeds, WALKING_FLOOR_KMH, TRIM_FRACTION).expect("some");
-        assert!((result.mean_kmh - 2.5).abs() < 0.01, "got {}", result.mean_kmh);
+        assert!(
+            (result.mean_kmh - 2.5).abs() < 0.01,
+            "got {}",
+            result.mean_kmh
+        );
         assert_eq!(result.walking_samples, 95, "5 crawl samples floored out");
     }
 
     #[test]
     fn trimmed_mean_none_when_all_below_floor() {
-        assert_eq!(trimmed_mean_speed(&[0.3, 0.5, 0.7], WALKING_FLOOR_KMH, TRIM_FRACTION), None);
-        assert_eq!(trimmed_mean_speed(&[], WALKING_FLOOR_KMH, TRIM_FRACTION), None);
+        assert_eq!(
+            trimmed_mean_speed(&[0.3, 0.5, 0.7], WALKING_FLOOR_KMH, TRIM_FRACTION),
+            None
+        );
+        assert_eq!(
+            trimmed_mean_speed(&[], WALKING_FLOOR_KMH, TRIM_FRACTION),
+            None
+        );
     }
 
     #[test]
     fn trimmed_mean_small_set_falls_back_to_plain_mean() {
         // Two samples: 15% trim rounds to 0 per side, so both are kept.
-        let result = trimmed_mean_speed(&[2.0, 3.0], WALKING_FLOOR_KMH, TRIM_FRACTION).expect("some");
+        let result =
+            trimmed_mean_speed(&[2.0, 3.0], WALKING_FLOOR_KMH, TRIM_FRACTION).expect("some");
         assert_eq!(result.mean_kmh, 2.5);
         assert_eq!(result.kept_samples, 2);
     }
@@ -155,14 +181,18 @@ mod tests {
     #[test]
     fn trimmed_mean_rounds_to_tenth() {
         // Mean 2.5333… → 2.5.
-        let result = trimmed_mean_speed(&[2.4, 2.5, 2.7], WALKING_FLOOR_KMH, TRIM_FRACTION).expect("some");
+        let result =
+            trimmed_mean_speed(&[2.4, 2.5, 2.7], WALKING_FLOOR_KMH, TRIM_FRACTION).expect("some");
         assert_eq!(result.mean_kmh, 2.5);
     }
 
     /// Insert a raw sample carrying just a belt speed at `ts_ms` (the compute
     /// path only reads `speed_centikmh`), via the public store API.
     fn insert_speed(store: &Store, ts_ms: i64, kmh: f32) {
-        let sample = TreadmillData { speed_kmh: Some(kmh), ..Default::default() };
+        let sample = TreadmillData {
+            speed_kmh: Some(kmh),
+            ..Default::default()
+        };
         store.insert_raw_sample(1, ts_ms, &sample, &[0]).unwrap();
     }
 
@@ -174,16 +204,26 @@ mod tests {
         let start = Utc.with_ymd_and_hms(2026, 7, 5, 10, 0, 0).unwrap();
         let end = start + Duration::minutes(40);
         let id = store.credit_activity(100, 200, 1800, start, None).unwrap();
-        store.credit_activity(100, 200, 1000, end, Some(id)).unwrap();
+        store
+            .credit_activity(100, 200, 1000, end, Some(id))
+            .unwrap();
 
         // Speed samples across the window: mostly 2.5, a few crawl and burst.
         for i in 0..100 {
             let ts = (start + Duration::seconds(i * 20)).timestamp_millis();
-            let kmh = if i < 5 { 0.5 } else if i >= 95 { 6.0 } else { 2.5 };
+            let kmh = if i < 5 {
+                0.5
+            } else if i >= 95 {
+                6.0
+            } else {
+                2.5
+            };
             insert_speed(&store, ts, kmh);
         }
 
-        let default = compute_default_speed(&store, 15).unwrap().expect("a default");
+        let default = compute_default_speed(&store, 15)
+            .unwrap()
+            .expect("a default");
         assert!((default.kmh - 2.5).abs() < 0.01, "got {}", default.kmh);
         assert_eq!(default.source.date, "2026-07-05");
     }

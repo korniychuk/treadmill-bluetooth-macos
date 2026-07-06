@@ -53,7 +53,11 @@ pub fn run() -> Result<()> {
         frames = rows.len(),
         sessions = outcome.sessions,
         segments = outcome.segments.len(),
-        resets = if outcome.resets > 0 { format!(" (handled {} device counter resets)", outcome.resets) } else { String::new() },
+        resets = if outcome.resets > 0 {
+            format!(" (handled {} device counter resets)", outcome.resets)
+        } else {
+            String::new()
+        },
     );
     Ok(())
 }
@@ -119,7 +123,11 @@ fn replay(rows: &[RawSample]) -> Result<ReplayOutcome> {
         let credit_now = match Utc.timestamp_millis_opt(row.ts_ms).single() {
             Some(dt) => dt,
             None => {
-                warn!(ts_ms = row.ts_ms, session_id = row.session_id, "raw_sample ts_ms out of range — skipping frame");
+                warn!(
+                    ts_ms = row.ts_ms,
+                    session_id = row.session_id,
+                    "raw_sample ts_ms out of range — skipping frame"
+                );
                 continue;
             }
         };
@@ -133,7 +141,11 @@ fn replay(rows: &[RawSample]) -> Result<ReplayOutcome> {
     }
 
     let segments = scratch.all_segments_asc()?;
-    Ok(ReplayOutcome { segments, sessions, resets })
+    Ok(ReplayOutcome {
+        segments,
+        sessions,
+        resets,
+    })
 }
 
 /// Local start/end dates of the frame span, for the summary line.
@@ -145,7 +157,10 @@ fn date_range(rows: &[RawSample]) -> (String, String) {
             .unwrap_or_else(|| "?".to_string())
     };
     // Rows are ordered by ts_ms, so first/last bound the span.
-    (fmt(rows.first().map(|r| r.ts_ms).unwrap_or(0)), fmt(rows.last().map(|r| r.ts_ms).unwrap_or(0)))
+    (
+        fmt(rows.first().map(|r| r.ts_ms).unwrap_or(0)),
+        fmt(rows.last().map(|r| r.ts_ms).unwrap_or(0)),
+    )
 }
 
 #[cfg(test)]
@@ -153,8 +168,22 @@ mod tests {
     use super::*;
 
     /// Build a raw sample; cumulative counters as the device reports them.
-    fn sample(session_id: i64, ts_ms: i64, speed_kmh: Option<f32>, steps: Option<u32>, distance_m: Option<u32>, elapsed_s: Option<u16>) -> RawSample {
-        RawSample { session_id, ts_ms, speed_kmh, distance_m, elapsed_s, steps }
+    fn sample(
+        session_id: i64,
+        ts_ms: i64,
+        speed_kmh: Option<f32>,
+        steps: Option<u32>,
+        distance_m: Option<u32>,
+        elapsed_s: Option<u16>,
+    ) -> RawSample {
+        RawSample {
+            session_id,
+            ts_ms,
+            speed_kmh,
+            distance_m,
+            elapsed_s,
+            steps,
+        }
     }
 
     /// Segment step totals in chronological order — the shape most assertions want.
@@ -169,9 +198,17 @@ mod tests {
         // = None), matching live's first-ever contact.
         let mut rows = Vec::new();
         let base = 1_000_000_000_000i64;
-        let push = |rows: &mut Vec<RawSample>, t: i64, speed: f32, steps: u32, dist: u32, el: u16| {
-            rows.push(sample(1, base + t * 1000, Some(speed), Some(steps), Some(dist), Some(el)));
-        };
+        let push =
+            |rows: &mut Vec<RawSample>, t: i64, speed: f32, steps: u32, dist: u32, el: u16| {
+                rows.push(sample(
+                    1,
+                    base + t * 1000,
+                    Some(speed),
+                    Some(steps),
+                    Some(dist),
+                    Some(el),
+                ));
+            };
 
         // Walk: frames 0..=2 (t=0,1,2). Steps 10,20,30.
         push(&mut rows, 0, 2.5, 10, 5, 1);
@@ -200,7 +237,11 @@ mod tests {
         let outcome = replay(&rows).unwrap();
 
         // Three distinct credited-walking segments.
-        assert_eq!(outcome.segments.len(), 3, "walk / walk / walk split by pause and step-away");
+        assert_eq!(
+            outcome.segments.len(),
+            3,
+            "walk / walk / walk split by pause and step-away"
+        );
         // Each walking spell credited 20 steps of confirmed deltas (the first
         // frame of the whole history credited 0; the away frames credited 0).
         assert_eq!(segment_steps(&outcome.segments), vec![20, 20, 20]);
@@ -209,7 +250,10 @@ mod tests {
         // Discard-on-away: the belt distance accrued while stepped off (frozen
         // steps, t=7..16) must not land on any segment. Segment 2 got exactly
         // its two 5 m credited deltas, not the phantom away metres.
-        assert_eq!(outcome.segments[1].distance_m, 10, "away-window distance is discarded, not credited");
+        assert_eq!(
+            outcome.segments[1].distance_m, 10,
+            "away-window distance is discarded, not credited"
+        );
     }
 
     #[test]
@@ -232,7 +276,10 @@ mod tests {
         // Belt never stopped and steps kept changing → one continuous segment.
         assert_eq!(outcome.segments.len(), 1);
         // 10 + 10 + 5 (reset frame) + 10 = 35 credited steps.
-        assert_eq!(outcome.segments[0].steps, 35, "reset rebaselines from zero, no negative/huge delta");
+        assert_eq!(
+            outcome.segments[0].steps, 35,
+            "reset rebaselines from zero, no negative/huge delta"
+        );
     }
 
     #[test]
@@ -254,7 +301,11 @@ mod tests {
 
         let outcome = replay(&rows).unwrap();
         assert_eq!(outcome.sessions, 2);
-        assert_eq!(outcome.segments.len(), 2, "each session yields its own segment");
+        assert_eq!(
+            outcome.segments.len(),
+            2,
+            "each session yields its own segment"
+        );
     }
 
     #[test]
@@ -274,7 +325,17 @@ mod tests {
 
         let key = |segs: &[Segment]| {
             segs.iter()
-                .map(|s| (s.id, s.date.clone(), s.started_at.clone(), s.ended_at.clone(), s.distance_m, s.steps, s.walking_time_s))
+                .map(|s| {
+                    (
+                        s.id,
+                        s.date.clone(),
+                        s.started_at.clone(),
+                        s.ended_at.clone(),
+                        s.distance_m,
+                        s.steps,
+                        s.walking_time_s,
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         assert_eq!(key(&first), key(&second), "two replays are identical");
@@ -298,7 +359,11 @@ mod tests {
         store.replace_activity_segments(&segments).unwrap();
         let after_second = store.all_segments_asc().unwrap();
 
-        let key = |segs: &[Segment]| segs.iter().map(|s| (s.id, s.steps, s.distance_m)).collect::<Vec<_>>();
+        let key = |segs: &[Segment]| {
+            segs.iter()
+                .map(|s| (s.id, s.steps, s.distance_m))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(key(&after_first), key(&after_second));
         assert_eq!(after_first.len(), 1);
     }

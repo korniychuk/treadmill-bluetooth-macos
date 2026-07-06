@@ -95,7 +95,10 @@ impl<'a> FitShow<'a> {
         ]
         .iter()
         .filter_map(|(uuid, wt)| {
-            chars.iter().find(|c| c.uuid == *uuid).map(|c| (c.clone(), *wt))
+            chars
+                .iter()
+                .find(|c| c.uuid == *uuid)
+                .map(|c| (c.clone(), *wt))
         })
         .collect();
         if write_chars.is_empty() {
@@ -112,7 +115,10 @@ impl<'a> FitShow<'a> {
             }
         }
 
-        Ok(Self { peripheral, write_chars })
+        Ok(Self {
+            peripheral,
+            write_chars,
+        })
     }
 
     /// Send one request frame and log every vendor response for a short window.
@@ -206,8 +212,13 @@ impl<'a> FitShow<'a> {
             bail!("incline level {incline_level} out of sane range");
         }
         let speed_byte = (speed_kmh * 10.0).round() as u8;
-        self.request(&[cmd::SYS_CONTROL, cmd::CONTROL_TARGET_OR_RUN, speed_byte, incline_level])
-            .await?;
+        self.request(&[
+            cmd::SYS_CONTROL,
+            cmd::CONTROL_TARGET_OR_RUN,
+            speed_byte,
+            incline_level,
+        ])
+        .await?;
         Ok(())
     }
 }

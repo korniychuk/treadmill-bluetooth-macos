@@ -41,7 +41,11 @@ pub async fn sniff_all(peripheral: &Peripheral) -> Result<()> {
         let hex: String = n.value.iter().map(|b| format!("{b:02x} ")).collect();
         // Treadmill Data is noisy (~2 Hz); annotate it so the interesting
         // vendor frames stand out, but keep logging everything.
-        let label = if n.uuid == ftms::TREADMILL_DATA { "2acd(data)" } else { "frame" };
+        let label = if n.uuid == ftms::TREADMILL_DATA {
+            "2acd(data)"
+        } else {
+            "frame"
+        };
         info!(char = %n.uuid, bytes = hex.trim(), "{label}");
     }
 

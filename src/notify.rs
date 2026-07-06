@@ -27,7 +27,10 @@ const SECS_PER_HOUR: u64 = 60 * 60;
 /// which is expected (not a real failure) once the first call succeeds.
 fn ensure_identity() {
     if let Err(err) = set_application(BUNDLE_ID)
-        && !matches!(err, NotifyError::Application(ApplicationError::AlreadySet(_)))
+        && !matches!(
+            err,
+            NotifyError::Application(ApplicationError::AlreadySet(_))
+        )
     {
         warn!(%err, "could not set notification identity — icon/name may fall back to default");
     }
@@ -57,7 +60,11 @@ fn toast_full(title: &str, subtitle: Option<&str>, body: &str, sound: Option<&st
     let icon = icon_path();
     let icon_str = icon.as_ref().map(|p| p.to_string_lossy());
     let mut notification = Notification::new();
-    notification.title(title).maybe_subtitle(subtitle).message(body).asynchronous(true);
+    notification
+        .title(title)
+        .maybe_subtitle(subtitle)
+        .message(body)
+        .asynchronous(true);
     if let Some(icon_str) = &icon_str {
         notification.app_icon(icon_str);
     }
@@ -100,7 +107,11 @@ fn group_thousands(value: i64) -> String {
         }
         grouped.push(ch);
     }
-    if value < 0 { format!("-{grouped}") } else { grouped }
+    if value < 0 {
+        format!("-{grouped}")
+    } else {
+        grouped
+    }
 }
 
 pub fn treadmill_found() {
@@ -112,7 +123,10 @@ pub fn treadmill_lost() {
 }
 
 pub fn walker_away() {
-    toast("Treadmill", "Belt is running but steps aren't counting — did you step off?");
+    toast(
+        "Treadmill",
+        "Belt is running but steps aren't counting — did you step off?",
+    );
 }
 
 /// Fired when steps resume after an `AwayWhileRunning` spell. `away` is how
@@ -121,7 +135,13 @@ pub fn walker_away() {
 /// rather than show a wrong one.
 pub fn walker_resumed(away: Option<Duration>) {
     match away {
-        Some(away) => toast("Treadmill", &format!("Steps are counting again — you were away {}", humanize_short(away))),
+        Some(away) => toast(
+            "Treadmill",
+            &format!(
+                "Steps are counting again — you were away {}",
+                humanize_short(away)
+            ),
+        ),
         None => toast("Treadmill", "Steps are counting again"),
     }
 }
@@ -157,7 +177,10 @@ pub fn treadmill_resumed(paused_for: Option<Duration>, restore: Option<SpeedRest
 /// pause-resume "Speed restored" toast (задача 012): this is a fresh start, not
 /// a restore.
 pub fn default_speed_applied(from_kmh: f32, to_kmh: f32) {
-    toast("Treadmill", &format!("Set your usual pace {from_kmh:.1} → {to_kmh:.1} km/h"));
+    toast(
+        "Treadmill",
+        &format!("Set your usual pace {from_kmh:.1} → {to_kmh:.1} km/h"),
+    );
 }
 
 /// Celebrate crossing a daily step goal, graduated by `tier` (задача 011):
@@ -167,9 +190,15 @@ pub fn goal_reached(threshold: i64, tier: u8) {
     let steps = group_thousands(threshold);
     let (body, sound) = match tier {
         1 => (format!("🎉 Goal reached: {steps} steps today"), None),
-        2 => (format!("🔥🎉 {steps} steps — you're on fire today!"), Some("Glass")),
+        2 => (
+            format!("🔥🎉 {steps} steps — you're on fire today!"),
+            Some("Glass"),
+        ),
         // Tier 3 (and any unexpectedly higher tier) gets the loudest copy.
-        _ => (format!("🏆🔥🎉 {steps} steps — crushing it! Absolute machine 💪"), Some("Hero")),
+        _ => (
+            format!("🏆🔥🎉 {steps} steps — crushing it! Absolute machine 💪"),
+            Some("Hero"),
+        ),
     };
     toast_full("Treadmill", None, &body, sound);
 }

@@ -35,7 +35,11 @@ use tracing_subscriber::EnvFilter;
 use crate::control_command::ControlCommand;
 
 #[derive(Parser)]
-#[command(name = "treadmill-bluetooth-macos", version, about = "macOS BLE connector for a Yesoul treadmill")]
+#[command(
+    name = "treadmill-bluetooth-macos",
+    version,
+    about = "macOS BLE connector for a Yesoul treadmill"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -249,13 +253,27 @@ fn run_notify_test() -> Result<()> {
         ("found", &notify::treadmill_found),
         ("lost", &notify::treadmill_lost),
         ("away", &notify::walker_away),
-        ("resumed (from away, with duration)", &(|| notify::walker_resumed(Some(sample_away)))),
+        (
+            "resumed (from away, with duration)",
+            &(|| notify::walker_resumed(Some(sample_away))),
+        ),
         ("paused", &notify::treadmill_paused),
         (
             "resumed (from pause, duration + speed restore)",
-            &(|| notify::treadmill_resumed(Some(sample_away), Some(notify::SpeedRestore { from_kmh: 0.5, to_kmh: 2.5 }))),
+            &(|| {
+                notify::treadmill_resumed(
+                    Some(sample_away),
+                    Some(notify::SpeedRestore {
+                        from_kmh: 0.5,
+                        to_kmh: 2.5,
+                    }),
+                )
+            }),
         ),
-        ("default speed applied (workout start)", &(|| notify::default_speed_applied(0.5, 2.5))),
+        (
+            "default speed applied (workout start)",
+            &(|| notify::default_speed_applied(0.5, 2.5)),
+        ),
         ("goal tier 1", &(|| notify::goal_reached(8000, 1))),
         ("goal tier 2", &(|| notify::goal_reached(10000, 2))),
         ("goal tier 3", &(|| notify::goal_reached(12000, 3))),
@@ -326,7 +344,11 @@ fn print_day(store: &store::Store, day: &store::DailyStats, gap_minutes: i64) ->
         day.distance_m as f64 / 1000.0,
         fmt_duration(day.walking_time_s),
     );
-    for (i, workout) in store.workouts_for(&day.date, gap_minutes)?.iter().enumerate() {
+    for (i, workout) in store
+        .workouts_for(&day.date, gap_minutes)?
+        .iter()
+        .enumerate()
+    {
         print_workout_line(store, i + 1, workout, "");
     }
     Ok(())
@@ -376,7 +398,8 @@ fn workout_raw(store: &store::Store, workout: &store::Workout) -> (Option<i64>, 
         .ok()
         .flatten()
         .filter(|&d| d >= workout.distance_m);
-    let time = raw_span_s(&workout.started_at, &workout.ended_at).filter(|&t| t >= workout.walking_time_s);
+    let time =
+        raw_span_s(&workout.started_at, &workout.ended_at).filter(|&t| t >= workout.walking_time_s);
     (dist, time)
 }
 
@@ -402,7 +425,11 @@ fn raw_hint(show: bool, value: &str) -> String {
         return String::new();
     }
     let hint = format!(" (raw {value})");
-    if std::io::stdout().is_terminal() { format!("\x1b[2m{hint}\x1b[0m") } else { hint }
+    if std::io::stdout().is_terminal() {
+        format!("\x1b[2m{hint}\x1b[0m")
+    } else {
+        hint
+    }
 }
 
 /// Duplicated from `daemon::WATCHDOG_STALE_THRESHOLD` (private to
@@ -419,15 +446,23 @@ fn run_status() -> Result<()> {
     let status = store.daemon_status()?;
     let daemon_alive = daemon_process_alive();
 
-    println!("daemon process: {}", if daemon_alive { "alive" } else { "NOT running" });
+    println!(
+        "daemon process: {}",
+        if daemon_alive { "alive" } else { "NOT running" }
+    );
 
     match &status {
-        None => println!("daemon status: never recorded (fresh install, or the daemon has never run)"),
+        None => {
+            println!("daemon status: never recorded (fresh install, or the daemon has never run)")
+        }
         Some(status) => {
             if status.connected {
                 let presence = status.presence_state.as_deref().unwrap_or("Unknown");
-                let since =
-                    status.last_connected_at.as_deref().map(describe_timestamp).unwrap_or_else(|| "unknown".to_string());
+                let since = status
+                    .last_connected_at
+                    .as_deref()
+                    .map(describe_timestamp)
+                    .unwrap_or_else(|| "unknown".to_string());
                 println!("treadmill: connected, presence = {presence} (since {since})");
             } else {
                 let ago = status
@@ -443,7 +478,10 @@ fn run_status() -> Result<()> {
                 "battery_idle" => "on battery, idling (scanning paused to save power)",
                 other => other,
             };
-            println!("power mode: {mode_desc}, since {}", describe_timestamp(&status.power_mode_since));
+            println!(
+                "power mode: {mode_desc}, since {}",
+                describe_timestamp(&status.power_mode_since)
+            );
             if status.power_mode == "battery_idle" {
                 println!(
                     "  exits battery-idle immediately on: AC power restored, or system wake \
@@ -461,7 +499,9 @@ fn run_status() -> Result<()> {
                         );
                     }
                 }
-                Err(err) => tracing::warn!(%err, updated_at = %status.updated_at, "status: unparseable daemon_status.updated_at"),
+                Err(err) => {
+                    tracing::warn!(%err, updated_at = %status.updated_at, "status: unparseable daemon_status.updated_at")
+                }
             }
         }
     }
@@ -474,9 +514,15 @@ fn run_status() -> Result<()> {
         println!("  (none yet today)");
     } else {
         let last_id = workouts.last().map(|w| w.id);
-        let in_progress = status.as_ref().is_some_and(|s| s.connected && s.presence_state.as_deref() == Some("Walking"));
+        let in_progress = status
+            .as_ref()
+            .is_some_and(|s| s.connected && s.presence_state.as_deref() == Some("Walking"));
         for (i, workout) in workouts.iter().enumerate() {
-            let marker = if in_progress && Some(workout.id) == last_id { " [in progress]" } else { "" };
+            let marker = if in_progress && Some(workout.id) == last_id {
+                " [in progress]"
+            } else {
+                ""
+            };
             print_workout_line(&store, i + 1, workout, marker);
         }
     }
@@ -526,7 +572,9 @@ fn run_widget() -> Result<()> {
     // after a long pause surfaced a stale 9-step workout as if in progress. When
     // filtered out, `cur_* = 0` (no live workout) and the day context falls back
     // to today.
-    let latest = store.latest_workout(gap_minutes)?.filter(|w| workout_is_live(w, gap_minutes, Utc::now()));
+    let latest = store
+        .latest_workout(gap_minutes)?
+        .filter(|w| workout_is_live(w, gap_minutes, Utc::now()));
     let (cur_walking_s, cur_steps, cur_distance_m) = match &latest {
         Some(workout) => (workout.walking_time_s, workout.steps, workout.distance_m),
         None => (0, 0, 0),
@@ -541,8 +589,10 @@ fn run_widget() -> Result<()> {
     // calendar `daily_stats`. `cur_* ≤ day_*` still holds (the current workout is
     // one of the reference day's workouts). `tm stats` daily lines stay strictly
     // calendar — this start-date view is widget-only, for live-workout continuity.
-    let reference_day =
-        latest.as_ref().map(|w| w.date.clone()).unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
+    let reference_day = latest
+        .as_ref()
+        .map(|w| w.date.clone())
+        .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
     let workouts = store.workouts_for(&reference_day, gap_minutes)?;
     let workout_count = workouts.len();
     let day_walking_s: i64 = workouts.iter().map(|w| w.walking_time_s).sum();
@@ -565,11 +615,13 @@ fn run_widget() -> Result<()> {
 /// injected so the boundary is unit-testable.
 fn workout_is_live(workout: &store::Workout, gap_minutes: i64, now: DateTime<Utc>) -> bool {
     match DateTime::parse_from_rfc3339(&workout.ended_at) {
-        Ok(ended_at) => now - ended_at.with_timezone(&Utc) <= chrono::Duration::minutes(gap_minutes),
+        Ok(ended_at) => {
+            now - ended_at.with_timezone(&Utc) <= chrono::Duration::minutes(gap_minutes)
+        }
         Err(err) => {
             tracing::warn!(%err, ended_at = %workout.ended_at, "widget: unparseable workout ended_at, treating as not live");
             false
-        },
+        }
     }
 }
 
@@ -577,7 +629,9 @@ fn workout_is_live(workout: &store::Workout, gap_minutes: i64, now: DateTime<Utc
 /// stale (hide) — a malformed row is not evidence the treadmill is on.
 fn widget_status_stale(status: &store::DaemonStatus) -> bool {
     match DateTime::parse_from_rfc3339(&status.updated_at) {
-        Ok(updated_at) => (Utc::now() - updated_at.with_timezone(&Utc)).num_seconds() > WATCHDOG_STALE_THRESHOLD_S,
+        Ok(updated_at) => {
+            (Utc::now() - updated_at.with_timezone(&Utc)).num_seconds() > WATCHDOG_STALE_THRESHOLD_S
+        }
         Err(err) => {
             tracing::warn!(%err, updated_at = %status.updated_at, "widget: unparseable updated_at, hiding widget");
             true
@@ -602,7 +656,11 @@ fn describe_timestamp(rfc3339: &str) -> String {
     match DateTime::parse_from_rfc3339(rfc3339) {
         Ok(dt) => {
             let utc = dt.with_timezone(&Utc);
-            format!("{} ({})", utc.with_timezone(&Local).format("%Y-%m-%d %H:%M"), humanize_ago(Utc::now() - utc))
+            format!(
+                "{} ({})",
+                utc.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
+                humanize_ago(Utc::now() - utc)
+            )
         }
         Err(err) => {
             tracing::warn!(%err, rfc3339, "status: unparseable timestamp");
@@ -638,7 +696,9 @@ fn humanize_ago(d: chrono::Duration) -> String {
 /// задача B's explicit warning against trusting stale DB rows).
 fn daemon_process_alive() -> bool {
     let uid = match std::process::Command::new("id").arg("-u").output() {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
         Ok(output) => {
             tracing::warn!(code = ?output.status.code(), "status: `id -u` failed, assuming daemon not running");
             return false;
@@ -650,12 +710,17 @@ fn daemon_process_alive() -> bool {
     };
 
     let target = format!("gui/{uid}/com.korniychuk.treadmill-bluetooth-macos.daemon");
-    match std::process::Command::new("launchctl").args(["print", &target]).output() {
+    match std::process::Command::new("launchctl")
+        .args(["print", &target])
+        .output()
+    {
         Ok(output) if output.status.success() => {
             // `launchctl print` succeeds for a *loaded* service even if it
             // crashed and isn't currently running — only a real `pid = N`
             // line means it's actually alive right now.
-            String::from_utf8_lossy(&output.stdout).lines().any(|line| line.trim_start().starts_with("pid = "))
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.trim_start().starts_with("pid = "))
         }
         Ok(_) => false, // not loaded at all
         Err(err) => {
@@ -719,7 +784,10 @@ fn daemon_holds_link(store: &store::Store) -> bool {
 /// to trust — an unparseable timestamp counts as not fresh (route to fallback).
 fn daemon_status_fresh(status: &store::DaemonStatus) -> bool {
     match DateTime::parse_from_rfc3339(&status.updated_at) {
-        Ok(updated_at) => (Utc::now() - updated_at.with_timezone(&Utc)).num_seconds() <= WATCHDOG_STALE_THRESHOLD_S,
+        Ok(updated_at) => {
+            (Utc::now() - updated_at.with_timezone(&Utc)).num_seconds()
+                <= WATCHDOG_STALE_THRESHOLD_S
+        }
         Err(err) => {
             tracing::warn!(%err, updated_at = %status.updated_at, "control: unparseable daemon_status.updated_at — treating daemon as not holding the link");
             false
@@ -742,7 +810,10 @@ async fn enqueue_and_wait(store: &store::Store, command: ControlCommand) -> Resu
                 return Ok(());
             }
             Some((status, error)) if status == "failed" => {
-                bail!("treadmill command failed: {}", error.unwrap_or_else(|| "unknown error".to_string()));
+                bail!(
+                    "treadmill command failed: {}",
+                    error.unwrap_or_else(|| "unknown error".to_string())
+                );
             }
             _ => {}
         }
@@ -808,24 +879,53 @@ mod tests {
     }
 
     fn workout_ending_at(ended_at: &str) -> store::Workout {
-        store::Workout { ended_at: ended_at.to_string(), ..Default::default() }
+        store::Workout {
+            ended_at: ended_at.to_string(),
+            ..Default::default()
+        }
     }
 
     #[test]
     fn workout_is_live_tracks_the_merge_gap_boundary() {
-        let now = DateTime::parse_from_rfc3339("2026-07-05T18:40:00Z").unwrap().with_timezone(&Utc);
+        let now = DateTime::parse_from_rfc3339("2026-07-05T18:40:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         let gap = 15;
 
         // Ended just now / within the gap → still the current workout.
-        assert!(workout_is_live(&workout_ending_at("2026-07-05T18:40:00Z"), gap, now));
-        assert!(workout_is_live(&workout_ending_at("2026-07-05T18:30:00Z"), gap, now)); // 10m ago
+        assert!(workout_is_live(
+            &workout_ending_at("2026-07-05T18:40:00Z"),
+            gap,
+            now
+        ));
+        assert!(workout_is_live(
+            &workout_ending_at("2026-07-05T18:30:00Z"),
+            gap,
+            now
+        )); // 10m ago
         // Exactly on the (inclusive) boundary → still live, mirroring merge_segments.
-        assert!(workout_is_live(&workout_ending_at("2026-07-05T18:25:00Z"), gap, now)); // 15m ago
+        assert!(workout_is_live(
+            &workout_ending_at("2026-07-05T18:25:00Z"),
+            gap,
+            now
+        )); // 15m ago
         // Past the gap → finished; the widget must not show it as current. This is
         // the reconnect-after-long-pause case that surfaced the stale workout.
-        assert!(!workout_is_live(&workout_ending_at("2026-07-05T18:24:59Z"), gap, now));
-        assert!(!workout_is_live(&workout_ending_at("2026-07-05T18:00:00Z"), gap, now)); // 40m ago
+        assert!(!workout_is_live(
+            &workout_ending_at("2026-07-05T18:24:59Z"),
+            gap,
+            now
+        ));
+        assert!(!workout_is_live(
+            &workout_ending_at("2026-07-05T18:00:00Z"),
+            gap,
+            now
+        )); // 40m ago
         // A corrupt timestamp is never treated as a live workout.
-        assert!(!workout_is_live(&workout_ending_at("not-a-timestamp"), gap, now));
+        assert!(!workout_is_live(
+            &workout_ending_at("not-a-timestamp"),
+            gap,
+            now
+        ));
     }
 }

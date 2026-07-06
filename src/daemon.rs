@@ -50,9 +50,9 @@
 //! and the JSONL log flushes per line, so an exit loses nothing a hung
 //! daemon wasn't already losing. See `docs/tasks/007-...md`.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -370,7 +370,9 @@ async fn stream_with_presence(
     // Bounded like every other CoreBluetooth call — see задача 007.
     let mut notifications = tokio::time::timeout(scan::CONNECT_TIMEOUT, peripheral.notifications())
         .await
-        .map_err(|_| anyhow!("opening notification stream timed out (possible CoreBluetooth hang)"))??;
+        .map_err(|_| {
+            anyhow!("opening notification stream timed out (possible CoreBluetooth hang)")
+        })??;
 
     // From here on telemetry should arrive ~1/s. Switch the watchdog to its
     // tight streaming threshold (задача 018) and reset the clock so the
@@ -626,7 +628,8 @@ fn cruising_speed(samples: &[(Instant, f32)], pause_at: Instant) -> Option<f32> 
     let mut walking: Vec<f32> = samples
         .iter()
         .filter(|(t, kmh)| {
-            *kmh >= SPEED_CRUISE_FLOOR_KMH && pause_at.saturating_duration_since(*t) >= SPEED_CRUISE_DECEL_SKIP
+            *kmh >= SPEED_CRUISE_FLOOR_KMH
+                && pause_at.saturating_duration_since(*t) >= SPEED_CRUISE_DECEL_SKIP
         })
         .map(|(_, kmh)| *kmh)
         .collect();
@@ -658,7 +661,11 @@ fn speed_restore_target(pre_pause_kmh: f32, resumed_kmh: f32) -> Option<f32> {
 /// (with a WARN on the abnormal paths) when nothing was applied — a missing
 /// captured speed, a no-op, or a failed/timed-out Control Point write must all
 /// leave the session running, never crash it.
-async fn try_restore_speed(peripheral: &Peripheral, pre_pause: Option<f32>, resumed_kmh: f32) -> Option<notify::SpeedRestore> {
+async fn try_restore_speed(
+    peripheral: &Peripheral,
+    pre_pause: Option<f32>,
+    resumed_kmh: f32,
+) -> Option<notify::SpeedRestore> {
     let Some(pre_pause) = pre_pause else {
         // Daemon started already paused, or the pause preceded any walking.
         warn!("resume without a captured pre-pause speed — skipping speed restore");
@@ -668,15 +675,25 @@ async fn try_restore_speed(peripheral: &Peripheral, pre_pause: Option<f32>, resu
 
     match tokio::time::timeout(SPEED_RESTORE_TIMEOUT, restore_speed(peripheral, target)).await {
         Ok(Ok(())) => {
-            info!(from = resumed_kmh, to = target, "restored pre-pause belt speed on resume");
-            Some(notify::SpeedRestore { from_kmh: resumed_kmh, to_kmh: target })
+            info!(
+                from = resumed_kmh,
+                to = target,
+                "restored pre-pause belt speed on resume"
+            );
+            Some(notify::SpeedRestore {
+                from_kmh: resumed_kmh,
+                to_kmh: target,
+            })
         }
         Ok(Err(err)) => {
             warn!(%err, target, "failed to restore pre-pause speed — leaving resume toast without the restore line");
             None
         }
         Err(_) => {
-            warn!(timeout_s = SPEED_RESTORE_TIMEOUT.as_secs(), target, "speed restore timed out (possible CoreBluetooth hang)");
+            warn!(
+                timeout_s = SPEED_RESTORE_TIMEOUT.as_secs(),
+                target, "speed restore timed out (possible CoreBluetooth hang)"
+            );
             None
         }
     }
@@ -722,7 +739,9 @@ async fn try_apply_default_speed(
     let target = match default_speed::compute_default_speed(store, gap_minutes) {
         Ok(Some(default)) => default.kmh,
         Ok(None) => {
-            info!("no qualifying prior workout (≥30m walking) — leaving belt at its device default speed");
+            info!(
+                "no qualifying prior workout (≥30m walking) — leaving belt at its device default speed"
+            );
             // Nothing to apply; don't recompute on every Walking flap this session.
             *applied = true;
             return None;
@@ -739,7 +758,11 @@ async fn try_apply_default_speed(
     *applied = true;
     match tokio::time::timeout(SPEED_RESTORE_TIMEOUT, restore_speed(peripheral, target)).await {
         Ok(Ok(())) => {
-            info!(from = resumed_kmh, to = target, "applied computed default belt speed at workout start");
+            info!(
+                from = resumed_kmh,
+                to = target,
+                "applied computed default belt speed at workout start"
+            );
             Some(target)
         }
         Ok(Err(err)) => {
@@ -766,9 +789,15 @@ fn celebrate_reached_goals(store: &Store, step_goals: &[Goal]) -> Result<()> {
     }
     let today = Local::now().format("%Y-%m-%d").to_string();
     let today_steps = store.today_stats()?.steps;
-    let already: std::collections::HashSet<i64> = store.celebrated_thresholds(&today)?.into_iter().collect();
+    let already: std::collections::HashSet<i64> =
+        store.celebrated_thresholds(&today)?.into_iter().collect();
     for goal in goals::thresholds_to_celebrate(today_steps, step_goals, &already) {
-        info!(threshold = goal.threshold, tier = goal.tier, steps = today_steps, "daily step goal reached");
+        info!(
+            threshold = goal.threshold,
+            tier = goal.tier,
+            steps = today_steps,
+            "daily step goal reached"
+        );
         notify::goal_reached(goal.threshold, goal.tier);
         store.mark_goal_celebrated(&today, goal.threshold)?;
     }
@@ -799,7 +828,12 @@ async fn process_control_commands(peripheral: &Peripheral, store: &Store) -> Res
         return Ok(());
     }
 
-    match tokio::time::timeout(SPEED_RESTORE_TIMEOUT, execute_control_command(peripheral, queued.command)).await {
+    match tokio::time::timeout(
+        SPEED_RESTORE_TIMEOUT,
+        execute_control_command(peripheral, queued.command),
+    )
+    .await
+    {
         Ok(Ok(())) => {
             info!(id = queued.id, command = %queued.command.to_wire(), "executed queued control command");
             store.mark_control_command_done(queued.id)?;
@@ -814,7 +848,10 @@ async fn process_control_commands(peripheral: &Peripheral, store: &Store) -> Res
                 timeout_s = SPEED_RESTORE_TIMEOUT.as_secs(),
                 "queued control command timed out (possible CoreBluetooth hang)"
             );
-            store.mark_control_command_failed(queued.id, "execution timed out (possible CoreBluetooth hang)")?;
+            store.mark_control_command_failed(
+                queued.id,
+                "execution timed out (possible CoreBluetooth hang)",
+            )?;
         }
     }
     Ok(())
@@ -963,14 +1000,19 @@ impl Watchdog {
         let anchor = self.anchor;
         let last_touch_ms = Arc::clone(&self.last_touch_ms);
         let streaming = Arc::clone(&self.streaming);
-        let probe = Self { anchor, last_touch_ms, streaming };
+        let probe = Self {
+            anchor,
+            last_touch_ms,
+            streaming,
+        };
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(WATCHDOG_POLL_INTERVAL);
             loop {
                 tick.tick().await;
                 let elapsed = probe.anchor.elapsed();
                 if probe.is_stale_at(elapsed) {
-                    let last_touch = Duration::from_millis(probe.last_touch_ms.load(Ordering::Relaxed));
+                    let last_touch =
+                        Duration::from_millis(probe.last_touch_ms.load(Ordering::Relaxed));
                     error!(
                         stale_s = (elapsed - last_touch).as_secs(),
                         threshold_s = probe.stale_threshold().as_secs(),
@@ -1096,7 +1138,10 @@ mod tests {
     fn cruising_speed_is_none_without_any_walking_sample() {
         // Belt never got above the floor (pure idle/ramp) → caller must fall back.
         let pause = Instant::now();
-        let samples = [(pause - Duration::from_secs(20), 0.5), (pause - Duration::from_secs(2), 0.6)];
+        let samples = [
+            (pause - Duration::from_secs(20), 0.5),
+            (pause - Duration::from_secs(2), 0.6),
+        ];
         assert_eq!(cruising_speed(&samples, pause), None);
     }
 

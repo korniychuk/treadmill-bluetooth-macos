@@ -68,7 +68,12 @@ impl ActivityAccumulator {
     /// `merge_segments` regroups by gap (задача 014). Returns the presence
     /// transition (if any) so the live caller can fire its toasts / speed
     /// restore; the replay ignores the return value.
-    pub fn observe(&mut self, now: Instant, speed_kmh: Option<f32>, steps: Option<u32>) -> Option<PresenceState> {
+    pub fn observe(
+        &mut self,
+        now: Instant,
+        speed_kmh: Option<f32>,
+        steps: Option<u32>,
+    ) -> Option<PresenceState> {
         let transition = self.presence.observe(now, speed_kmh, steps);
         if let Some(next) = transition
             && next != PresenceState::Walking
@@ -83,8 +88,20 @@ impl ActivityAccumulator {
     /// [`credit_or_hold`]). `now` is the sample's real timestamp — `Utc::now()`
     /// live, or the `ts_ms`-derived instant on replay — so segment start/end
     /// and the local-date attribution match the live daemon exactly.
-    pub fn credit(&mut self, store: &mut Store, now: DateTime<Utc>, deltas: RawDeltas) -> Result<()> {
-        credit_or_hold(store, &mut self.pending, &mut self.current_segment, self.presence.state(), now, deltas)
+    pub fn credit(
+        &mut self,
+        store: &mut Store,
+        now: DateTime<Utc>,
+        deltas: RawDeltas,
+    ) -> Result<()> {
+        credit_or_hold(
+            store,
+            &mut self.pending,
+            &mut self.current_segment,
+            self.presence.state(),
+            now,
+            deltas,
+        )
     }
 }
 
@@ -128,7 +145,13 @@ pub fn credit_or_hold(
             pending.distance_m += deltas.distance_m;
             pending.elapsed_s += deltas.elapsed_s;
             if deltas.steps > 0 {
-                let id = store.credit_activity(deltas.steps, pending.distance_m, pending.elapsed_s, now, *current_segment)?;
+                let id = store.credit_activity(
+                    deltas.steps,
+                    pending.distance_m,
+                    pending.elapsed_s,
+                    now,
+                    *current_segment,
+                )?;
                 *current_segment = Some(id);
                 *pending = PendingCredit::default();
             }
@@ -158,14 +181,39 @@ mod tests {
         let now = Utc::now();
 
         // Ambiguous gap: belt moved 3m/1s but no step registered yet.
-        credit_or_hold(&mut store, &mut pending, &mut segment, PresenceState::Walking, now, RawDeltas { steps: 0, distance_m: 3, elapsed_s: 1 })
-            .unwrap();
+        credit_or_hold(
+            &mut store,
+            &mut pending,
+            &mut segment,
+            PresenceState::Walking,
+            now,
+            RawDeltas {
+                steps: 0,
+                distance_m: 3,
+                elapsed_s: 1,
+            },
+        )
+        .unwrap();
         assert_eq!(pending.distance_m, 3);
-        assert!(segment.is_none(), "no segment opened until a step confirms walking");
+        assert!(
+            segment.is_none(),
+            "no segment opened until a step confirms walking"
+        );
 
         // A step now confirms the whole gap was real walking — flush it.
-        credit_or_hold(&mut store, &mut pending, &mut segment, PresenceState::Walking, now, RawDeltas { steps: 1, distance_m: 1, elapsed_s: 1 })
-            .unwrap();
+        credit_or_hold(
+            &mut store,
+            &mut pending,
+            &mut segment,
+            PresenceState::Walking,
+            now,
+            RawDeltas {
+                steps: 1,
+                distance_m: 1,
+                elapsed_s: 1,
+            },
+        )
+        .unwrap();
         assert_eq!(pending.distance_m, 0);
         assert!(segment.is_some(), "the confirming step opens the segment");
         let today = store.today_stats().unwrap();
@@ -184,13 +232,35 @@ mod tests {
         // The belt kept moving for the whole confirmation window before the
         // tracker flips to AwayWhileRunning — this must never reach daily_stats.
         for _ in 0..10 {
-            credit_or_hold(&mut store, &mut pending, &mut segment, PresenceState::Walking, now, RawDeltas { steps: 0, distance_m: 1, elapsed_s: 1 })
-                .unwrap();
+            credit_or_hold(
+                &mut store,
+                &mut pending,
+                &mut segment,
+                PresenceState::Walking,
+                now,
+                RawDeltas {
+                    steps: 0,
+                    distance_m: 1,
+                    elapsed_s: 1,
+                },
+            )
+            .unwrap();
         }
         assert_eq!(pending.distance_m, 10);
 
-        credit_or_hold(&mut store, &mut pending, &mut segment, PresenceState::AwayWhileRunning, now, RawDeltas { steps: 0, distance_m: 1, elapsed_s: 1 })
-            .unwrap();
+        credit_or_hold(
+            &mut store,
+            &mut pending,
+            &mut segment,
+            PresenceState::AwayWhileRunning,
+            now,
+            RawDeltas {
+                steps: 0,
+                distance_m: 1,
+                elapsed_s: 1,
+            },
+        )
+        .unwrap();
 
         assert_eq!(pending.distance_m, 0);
         let today = store.today_stats().unwrap();

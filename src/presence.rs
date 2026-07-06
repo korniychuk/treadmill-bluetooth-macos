@@ -34,7 +34,11 @@ pub struct PresenceTracker {
 
 impl PresenceTracker {
     pub fn new() -> Self {
-        Self { state: PresenceState::Unknown, last_steps: None, last_step_change: None }
+        Self {
+            state: PresenceState::Unknown,
+            last_steps: None,
+            last_step_change: None,
+        }
     }
 
     /// Feed one telemetry sample; returns `Some(new_state)` only on a
@@ -46,7 +50,12 @@ impl PresenceTracker {
     /// (which passes an instant synthesized from a sample's `ts_ms`). This is
     /// the single source of truth for the 10s away detection — see
     /// `docs/tasks/015`.
-    pub fn observe(&mut self, now: Instant, speed_kmh: Option<f32>, steps: Option<u32>) -> Option<PresenceState> {
+    pub fn observe(
+        &mut self,
+        now: Instant,
+        speed_kmh: Option<f32>,
+        steps: Option<u32>,
+    ) -> Option<PresenceState> {
         if let Some(steps) = steps
             && self.last_steps != Some(steps)
         {

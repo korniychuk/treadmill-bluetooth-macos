@@ -56,7 +56,9 @@ impl ControlCommand {
                 let kmh = other
                     .strip_prefix("speed:")
                     .with_context(|| format!("unknown control command wire form: {other:?}"))?;
-                let kmh: f32 = kmh.parse().with_context(|| format!("unparseable speed in {other:?}"))?;
+                let kmh: f32 = kmh
+                    .parse()
+                    .with_context(|| format!("unparseable speed in {other:?}"))?;
                 Ok(Self::Speed(kmh))
             }
         }
@@ -66,7 +68,8 @@ impl ControlCommand {
 /// Whether a command queued at `created_at` is too old to execute at `now`.
 /// Pure so the daemon's staleness guard is unit-testable without a clock.
 pub fn is_stale(created_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-    now.signed_duration_since(created_at) > chrono::Duration::from_std(CONTROL_STALE_THRESHOLD).expect("30s fits chrono")
+    now.signed_duration_since(created_at)
+        > chrono::Duration::from_std(CONTROL_STALE_THRESHOLD).expect("30s fits chrono")
 }
 
 #[cfg(test)]
@@ -77,7 +80,11 @@ mod tests {
 
     #[test]
     fn wire_round_trips_every_variant() {
-        for cmd in [ControlCommand::Start, ControlCommand::Stop, ControlCommand::Speed(2.5)] {
+        for cmd in [
+            ControlCommand::Start,
+            ControlCommand::Stop,
+            ControlCommand::Speed(2.5),
+        ] {
             let parsed = ControlCommand::parse(&cmd.to_wire()).expect("round-trips");
             assert_eq!(parsed, cmd);
         }

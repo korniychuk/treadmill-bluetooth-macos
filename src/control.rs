@@ -54,7 +54,10 @@ impl<'a> Controller<'a> {
             .await
             .context("subscribe to Control Point indications")?;
 
-        let controller = Self { peripheral, control_point };
+        let controller = Self {
+            peripheral,
+            control_point,
+        };
         controller.execute(opcode::REQUEST_CONTROL, &[]).await?;
         info!("control granted by fitness machine");
         Ok(controller)
@@ -77,7 +80,8 @@ impl<'a> Controller<'a> {
         }
         // FTMS encodes speed as uint16 in units of 0.01 km/h, little-endian.
         let raw = (kmh * 100.0).round() as u16;
-        self.execute(opcode::SET_TARGET_SPEED, &raw.to_le_bytes()).await
+        self.execute(opcode::SET_TARGET_SPEED, &raw.to_le_bytes())
+            .await
     }
 
     /// Set target inclination in percent (FTMS sint16, 0.1 % units).
@@ -90,7 +94,8 @@ impl<'a> Controller<'a> {
             bail!("incline {percent}% out of sane range");
         }
         let raw = (percent * 10.0).round() as i16;
-        self.execute(opcode::SET_TARGET_INCLINATION, &raw.to_le_bytes()).await
+        self.execute(opcode::SET_TARGET_INCLINATION, &raw.to_le_bytes())
+            .await
     }
 
     /// Write `[op, params...]` and wait for the `[0x80, op, result]` indication.
@@ -121,7 +126,9 @@ impl<'a> Controller<'a> {
             None
         })
         .await
-        .with_context(|| format!("no Control Point response to {op:#04x} within {RESPONSE_TIMEOUT:?}"))?
+        .with_context(|| {
+            format!("no Control Point response to {op:#04x} within {RESPONSE_TIMEOUT:?}")
+        })?
         .with_context(|| format!("indication stream ended awaiting response to {op:#04x}"))?;
 
         match response.get(2) {

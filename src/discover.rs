@@ -29,13 +29,21 @@ pub async fn dump_gatt(peripheral: &Peripheral) -> Result<()> {
 
     let mut json = String::from("{\n");
     let _ = writeln!(json, "  \"device_name\": {:?},", name);
-    let _ = writeln!(json, "  \"peripheral_id\": {:?},", peripheral.id().to_string());
+    let _ = writeln!(
+        json,
+        "  \"peripheral_id\": {:?},",
+        peripheral.id().to_string()
+    );
     json.push_str("  \"services\": [\n");
 
     let services = peripheral.services();
     for (si, service) in services.iter().enumerate() {
         info!(service = %service.uuid, primary = service.primary, "service");
-        let _ = writeln!(json, "    {{\n      \"uuid\": {:?},", service.uuid.to_string());
+        let _ = writeln!(
+            json,
+            "    {{\n      \"uuid\": {:?},",
+            service.uuid.to_string()
+        );
         let _ = writeln!(json, "      \"primary\": {},", service.primary);
         json.push_str("      \"characteristics\": [\n");
 
@@ -56,7 +64,11 @@ pub async fn dump_gatt(peripheral: &Peripheral) -> Result<()> {
             let hex = value.as_deref().map(to_hex);
             info!(char = %ch.uuid, props = %props_str, value = hex.as_deref().unwrap_or("-"), "characteristic");
 
-            let _ = writeln!(json, "        {{\n          \"uuid\": {:?},", ch.uuid.to_string());
+            let _ = writeln!(
+                json,
+                "        {{\n          \"uuid\": {:?},",
+                ch.uuid.to_string()
+            );
             let _ = writeln!(json, "          \"properties\": {:?},", props_str);
             match &hex {
                 Some(h) => {
@@ -72,7 +84,11 @@ pub async fn dump_gatt(peripheral: &Peripheral) -> Result<()> {
                 .collect();
             json.push_str(&descs.join(", "));
             json.push_str("]\n        }");
-            json.push_str(if ci + 1 < service.characteristics.len() { ",\n" } else { "\n" });
+            json.push_str(if ci + 1 < service.characteristics.len() {
+                ",\n"
+            } else {
+                "\n"
+            });
         }
 
         json.push_str("      ]\n    }");
@@ -107,5 +123,9 @@ fn format_props(flags: CharPropFlags) -> String {
 }
 
 fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+    bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }

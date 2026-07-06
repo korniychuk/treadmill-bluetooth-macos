@@ -165,7 +165,8 @@ impl Store {
         // A short-lived reader (e.g. the 2s `widget` poll) can open the DB while
         // the daemon is mid-write; wait out the write lock instead of erroring
         // with SQLITE_BUSY.
-        conn.busy_timeout(std::time::Duration::from_secs(3)).context("set busy_timeout")?;
+        conn.busy_timeout(std::time::Duration::from_secs(3))
+            .context("set busy_timeout")?;
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -259,7 +260,10 @@ impl Store {
     pub fn start_session(&self) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
         self.conn
-            .execute("INSERT INTO sessions (started_at, ended_at) VALUES (?1, NULL)", params![now])
+            .execute(
+                "INSERT INTO sessions (started_at, ended_at) VALUES (?1, NULL)",
+                params![now],
+            )
             .context("insert session")?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -290,7 +294,10 @@ impl Store {
         raw_distance_m: Option<u32>,
         raw_elapsed_s: Option<u16>,
     ) -> Result<RawDeltas> {
-        let tx = self.conn.transaction().context("begin baseline transaction")?;
+        let tx = self
+            .conn
+            .transaction()
+            .context("begin baseline transaction")?;
 
         let (last_steps, last_distance, last_elapsed): (Option<i64>, Option<i64>, Option<i64>) = tx
             .query_row(
@@ -303,9 +310,15 @@ impl Store {
             .unwrap_or((None, None, None));
 
         let deltas = RawDeltas {
-            steps: raw_steps.map(|v| delta_since(v as i64, last_steps)).unwrap_or(0),
-            distance_m: raw_distance_m.map(|v| delta_since(v as i64, last_distance)).unwrap_or(0),
-            elapsed_s: raw_elapsed_s.map(|v| delta_since(v as i64, last_elapsed)).unwrap_or(0),
+            steps: raw_steps
+                .map(|v| delta_since(v as i64, last_steps))
+                .unwrap_or(0),
+            distance_m: raw_distance_m
+                .map(|v| delta_since(v as i64, last_distance))
+                .unwrap_or(0),
+            elapsed_s: raw_elapsed_s
+                .map(|v| delta_since(v as i64, last_elapsed))
+                .unwrap_or(0),
         };
 
         tx.execute(
@@ -358,7 +371,10 @@ impl Store {
         open_segment: Option<i64>,
     ) -> Result<i64> {
         let today = now.with_timezone(&Local).format("%Y-%m-%d").to_string();
-        let tx = self.conn.transaction().context("begin credit_activity transaction")?;
+        let tx = self
+            .conn
+            .transaction()
+            .context("begin credit_activity transaction")?;
 
         tx.execute(
             "INSERT INTO daily_stats (date, distance_m, steps, walking_time_s)
@@ -389,7 +405,10 @@ impl Store {
                     )
                     .context("extend activity segment")?;
                 if rows == 0 {
-                    tracing::warn!(id, "open segment id not found — opening a new segment instead");
+                    tracing::warn!(
+                        id,
+                        "open segment id not found — opening a new segment instead"
+                    );
                     None
                 } else {
                     Some(id)
@@ -424,7 +443,13 @@ impl Store {
     /// keeps the exact bytes alongside the decode, so a future protocol
     /// discovery (e.g. this device starting to set a flag bit we don't parse
     /// yet) can be recovered from history instead of lost.
-    pub fn insert_raw_sample(&self, session_id: i64, ts_ms: i64, sample: &TreadmillData, raw_frame: &[u8]) -> Result<()> {
+    pub fn insert_raw_sample(
+        &self,
+        session_id: i64,
+        ts_ms: i64,
+        sample: &TreadmillData,
+        raw_frame: &[u8],
+    ) -> Result<()> {
         self.conn
             .execute(
                 "INSERT INTO raw_samples
@@ -451,7 +476,13 @@ impl Store {
     /// `event_code` is the raw FTMS op code (first byte); its human-readable
     /// meaning lives in `ftms::describe_status_event` (code, not a DB column)
     /// so the mapping has one source of truth instead of drifting copies.
-    pub fn insert_status_event(&self, session_id: i64, ts_ms: i64, event_code: u8, raw_frame: &[u8]) -> Result<()> {
+    pub fn insert_status_event(
+        &self,
+        session_id: i64,
+        ts_ms: i64,
+        event_code: u8,
+        raw_frame: &[u8],
+    ) -> Result<()> {
         self.conn
             .execute(
                 "INSERT INTO status_events (session_id, ts_ms, event_code, raw_frame) VALUES (?1, ?2, ?3, ?4)",
@@ -464,7 +495,12 @@ impl Store {
     /// Totals for today (local calendar date), zeroed if nothing recorded yet.
     pub fn today_stats(&self) -> Result<DailyStats> {
         let today = Local::now().format("%Y-%m-%d").to_string();
-        self.stats_for(&today).map(|opt| opt.unwrap_or(DailyStats { date: today, ..Default::default() }))
+        self.stats_for(&today).map(|opt| {
+            opt.unwrap_or(DailyStats {
+                date: today,
+                ..Default::default()
+            })
+        })
     }
 
     /// Totals for an arbitrary `YYYY-MM-DD` date, or `None` if nothing recorded.
@@ -502,7 +538,8 @@ impl Store {
                 })
             })
             .context("run all_stats query")?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().context("collect all_stats rows")
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect all_stats rows")
     }
 
     /// All recorded activity segments, oldest first (by `started_at`). The
@@ -518,8 +555,11 @@ impl Store {
                  FROM activity_segments ORDER BY started_at ASC, id ASC",
             )
             .context("prepare all_segments query")?;
-        let rows = stmt.query_map([], segment_from_row).context("run all_segments query")?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().context("collect all_segments rows")
+        let rows = stmt
+            .query_map([], segment_from_row)
+            .context("run all_segments query")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect all_segments rows")
     }
 
     /// Workouts whose start day is the given `YYYY-MM-DD`, oldest first, derived
@@ -553,8 +593,12 @@ impl Store {
     /// cumulative counter resets to zero. Returns `None` when the window holds
     /// no usable samples, so the caller can omit the hint rather than show 0.
     pub fn raw_distance_m(&self, started_at: &str, ended_at: &str) -> Result<Option<i64>> {
-        let start_ms = DateTime::parse_from_rfc3339(started_at).context("parse workout started_at")?.timestamp_millis();
-        let end_ms = DateTime::parse_from_rfc3339(ended_at).context("parse workout ended_at")?.timestamp_millis();
+        let start_ms = DateTime::parse_from_rfc3339(started_at)
+            .context("parse workout started_at")?
+            .timestamp_millis();
+        let end_ms = DateTime::parse_from_rfc3339(ended_at)
+            .context("parse workout ended_at")?
+            .timestamp_millis();
         let raw: Option<i64> = self
             .conn
             .query_row(
@@ -576,8 +620,12 @@ impl Store {
     /// the stored centi-km/h wire scale. Ordered by time, though the estimate is
     /// order-independent.
     pub fn walking_speeds_in_window(&self, started_at: &str, ended_at: &str) -> Result<Vec<f32>> {
-        let start_ms = DateTime::parse_from_rfc3339(started_at).context("parse window started_at")?.timestamp_millis();
-        let end_ms = DateTime::parse_from_rfc3339(ended_at).context("parse window ended_at")?.timestamp_millis();
+        let start_ms = DateTime::parse_from_rfc3339(started_at)
+            .context("parse window started_at")?
+            .timestamp_millis();
+        let end_ms = DateTime::parse_from_rfc3339(ended_at)
+            .context("parse window ended_at")?
+            .timestamp_millis();
         let mut stmt = self
             .conn
             .prepare(
@@ -592,7 +640,8 @@ impl Store {
                 Ok(centi as f32 / 100.0)
             })
             .context("run walking_speeds_in_window query")?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().context("collect walking_speeds_in_window rows")
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect walking_speeds_in_window rows")
     }
 
     /// All `raw_samples` rows in true processing order (`ts_ms`, then `id` as a
@@ -629,7 +678,8 @@ impl Store {
                 })
             })
             .context("run raw_samples_ordered query")?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().context("collect raw_samples_ordered rows")
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect raw_samples_ordered rows")
     }
 
     /// Atomically replace the entire `activity_segments` table with `segments`
@@ -639,8 +689,12 @@ impl Store {
     /// (the replay produces identical ids/columns each run). Touches nothing
     /// else — `daily_stats`, `raw_samples`, and `workouts` are out of scope.
     pub fn replace_activity_segments(&mut self, segments: &[Segment]) -> Result<()> {
-        let tx = self.conn.transaction().context("begin replace_activity_segments transaction")?;
-        tx.execute("DELETE FROM activity_segments", []).context("clear activity_segments")?;
+        let tx = self
+            .conn
+            .transaction()
+            .context("begin replace_activity_segments transaction")?;
+        tx.execute("DELETE FROM activity_segments", [])
+            .context("clear activity_segments")?;
         {
             let mut stmt = tx
                 .prepare(
@@ -661,7 +715,8 @@ impl Store {
                 .context("insert rebuilt activity segment")?;
             }
         }
-        tx.commit().context("commit replace_activity_segments transaction")?;
+        tx.commit()
+            .context("commit replace_activity_segments transaction")?;
         Ok(())
     }
 
@@ -730,8 +785,11 @@ impl Store {
             .conn
             .prepare("SELECT threshold FROM goal_celebrations WHERE date = ?1")
             .context("prepare celebrated_thresholds query")?;
-        let rows = stmt.query_map(params![date], |row| row.get(0)).context("run celebrated_thresholds query")?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().context("collect celebrated_thresholds rows")
+        let rows = stmt
+            .query_map(params![date], |row| row.get(0))
+            .context("run celebrated_thresholds query")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect celebrated_thresholds rows")
     }
 
     /// Mark a goal threshold celebrated for `date`. `INSERT OR IGNORE` keeps
@@ -771,7 +829,10 @@ impl Store {
     fn prune_control_commands(&self) -> Result<()> {
         let cutoff = (Utc::now() - CONTROL_COMMAND_RETENTION).to_rfc3339();
         self.conn
-            .execute("DELETE FROM control_commands WHERE created_at < ?1", params![cutoff])
+            .execute(
+                "DELETE FROM control_commands WHERE created_at < ?1",
+                params![cutoff],
+            )
             .context("prune old control commands")?;
         Ok(())
     }
@@ -799,9 +860,17 @@ impl Store {
             let parsed = DateTime::parse_from_rfc3339(&created_at_s)
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(anyhow::Error::from)
-                .and_then(|created_at| ControlCommand::parse(&command_s).map(|command| (created_at, command)));
+                .and_then(|created_at| {
+                    ControlCommand::parse(&command_s).map(|command| (created_at, command))
+                });
             match parsed {
-                Ok((created_at, command)) => return Ok(Some(QueuedControlCommand { id, created_at, command })),
+                Ok((created_at, command)) => {
+                    return Ok(Some(QueuedControlCommand {
+                        id,
+                        created_at,
+                        command,
+                    }));
+                }
                 Err(err) => {
                     tracing::warn!(%err, id, command = %command_s, "unparseable control command row — failing and skipping");
                     self.mark_control_command_failed(id, &format!("unparseable: {err}"))?;
@@ -954,7 +1023,8 @@ fn delta_since(new: i64, last: Option<i64>) -> i64 {
 
 fn db_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("$HOME not set")?;
-    Ok(PathBuf::from(home).join("Library/Application Support/treadmill-bluetooth-macos/treadmill.db"))
+    Ok(PathBuf::from(home)
+        .join("Library/Application Support/treadmill-bluetooth-macos/treadmill.db"))
 }
 
 #[cfg(test)]
@@ -996,7 +1066,14 @@ mod tests {
     }
 
     /// Credit one walking burst, threading the daemon's open-segment id.
-    fn credit(store: &mut Store, steps: i64, dist: i64, time: i64, now: DateTime<Utc>, open: Option<i64>) -> i64 {
+    fn credit(
+        store: &mut Store,
+        steps: i64,
+        dist: i64,
+        time: i64,
+        now: DateTime<Utc>,
+        open: Option<i64>,
+    ) -> i64 {
         store.credit_activity(steps, dist, time, now, open).unwrap()
     }
 
@@ -1046,7 +1123,11 @@ mod tests {
         let id2 = credit(&mut store, 5, 10, 30, t1, None);
 
         assert_ne!(id, id2);
-        assert_eq!(store.all_segments_asc().unwrap().len(), 2, "close-and-new yields two segments");
+        assert_eq!(
+            store.all_segments_asc().unwrap().len(),
+            2,
+            "close-and-new yields two segments"
+        );
     }
 
     #[test]
@@ -1062,7 +1143,11 @@ mod tests {
         assert_ne!(id2, 999_999);
         let segs = store.all_segments_asc().unwrap();
         assert_eq!(segs.len(), 2);
-        assert_eq!(segs.iter().map(|s| s.steps).sum::<i64>(), 12, "both credits landed");
+        assert_eq!(
+            segs.iter().map(|s| s.steps).sum::<i64>(),
+            12,
+            "both credits landed"
+        );
     }
 
     #[test]
@@ -1097,13 +1182,22 @@ mod tests {
         let day5 = store.workouts_for("2026-07-05", 15).unwrap();
         assert_eq!(day5.len(), 1);
         assert_eq!(day5[0].steps, 30);
-        assert!(store.workouts_for("2026-07-06", 15).unwrap().is_empty(), "attributed to start day, not end day");
+        assert!(
+            store.workouts_for("2026-07-06", 15).unwrap().is_empty(),
+            "attributed to start day, not end day"
+        );
 
         // daily_stats, in contrast, is genuinely split by calendar day.
-        let day1 = store.stats_for("2026-07-05").unwrap().expect("day1 stats present");
+        let day1 = store
+            .stats_for("2026-07-05")
+            .unwrap()
+            .expect("day1 stats present");
         assert_eq!(day1.steps, 10);
         assert_eq!(day1.distance_m, 20);
-        let day2 = store.stats_for("2026-07-06").unwrap().expect("day2 stats present");
+        let day2 = store
+            .stats_for("2026-07-06")
+            .unwrap()
+            .expect("day2 stats present");
         assert_eq!(day2.steps, 20);
         assert_eq!(day2.distance_m, 40);
     }
@@ -1137,7 +1231,10 @@ mod tests {
         let a_end = a_start + Duration::minutes(5);
         let b_start = a_end + Duration::minutes(20); // 20 min gap > 15
         let b_end = b_start + Duration::minutes(5);
-        let workouts = merge_segments(&[seg(1, a_start, a_end, 100), seg(2, b_start, b_end, 200)], 15);
+        let workouts = merge_segments(
+            &[seg(1, a_start, a_end, 100), seg(2, b_start, b_end, 200)],
+            15,
+        );
         assert_eq!(workouts.len(), 2);
         assert_eq!(workouts[0].id, 1);
         assert_eq!(workouts[1].id, 2);
@@ -1151,7 +1248,13 @@ mod tests {
         let at_threshold = a_end + Duration::minutes(15);
         let over = a_end + Duration::minutes(15) + Duration::seconds(1);
 
-        let merged = merge_segments(&[seg(1, a_start, a_end, 1), seg(2, at_threshold, at_threshold, 1)], 15);
+        let merged = merge_segments(
+            &[
+                seg(1, a_start, a_end, 1),
+                seg(2, at_threshold, at_threshold, 1),
+            ],
+            15,
+        );
         assert_eq!(merged.len(), 1, "gap == threshold continues the workout");
 
         let split = merge_segments(&[seg(1, a_start, a_end, 1), seg(2, over, over, 1)], 15);
@@ -1164,11 +1267,29 @@ mod tests {
         let s0 = Utc.with_ymd_and_hms(2026, 7, 5, 10, 0, 0).unwrap();
         let segs = [
             seg(1, s0, s0 + Duration::minutes(1), 10),
-            seg(2, s0 + Duration::minutes(11), s0 + Duration::minutes(12), 10),
-            seg(3, s0 + Duration::minutes(22), s0 + Duration::minutes(23), 10),
+            seg(
+                2,
+                s0 + Duration::minutes(11),
+                s0 + Duration::minutes(12),
+                10,
+            ),
+            seg(
+                3,
+                s0 + Duration::minutes(22),
+                s0 + Duration::minutes(23),
+                10,
+            ),
         ];
-        assert_eq!(merge_segments(&segs, 5).len(), 3, "tight gap → three separate workouts");
-        assert_eq!(merge_segments(&segs, 15).len(), 1, "loose gap → one merged workout");
+        assert_eq!(
+            merge_segments(&segs, 5).len(),
+            3,
+            "tight gap → three separate workouts"
+        );
+        assert_eq!(
+            merge_segments(&segs, 15).len(),
+            1,
+            "loose gap → one merged workout"
+        );
     }
 
     #[test]
@@ -1179,8 +1300,15 @@ mod tests {
         let e2 = Utc.with_ymd_and_hms(2026, 7, 6, 0, 5, 0).unwrap();
 
         let workouts = merge_segments(&[seg(1, s1, e1, 10), seg(2, s2, e2, 20)], 15);
-        assert_eq!(workouts.len(), 1, "cross-midnight, gap under threshold, merges");
-        assert_eq!(workouts[0].date, "2026-07-05", "attributed to the start day");
+        assert_eq!(
+            workouts.len(),
+            1,
+            "cross-midnight, gap under threshold, merges"
+        );
+        assert_eq!(
+            workouts[0].date, "2026-07-05",
+            "attributed to the start day"
+        );
         assert_eq!(workouts[0].steps, 30);
         assert_eq!(workouts[0].ended_at, e2.to_rfc3339());
     }
@@ -1206,7 +1334,10 @@ mod tests {
         assert_eq!(read_back.presence_state.as_deref(), Some("Walking"));
 
         // Second upsert overwrites in place — still exactly one row (id=0).
-        let status2 = DaemonStatus { connected: false, ..status };
+        let status2 = DaemonStatus {
+            connected: false,
+            ..status
+        };
         store.upsert_daemon_status(&status2).unwrap();
         let read_back2 = store.daemon_status().unwrap().expect("status row present");
         assert!(!read_back2.connected);
@@ -1215,7 +1346,12 @@ mod tests {
     #[test]
     fn goal_celebrations_are_idempotent_and_scoped_to_date() {
         let store = memory_store();
-        assert!(store.celebrated_thresholds("2026-07-05").unwrap().is_empty());
+        assert!(
+            store
+                .celebrated_thresholds("2026-07-05")
+                .unwrap()
+                .is_empty()
+        );
 
         store.mark_goal_celebrated("2026-07-05", 8000).unwrap();
         store.mark_goal_celebrated("2026-07-05", 10000).unwrap();
@@ -1227,34 +1363,54 @@ mod tests {
         assert_eq!(today, vec![8000, 10000]);
 
         // A different day starts fresh.
-        assert!(store.celebrated_thresholds("2026-07-06").unwrap().is_empty());
+        assert!(
+            store
+                .celebrated_thresholds("2026-07-06")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn control_command_enqueue_pending_then_done() {
         // arr
         let store = memory_store();
-        let id = store.enqueue_control_command(&ControlCommand::Speed(2.5)).unwrap();
+        let id = store
+            .enqueue_control_command(&ControlCommand::Speed(2.5))
+            .unwrap();
 
         // act — the freshly enqueued command is the oldest pending one.
-        let pending = store.next_pending_control_command().unwrap().expect("one pending");
+        let pending = store
+            .next_pending_control_command()
+            .unwrap()
+            .expect("one pending");
 
         // assert — round-tripped through the wire form, then transitions to done.
         assert_eq!(pending.id, id);
         assert_eq!(pending.command, ControlCommand::Speed(2.5));
-        assert_eq!(store.control_command_outcome(id).unwrap().unwrap().0, "pending");
+        assert_eq!(
+            store.control_command_outcome(id).unwrap().unwrap().0,
+            "pending"
+        );
         store.mark_control_command_done(id).unwrap();
         let (status, error) = store.control_command_outcome(id).unwrap().unwrap();
         assert_eq!(status, "done");
         assert_eq!(error, None);
-        assert!(store.next_pending_control_command().unwrap().is_none(), "no longer pending");
+        assert!(
+            store.next_pending_control_command().unwrap().is_none(),
+            "no longer pending"
+        );
     }
 
     #[test]
     fn control_command_mark_failed_records_error() {
         let store = memory_store();
-        let id = store.enqueue_control_command(&ControlCommand::Start).unwrap();
-        store.mark_control_command_failed(id, "stale, not executed").unwrap();
+        let id = store
+            .enqueue_control_command(&ControlCommand::Start)
+            .unwrap();
+        store
+            .mark_control_command_failed(id, "stale, not executed")
+            .unwrap();
         let (status, error) = store.control_command_outcome(id).unwrap().unwrap();
         assert_eq!(status, "failed");
         assert_eq!(error.as_deref(), Some("stale, not executed"));
@@ -1263,13 +1419,27 @@ mod tests {
     #[test]
     fn next_pending_control_command_returns_oldest_first() {
         let store = memory_store();
-        let first = store.enqueue_control_command(&ControlCommand::Start).unwrap();
-        let _second = store.enqueue_control_command(&ControlCommand::Stop).unwrap();
+        let first = store
+            .enqueue_control_command(&ControlCommand::Start)
+            .unwrap();
+        let _second = store
+            .enqueue_control_command(&ControlCommand::Stop)
+            .unwrap();
 
         // Oldest (lowest id) comes first; failing it surfaces the next.
-        assert_eq!(store.next_pending_control_command().unwrap().unwrap().id, first);
+        assert_eq!(
+            store.next_pending_control_command().unwrap().unwrap().id,
+            first
+        );
         store.mark_control_command_done(first).unwrap();
-        assert_eq!(store.next_pending_control_command().unwrap().unwrap().command, ControlCommand::Stop);
+        assert_eq!(
+            store
+                .next_pending_control_command()
+                .unwrap()
+                .unwrap()
+                .command,
+            ControlCommand::Stop
+        );
     }
 
     #[test]
@@ -1280,13 +1450,22 @@ mod tests {
             .conn
             .execute(
                 "INSERT INTO control_commands (created_at, command, status) VALUES (?1, ?2, ?3)",
-                params![Utc::now().to_rfc3339(), "speed:not-a-number", CONTROL_STATUS_PENDING],
+                params![
+                    Utc::now().to_rfc3339(),
+                    "speed:not-a-number",
+                    CONTROL_STATUS_PENDING
+                ],
             )
             .unwrap();
-        let good = store.enqueue_control_command(&ControlCommand::Stop).unwrap();
+        let good = store
+            .enqueue_control_command(&ControlCommand::Stop)
+            .unwrap();
 
         // act / assert — the poison row is failed and skipped, the good one surfaces.
-        let pending = store.next_pending_control_command().unwrap().expect("good command surfaces");
+        let pending = store
+            .next_pending_control_command()
+            .unwrap()
+            .expect("good command surfaces");
         assert_eq!(pending.id, good);
     }
 
@@ -1304,10 +1483,15 @@ mod tests {
             .unwrap();
 
         // act
-        store.enqueue_control_command(&ControlCommand::Start).unwrap();
+        store
+            .enqueue_control_command(&ControlCommand::Start)
+            .unwrap();
 
         // assert — only the fresh row survives; the queue stays bounded.
-        let count: i64 = store.conn.query_row("SELECT COUNT(*) FROM control_commands", [], |r| r.get(0)).unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM control_commands", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 1);
     }
 }

@@ -104,7 +104,11 @@ fn read_thresholds(path: &std::path::Path) -> Option<Vec<i64>> {
     let raw = std::fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let goals = value.get("goals")?.as_array()?;
-    let thresholds: Vec<i64> = goals.iter().filter_map(|v| v.as_i64()).filter(|&t| t > 0).collect();
+    let thresholds: Vec<i64> = goals
+        .iter()
+        .filter_map(|v| v.as_i64())
+        .filter(|&t| t > 0)
+        .collect();
     (!thresholds.is_empty()).then_some(thresholds)
 }
 
@@ -177,24 +181,37 @@ pub fn assign_tiers(thresholds: &[i64]) -> Vec<Goal> {
     sorted.sort_unstable();
     sorted.dedup();
     if sorted.len() > MAX_GOALS {
-        warn!(count = sorted.len(), max = MAX_GOALS, "more goals than tiers — keeping the lowest three");
+        warn!(
+            count = sorted.len(),
+            max = MAX_GOALS,
+            "more goals than tiers — keeping the lowest three"
+        );
         sorted.truncate(MAX_GOALS);
     }
     sorted
         .into_iter()
         .enumerate()
-        .map(|(rank, threshold)| Goal { threshold, tier: (rank + 1) as u8 })
+        .map(|(rank, threshold)| Goal {
+            threshold,
+            tier: (rank + 1) as u8,
+        })
         .collect()
 }
 
 /// Pure crossing decision: the goals whose threshold today's steps have now
 /// reached and that have not yet been celebrated today. Returned ascending by
 /// threshold, so a caller firing them in order lands the biggest goal last.
-pub fn thresholds_to_celebrate(today_steps: i64, goals: &[Goal], already_celebrated: &HashSet<i64>) -> Vec<Goal> {
+pub fn thresholds_to_celebrate(
+    today_steps: i64,
+    goals: &[Goal],
+    already_celebrated: &HashSet<i64>,
+) -> Vec<Goal> {
     let mut due: Vec<Goal> = goals
         .iter()
         .copied()
-        .filter(|goal| today_steps >= goal.threshold && !already_celebrated.contains(&goal.threshold))
+        .filter(|goal| {
+            today_steps >= goal.threshold && !already_celebrated.contains(&goal.threshold)
+        })
         .collect();
     due.sort_unstable_by_key(|goal| goal.threshold);
     due
@@ -213,20 +230,56 @@ mod tests {
         // Unsorted input with a duplicate and a fourth goal.
         let goals = assign_tiers(&[12000, 8000, 10000, 8000, 15000]);
         assert_eq!(goals.len(), 3, "capped at three, deduped");
-        assert_eq!(goals[0], Goal { threshold: 8000, tier: 1 });
-        assert_eq!(goals[1], Goal { threshold: 10000, tier: 2 });
-        assert_eq!(goals[2], Goal { threshold: 12000, tier: 3 });
+        assert_eq!(
+            goals[0],
+            Goal {
+                threshold: 8000,
+                tier: 1
+            }
+        );
+        assert_eq!(
+            goals[1],
+            Goal {
+                threshold: 10000,
+                tier: 2
+            }
+        );
+        assert_eq!(
+            goals[2],
+            Goal {
+                threshold: 12000,
+                tier: 3
+            }
+        );
     }
 
     #[test]
     fn assign_tiers_single_goal_is_tier_one() {
-        assert_eq!(assign_tiers(&[8000]), vec![Goal { threshold: 8000, tier: 1 }]);
+        assert_eq!(
+            assign_tiers(&[8000]),
+            vec![Goal {
+                threshold: 8000,
+                tier: 1
+            }]
+        );
     }
 
     #[test]
     fn assign_tiers_two_goals_are_tiers_one_and_two() {
         let goals = assign_tiers(&[10000, 8000]);
-        assert_eq!(goals, vec![Goal { threshold: 8000, tier: 1 }, Goal { threshold: 10000, tier: 2 }]);
+        assert_eq!(
+            goals,
+            vec![
+                Goal {
+                    threshold: 8000,
+                    tier: 1
+                },
+                Goal {
+                    threshold: 10000,
+                    tier: 2
+                }
+            ]
+        );
     }
 
     #[test]
@@ -236,7 +289,13 @@ mod tests {
         // act
         let due = thresholds_to_celebrate(8000, &goals, &celebrated(&[]));
         // assert
-        assert_eq!(due, vec![Goal { threshold: 8000, tier: 1 }]);
+        assert_eq!(
+            due,
+            vec![Goal {
+                threshold: 8000,
+                tier: 1
+            }]
+        );
     }
 
     #[test]
@@ -252,7 +311,19 @@ mod tests {
         // act
         let due = thresholds_to_celebrate(11000, &goals, &celebrated(&[]));
         // assert — both due, biggest last.
-        assert_eq!(due, vec![Goal { threshold: 8000, tier: 1 }, Goal { threshold: 10000, tier: 2 }]);
+        assert_eq!(
+            due,
+            vec![
+                Goal {
+                    threshold: 8000,
+                    tier: 1
+                },
+                Goal {
+                    threshold: 10000,
+                    tier: 2
+                }
+            ]
+        );
     }
 
     #[test]
@@ -269,7 +340,13 @@ mod tests {
     fn restart_still_fires_the_not_yet_reached_goal() {
         let goals = assign_tiers(&[8000, 10000, 12000]);
         let due = thresholds_to_celebrate(12100, &goals, &celebrated(&[8000, 10000]));
-        assert_eq!(due, vec![Goal { threshold: 12000, tier: 3 }]);
+        assert_eq!(
+            due,
+            vec![Goal {
+                threshold: 12000,
+                tier: 3
+            }]
+        );
     }
 
     #[test]
@@ -293,7 +370,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let bad = dir.join("bad.json");
         std::fs::write(&bad, "not json at all").unwrap();
-        assert_eq!(read_thresholds(&bad), None, "malformed JSON → None (caller uses defaults)");
+        assert_eq!(
+            read_thresholds(&bad),
+            None,
+            "malformed JSON → None (caller uses defaults)"
+        );
 
         let empty = dir.join("empty.json");
         std::fs::write(&empty, r#"{ "goals": [] }"#).unwrap();
@@ -347,6 +428,12 @@ mod tests {
         // only celebrates the configured 10k (8k already done).
         let goals = assign_tiers(&[8000, 10000]);
         let due = thresholds_to_celebrate(12100, &goals, &celebrated(&[8000]));
-        assert_eq!(due, vec![Goal { threshold: 10000, tier: 2 }]);
+        assert_eq!(
+            due,
+            vec![Goal {
+                threshold: 10000,
+                tier: 2
+            }]
+        );
     }
 }

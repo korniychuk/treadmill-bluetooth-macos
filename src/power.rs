@@ -56,6 +56,9 @@ const K_IO_MESSAGE_CAN_SYSTEM_SLEEP: u32 = 0xE000_0270;
 const K_IO_MESSAGE_SYSTEM_WILL_SLEEP: u32 = 0xE000_0280;
 /// `kIOMessageSystemWillPowerOn` — fires before the system is fully awake;
 /// we wait for `kIOMessageSystemHasPoweredOn` instead to report "did wake".
+/// Kept for documentation/completeness of the IOMessage set; intentionally
+/// unhandled.
+#[allow(dead_code)]
 const K_IO_MESSAGE_SYSTEM_WILL_POWER_ON: u32 = 0xE000_0320;
 /// `kIOMessageSystemHasPoweredOn` — system finished waking up.
 const K_IO_MESSAGE_SYSTEM_HAS_POWERED_ON: u32 = 0xE000_0300;
@@ -201,7 +204,10 @@ extern "C" fn system_power_callback(
     };
     info!(?event, "system power event");
     if ctx.tx.send(event).is_err() {
-        warn!(?event, "power-event receiver dropped; system power event lost");
+        warn!(
+            ?event,
+            "power-event receiver dropped; system power event lost"
+        );
     }
 }
 
@@ -281,8 +287,12 @@ pub fn spawn_power_event_listener() -> UnboundedReceiver<PowerEvent> {
 
 /// Callback signature for `IOServiceAddInterestNotification`-style system
 /// power notifications, matching `IOServiceInterestCallback` in `IOKitLib.h`.
-type IOServiceInterestCallback =
-    extern "C" fn(refcon: *mut c_void, service: u32, message_type: u32, message_argument: *mut c_void);
+type IOServiceInterestCallback = extern "C" fn(
+    refcon: *mut c_void,
+    service: u32,
+    message_type: u32,
+    message_argument: *mut c_void,
+);
 
 unsafe extern "C" {
     /// `<IOKit/pwr_mgt/IOPMLib.h>`. Registers for system-wide power

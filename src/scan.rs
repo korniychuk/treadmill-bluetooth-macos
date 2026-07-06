@@ -49,7 +49,10 @@ pub async fn scan_and_list(adapter: &Adapter) -> Result<()> {
         .start_scan(ScanFilter::default())
         .await
         .context("start BLE scan")?;
-    info!(timeout_s = SCAN_TIMEOUT.as_secs(), "scanning for BLE devices");
+    info!(
+        timeout_s = SCAN_TIMEOUT.as_secs(),
+        "scanning for BLE devices"
+    );
     sleep(SCAN_TIMEOUT).await;
 
     let peripherals = adapter.peripherals().await.context("list peripherals")?;
@@ -212,9 +215,14 @@ pub async fn subscribe_treadmill_data(peripheral: &Peripheral) -> Result<()> {
 /// characteristic exists — not every FTMS device implements it, so this is
 /// best-effort and returns `false` (not an error) when it's missing.
 pub async fn subscribe_treadmill_status(peripheral: &Peripheral) -> Result<bool> {
-    let Some(characteristic) = peripheral.characteristics().into_iter().find(|c| c.uuid == ftms::FITNESS_MACHINE_STATUS)
+    let Some(characteristic) = peripheral
+        .characteristics()
+        .into_iter()
+        .find(|c| c.uuid == ftms::FITNESS_MACHINE_STATUS)
     else {
-        warn!("Fitness Machine Status characteristic (0x2ADA) not present on this device — status events won't be logged");
+        warn!(
+            "Fitness Machine Status characteristic (0x2ADA) not present on this device — status events won't be logged"
+        );
         return Ok(false);
     };
 

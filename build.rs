@@ -14,7 +14,8 @@ fn main() {
         return;
     }
 
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
+    let manifest_dir =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
     let plist = format!("{manifest_dir}/macos/Info.plist");
 
     println!("cargo:rerun-if-changed={plist}");
