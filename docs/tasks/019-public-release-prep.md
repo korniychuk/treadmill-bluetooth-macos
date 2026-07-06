@@ -1,6 +1,24 @@
 # 019 — Подготовка репозитория к публикации (open-source)
 
-- **Status:** planning (ожидает согласования перед выполнением)
+- **Status:** prep executed (WS0–WS5 done) — ожидает review + публичного flip (WS6)
+
+## Execution log (2026-07-06)
+
+- ✅ **Секреты:** аудит файлов + всей истории git — чисто, чистка истории не нужна.
+- ✅ **Life OS:** прямой интеграции нет; политика зафиксирована в ADR 0002.
+- ✅ **WS0 гигиена:** `.claude/*.lock` в gitignore, lock анстейджен, `rust-version=1.95`.
+- ✅ **WS1 приватность:** `ReQuant` убран; dotfiles → нейтральное *AnKor Dotfiles*;
+  `YS_W2PRO_02395` и `IDENTITY 'AnKor'` оставлены (по решению).
+- ✅ **WS2 доки:** README переписан (+ Limitations), CONTRIBUTING, CHANGELOG.
+- ✅ **WS3 tmux:** скрипт + README в `scripts/tmux/`; `docs/tasks/009` обновлён.
+  ⏳ follow-up вне этого репо: перенаправить симлинк в *AnKor Dotfiles* на этот репо.
+- ✅ **WS4 CI/CD:** `.github/workflows/ci.yml` + `release.yml` (unsigned tar.gz);
+  плюс `scripts/install-prebuilt.sh` (установка без Rust). ⚠️ не smoke-тестирован.
+- ✅ **WS5 политика:** ADR 0002.
+- ✅ **Verify:** `cargo fmt --check` чист, `clippy -D warnings` чист, 76 тестов green.
+- ⏳ **WS6:** публичный flip + релиз `v0.1.0` — необратимо, отдельным подтверждением.
+- ℹ️ Коммит `b167572` (план) в истории всё ещё содержит литералы `ankor-dotfiles`/
+  `ReQuant` — не секрет; переписать нельзя без force-push в main (запрещён политикой).
 - **Owner:** Anton
 - **Депендси:** —
 - **Затрагивает:** README, `docs/`, `.gitignore`, `scripts/`, `.github/workflows/`,
