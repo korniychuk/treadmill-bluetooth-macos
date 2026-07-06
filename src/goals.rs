@@ -16,6 +16,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use tracing::{info, warn};
 
@@ -75,6 +76,16 @@ pub fn load_goals() -> Vec<Goal> {
         }
     };
     assign_tiers(&thresholds)
+}
+
+/// Last-modified time of the resolved config file, or `None` when it can't be
+/// stat'd (missing file, unreadable, or no `$HOME`). The daemon polls this to
+/// reload goals only when the file actually changes — avoiding a re-read/re-log
+/// every tick (задача 017). A `None`→`Some` (or vice-versa) transition on
+/// create/delete is itself a change the caller reacts to.
+pub fn config_mtime() -> Option<SystemTime> {
+    let path = config_path()?;
+    std::fs::metadata(&path).ok()?.modified().ok()
 }
 
 /// Resolve the config file path: explicit [`CONFIG_ENV`] override first, else

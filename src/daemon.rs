@@ -150,6 +150,12 @@ const WATCHDOG_EXIT_CODE: i32 = 86;
 /// stretches; keep it snappy but idle-cheap.
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How often, during an active session, to check whether the goals config file
+/// changed on disk and reload it without a daemon restart (задача 017). Only a
+/// cheap `stat` per tick — the file is re-read/parsed only when its mtime moved.
+/// 5s is a snappy pickup latency for a config edit while negligible in cost.
+const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Run the daemon forever: scan → connect → stream with presence tracking →
 /// on disconnect, toast and go back to scanning. Reacts to power/sleep
 /// events instead of polling — see module docs.
@@ -158,7 +164,9 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
     let mut store = Store::open()?;
     // Loaded once here (not per session): config edits take effect on the next
     // daemon restart, matching the "edit the committed repo file" workflow.
-    let step_goals = goals::load_goals();
+    // Mutable so a live session can hot-reload it when goals.json changes on
+    // disk, without a daemon restart (задача 017).
+    let mut step_goals = goals::load_goals();
     info!(goals = ?step_goals, "loaded daily step goals");
     let watchdog = Watchdog::new();
     watchdog.spawn_monitor();
@@ -284,7 +292,7 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                             &mut state,
                             &watchdog,
                             &mut on_ac,
-                            &step_goals,
+                            &mut step_goals,
                         )
                         .await
                         {
@@ -326,7 +334,7 @@ async fn stream_with_presence(
     state: &mut DaemonState,
     watchdog: &Watchdog,
     on_ac: &mut bool,
-    step_goals: &[Goal],
+    step_goals: &mut Vec<Goal>,
 ) -> Result<()> {
     scan::subscribe_treadmill_data(peripheral).await?;
     scan::subscribe_treadmill_status(peripheral).await?;
@@ -365,6 +373,11 @@ async fn stream_with_presence(
     // Backstop poll for queued control commands during quiet stretches; the
     // primary check runs at the end of each telemetry sample below (задача 013).
     let mut command_tick = tokio::time::interval(CONTROL_POLL_INTERVAL);
+    // Hot-reload of goals.json (задача 017): `None` forces the first tick to
+    // reconcile against disk, so a config edited while the daemon was idle is
+    // picked up at session start too.
+    let mut config_tick = tokio::time::interval(CONFIG_RELOAD_INTERVAL);
+    let mut goals_mtime: Option<std::time::SystemTime> = None;
 
     loop {
         tokio::select! {
@@ -531,6 +544,19 @@ async fn stream_with_presence(
             }
             _ = command_tick.tick() => {
                 process_control_commands(peripheral, store).await?;
+            }
+            _ = config_tick.tick() => {
+                // Reload goals only when goals.json actually changed on disk —
+                // one cheap `stat`, re-read/re-log only on a real edit (задача 017).
+                let now_mtime = goals::config_mtime();
+                if now_mtime != goals_mtime {
+                    goals_mtime = now_mtime;
+                    let reloaded = goals::load_goals();
+                    if reloaded != *step_goals {
+                        info!(goals = ?reloaded, "goals config changed on disk — reloaded without a daemon restart");
+                        *step_goals = reloaded;
+                    }
+                }
             }
         }
     }
