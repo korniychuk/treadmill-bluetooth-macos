@@ -6,7 +6,7 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.1.0] — First public release
+## [0.1.0] — 2026-07-06 — First public release
 
 First open-source release. macOS BLE connector for a Yesoul (FTMS) treadmill.
 

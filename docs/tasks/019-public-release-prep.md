@@ -1,6 +1,6 @@
 # 019 — Подготовка репозитория к публикации (open-source)
 
-- **Status:** prep executed (WS0–WS5 done) — ожидает review + публичного flip (WS6)
+- **Status:** ✅ DONE — репозиторий публичный, релиз `v0.1.0` опубликован (2026-07-06)
 
 ## Execution log (2026-07-06)
 
@@ -16,9 +16,17 @@
   плюс `scripts/install-prebuilt.sh` (установка без Rust). ⚠️ не smoke-тестирован.
 - ✅ **WS5 политика:** ADR 0002.
 - ✅ **Verify:** `cargo fmt --check` чист, `clippy -D warnings` чист, 76 тестов green.
-- ⏳ **WS6:** публичный flip + релиз `v0.1.0` — необратимо, отдельным подтверждением.
+- ✅ **WS6:** репо публичный (`gh repo edit --visibility public`); тег `v0.1.0`
+  → `release.yml` собрал unsigned `arm64` tar.gz и создал GitHub Release.
+  Install-однострочник (`releases/latest/download/...`) резолвится публично (HTTP 200).
+- ✅ **Скриншоты:** 9 шт. (тосты, tmux-виджет walking/paused, CLI) в `docs/screenshots/`,
+  встроены в README (секции Demo + tmux). Замусоренные кадры кропнуты.
+- ✅ **Follow-up dotfiles:** копия виджета в *AnKor Dotfiles* заменена symlink'ом на
+  `scripts/tmux/treadmill-widget.sh` (single source of truth).
 - ℹ️ Коммит `b167572` (план) в истории всё ещё содержит литералы `ankor-dotfiles`/
-  `ReQuant` — не секрет; переписать нельзя без force-push в main (запрещён политикой).
+  `ReQuant` — не секрет; оставлено как есть (по решению; force-push в main запрещён).
+- ℹ️ Дистрибуция: unsigned tar.gz + `install-prebuilt.sh` ($0). Notarization ($99/год)
+  и Homebrew-tap — отклонены/отложены.
 - **Owner:** Anton
 - **Депендси:** —
 - **Затрагивает:** README, `docs/`, `.gitignore`, `scripts/`, `.github/workflows/`,
