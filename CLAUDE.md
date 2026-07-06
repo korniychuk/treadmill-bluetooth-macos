@@ -28,6 +28,13 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
 - `src/activity.rs` — общий движок presence+credit+сегменты (`ActivityAccumulator`,
   `credit_or_hold`), которым гоняют **и** живой демон, **и** replay (задача 015) —
   сегментация идентична by construction, не форкается.
+- `src/default_speed.rs` — расчётная дефолтная скорость ленты на старте
+  тренировки (задача 016): `trimmed_mean_speed` (чистая, 15%-trim сверху/снизу,
+  floor) + `compute_default_speed` — берёт последнюю подходящую тренировку
+  (`walking_time_s` ≥ 30 мин) за всю историю и её крейсерскую скорость из
+  `raw_samples`. Демон применяет её на переходе в `Walking` без pre-pause
+  скорости, только если лента на заводском crawl (`≤0.8`); read-time,
+  переиспользует bounded BLE-write задачи 012.
 - `src/recompute.rs` — команда `recompute-segments`: проигрывает `raw_samples`
   через тот же `ActivityAccumulator` (scratch in-memory `Store` переиспользует
   `advance_baseline`+`credit_activity` verbatim) и транзакционно/идемпотентно
@@ -81,6 +88,7 @@ cargo run -- daemon    # фоновый режим: авто-коннект + pr
 cargo run -- stats     # статистика за сегодня; `stats --all` — за все дни
 cargo run -- widget    # компактный TSV текущей тренировки для status-bar виджета; пусто если дорожка off (см. docs/tasks/009)
 cargo run -- recompute-segments  # пересобрать activity_segments из raw_samples (без BLE, идемпотентно; docs/tasks/015)
+cargo run -- default-speed  # показать расчётную дефолтную скорость на старте тренировки (без BLE; docs/tasks/016)
 cargo run -- --help    # полный список команд
 cargo test             # юнит-тесты
 cargo clippy           # линт

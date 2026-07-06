@@ -569,6 +569,32 @@ impl Store {
         Ok(raw)
     }
 
+    /// Belt speeds (km/h) recorded in `raw_samples` over the wall-clock window
+    /// `[started_at, ended_at]`, for the computed default-speed estimate (задача
+    /// 016). Only positive speeds are returned (crawl/idle-floor and trimming
+    /// happen in the pure `default_speed::trimmed_mean_speed`), decoded back from
+    /// the stored centi-km/h wire scale. Ordered by time, though the estimate is
+    /// order-independent.
+    pub fn walking_speeds_in_window(&self, started_at: &str, ended_at: &str) -> Result<Vec<f32>> {
+        let start_ms = DateTime::parse_from_rfc3339(started_at).context("parse window started_at")?.timestamp_millis();
+        let end_ms = DateTime::parse_from_rfc3339(ended_at).context("parse window ended_at")?.timestamp_millis();
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT speed_centikmh FROM raw_samples
+                 WHERE ts_ms BETWEEN ?1 AND ?2 AND speed_centikmh IS NOT NULL AND speed_centikmh > 0
+                 ORDER BY ts_ms ASC",
+            )
+            .context("prepare walking_speeds_in_window query")?;
+        let rows = stmt
+            .query_map(params![start_ms, end_ms], |row| {
+                let centi: i64 = row.get(0)?;
+                Ok(centi as f32 / 100.0)
+            })
+            .context("run walking_speeds_in_window query")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("collect walking_speeds_in_window rows")
+    }
+
     /// All `raw_samples` rows in true processing order (`ts_ms`, then `id` as a
     /// stable tiebreaker for same-millisecond frames), decoded back from their
     /// stored wire scale into the cumulative device counters. Backs the offline

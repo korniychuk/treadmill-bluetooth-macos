@@ -67,6 +67,7 @@ use tracing::{error, info, warn};
 use crate::activity::ActivityAccumulator;
 use crate::control::Controller;
 use crate::control_command::{self, ControlCommand};
+use crate::default_speed;
 use crate::ftms;
 use crate::goals::{self, Goal};
 use crate::logger::WorkoutLogger;
@@ -124,6 +125,14 @@ const SPEED_CRUISE_DECEL_SKIP: Duration = Duration::from_secs(10);
 /// Samples slower than this are ramp/idle, not walking, and are excluded from
 /// the cruising estimate (the belt minimum sits around 0.5 km/h).
 const SPEED_CRUISE_FLOOR_KMH: f32 = 0.8;
+
+/// Ceiling on the resumed belt speed for applying the computed default at a
+/// workout start (задача 016): apply only when the belt is at/below the device's
+/// factory crawl (~0.5), i.e. it just (re)started/reset and sits at its useless
+/// default. A belt already moving faster means the operator chose that speed (or
+/// a daemon restart landed mid-walk) — never override it. Same value as the
+/// cruise floor: below it is not real walking.
+const DEFAULT_SPEED_APPLY_CEILING_KMH: f32 = 0.8;
 
 /// How long to retain recent speed samples for the cruising estimate. Covers
 /// the decel-skip plus a useful averaging window before it; older samples are
@@ -349,6 +358,10 @@ async fn stream_with_presence(
     let mut speed_history: VecDeque<(Instant, f32)> = VecDeque::new();
     let mut last_walking_speed: Option<f32> = None;
     let mut pre_pause_speed: Option<f32> = None;
+    // Whether the computed default speed has already been applied (or attempted)
+    // this session (задача 016). Fresh per BLE session, so each physical
+    // (re)start of the treadmill gets one attempt; reconnect/new session resets it.
+    let mut default_speed_applied = false;
     // Backstop poll for queued control commands during quiet stretches; the
     // primary check runs at the end of each telemetry sample below (задача 013).
     let mut command_tick = tokio::time::interval(CONTROL_POLL_INTERVAL);
@@ -453,8 +466,31 @@ async fn stream_with_presence(
                         PresenceState::Walking if prev_state == PresenceState::Paused => {
                             let paused_for = paused_since.take().map(|since| since.elapsed());
                             let resumed_speed = data.speed_kmh.unwrap_or(0.0);
-                            let restore = try_restore_speed(peripheral, pre_pause_speed.take(), resumed_speed).await;
-                            notify::treadmill_resumed(paused_for, restore);
+                            match pre_pause_speed.take() {
+                                // A real captured walking speed → restore it (задача 012).
+                                Some(pre) => {
+                                    let restore = try_restore_speed(peripheral, Some(pre), resumed_speed).await;
+                                    notify::treadmill_resumed(paused_for, restore);
+                                }
+                                // Nothing to restore → this is a fresh start/reset at the
+                                // device crawl (scenarios 2 & 3, задача 016): apply the
+                                // computed default. Only toasts when it actually applied.
+                                None => match try_apply_default_speed(peripheral, store, resumed_speed, &mut default_speed_applied).await {
+                                    Some(applied) => notify::default_speed_applied(resumed_speed, applied),
+                                    None => notify::treadmill_resumed(paused_for, None),
+                                },
+                            }
+                        }
+                        // Connected with the belt already moving (scenario 1, задача 016).
+                        // Apply the computed default only if the belt is at its device
+                        // crawl (guarded inside `try_apply_default_speed`).
+                        PresenceState::Walking if prev_state == PresenceState::Unknown => {
+                            let resumed_speed = data.speed_kmh.unwrap_or(0.0);
+                            if let Some(applied) =
+                                try_apply_default_speed(peripheral, store, resumed_speed, &mut default_speed_applied).await
+                            {
+                                notify::default_speed_applied(resumed_speed, applied);
+                            }
                         }
                         // Skip the very first sample after connecting: PresenceState
                         // starts Unknown, so a treadmill discovered already stopped
@@ -589,6 +625,73 @@ async fn try_restore_speed(peripheral: &Peripheral, pre_pause: Option<f32>, resu
 async fn restore_speed(peripheral: &Peripheral, target_kmh: f32) -> Result<()> {
     let controller = Controller::take_control(peripheral).await?;
     controller.set_speed(target_kmh).await
+}
+
+/// Apply the computed default belt speed at a workout start (задача 016), when
+/// there is no pre-pause speed to restore. Returns the applied km/h for the
+/// toast, or `None` when nothing was applied. Guards, in order:
+/// - once per session (`applied`) — one attempt per (re)start, no retry storm on
+///   a presence flap at the crawl;
+/// - the belt must be at/below the device crawl ([`DEFAULT_SPEED_APPLY_CEILING_KMH`])
+///   — a belt already moving faster was set by the operator (or a daemon restart
+///   landed mid-walk); never override it;
+/// - a qualifying prior workout must exist ([`default_speed::compute_default_speed`]).
+///
+/// The BLE write reuses the bounded [`restore_speed`]/[`SPEED_RESTORE_TIMEOUT`]
+/// path (задачи 007/012); a failed/timed-out write is logged and swallowed —
+/// applying a convenience speed must never tear down the session.
+async fn try_apply_default_speed(
+    peripheral: &Peripheral,
+    store: &Store,
+    resumed_kmh: f32,
+    applied: &mut bool,
+) -> Option<f32> {
+    if *applied {
+        return None;
+    }
+    if resumed_kmh > DEFAULT_SPEED_APPLY_CEILING_KMH {
+        // Belt already at a real speed — the operator's choice, or a mid-walk
+        // reconnect. Not a fresh crawl start; leave it alone (and let a later
+        // genuine crawl start still get its one attempt).
+        return None;
+    }
+
+    let gap_minutes = goals::load_workout_gap_minutes();
+    let target = match default_speed::compute_default_speed(store, gap_minutes) {
+        Ok(Some(default)) => default.kmh,
+        Ok(None) => {
+            info!("no qualifying prior workout (≥30m walking) — leaving belt at its device default speed");
+            // Nothing to apply; don't recompute on every Walking flap this session.
+            *applied = true;
+            return None;
+        }
+        Err(err) => {
+            // A transient DB error may clear — do not consume the one attempt.
+            warn!(%err, "failed to compute default speed — leaving belt at its device default");
+            return None;
+        }
+    };
+
+    // One attempt per session regardless of the write outcome (a failed write
+    // must not loop on a presence flap at the crawl start).
+    *applied = true;
+    match tokio::time::timeout(SPEED_RESTORE_TIMEOUT, restore_speed(peripheral, target)).await {
+        Ok(Ok(())) => {
+            info!(from = resumed_kmh, to = target, "applied computed default belt speed at workout start");
+            Some(target)
+        }
+        Ok(Err(err)) => {
+            warn!(%err, target, "failed to apply default belt speed at workout start — leaving belt as is");
+            None
+        }
+        Err(_) => {
+            warn!(
+                timeout_s = SPEED_RESTORE_TIMEOUT.as_secs(),
+                target, "default belt speed write timed out (possible CoreBluetooth hang)"
+            );
+            None
+        }
+    }
 }
 
 /// After a step credit, fire a toast for each configured goal today's steps

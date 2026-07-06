@@ -7,6 +7,7 @@ mod activity;
 mod control;
 mod control_command;
 mod daemon;
+mod default_speed;
 mod discover;
 mod fitshow;
 mod ftms;
@@ -76,6 +77,10 @@ enum Commands {
     /// step-away/pause). Like `status`, never opens the BLE adapter. See
     /// docs/tasks/009 and 014.
     Widget,
+    /// Print the computed default belt speed the daemon would apply at the next
+    /// workout start — the trimmed-mean cruising pace of your most recent ≥30min
+    /// workout (задача 016). Read-only, no BLE.
+    DefaultSpeed,
     /// Start the belt via the FTMS Control Point.
     Start,
     /// Stop the belt via the FTMS Control Point.
@@ -140,6 +145,9 @@ async fn main() -> Result<()> {
     if let Commands::NotifyTest = command {
         return run_notify_test();
     }
+    if let Commands::DefaultSpeed = command {
+        return run_default_speed();
+    }
     // Control commands route through the daemon's queue when it holds the BLE
     // link (two processes can't co-own the connection — задача 013), and only
     // fall back to a direct connection when the daemon is off. Handled here,
@@ -181,6 +189,7 @@ async fn main() -> Result<()> {
         | Commands::RecomputeSegments
         | Commands::Widget
         | Commands::NotifyTest
+        | Commands::DefaultSpeed
         | Commands::Start
         | Commands::Stop
         | Commands::Speed { .. } => {
@@ -236,7 +245,7 @@ fn run_notify_test() -> Result<()> {
     // table. Sample durations/goals are illustrative — this path never touches
     // BLE or the real presence state.
     let sample_away = std::time::Duration::from_secs(157);
-    let toasts: [(&str, &dyn Fn()); 9] = [
+    let toasts: [(&str, &dyn Fn()); 10] = [
         ("found", &notify::treadmill_found),
         ("lost", &notify::treadmill_lost),
         ("away", &notify::walker_away),
@@ -246,6 +255,7 @@ fn run_notify_test() -> Result<()> {
             "resumed (from pause, duration + speed restore)",
             &(|| notify::treadmill_resumed(Some(sample_away), Some(notify::SpeedRestore { from_kmh: 0.5, to_kmh: 2.5 }))),
         ),
+        ("default speed applied (workout start)", &(|| notify::default_speed_applied(0.5, 2.5))),
         ("goal tier 1", &(|| notify::goal_reached(8000, 1))),
         ("goal tier 2", &(|| notify::goal_reached(10000, 2))),
         ("goal tier 3", &(|| notify::goal_reached(12000, 3))),
@@ -254,6 +264,34 @@ fn run_notify_test() -> Result<()> {
         println!("sending: {label}");
         send();
         std::thread::sleep(std::time::Duration::from_millis(800));
+    }
+    Ok(())
+}
+
+/// Print the computed default belt speed the daemon would apply at the next
+/// workout start, and which workout it was derived from (задача 016). Read-only.
+fn run_default_speed() -> Result<()> {
+    let store = store::Store::open()?;
+    let gap_minutes = goals::load_workout_gap_minutes();
+    match default_speed::compute_default_speed(&store, gap_minutes)? {
+        Some(default) => {
+            println!("computed default speed: {:.1} km/h", default.kmh);
+            println!(
+                "  from workout on {} ({} → {}, {} walking)",
+                default.source.date,
+                format_local_time(&default.source.started_at),
+                format_local_time(&default.source.ended_at),
+                fmt_duration(default.source.walking_time_s),
+            );
+            println!(
+                "  {} walking samples, {} kept after 15% top/bottom trim",
+                default.walking_samples, default.kept_samples,
+            );
+        }
+        None => println!(
+            "no qualifying workout yet (need one with \u{2265}30m of credited walking) — \
+             the belt would stay at its device default speed"
+        ),
     }
     Ok(())
 }

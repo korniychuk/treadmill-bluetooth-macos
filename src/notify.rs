@@ -151,6 +151,15 @@ pub fn treadmill_resumed(paused_for: Option<Duration>, restore: Option<SpeedRest
     toast_full("Treadmill", subtitle.as_deref(), &body, None);
 }
 
+/// Fired when the daemon applies the computed default belt speed at a workout
+/// start (задача 016): the device came up at its factory crawl `from_kmh` (~0.5)
+/// and we set `to_kmh` — the operator's recent cruising pace. Distinct from the
+/// pause-resume "Speed restored" toast (задача 012): this is a fresh start, not
+/// a restore.
+pub fn default_speed_applied(from_kmh: f32, to_kmh: f32) {
+    toast("Treadmill", &format!("Set your usual pace {from_kmh:.1} → {to_kmh:.1} km/h"));
+}
+
 /// Celebrate crossing a daily step goal, graduated by `tier` (задача 011):
 /// tier 1 is a quiet flourish, tier 2 adds heat and a sound, tier 3 is the
 /// loudest with a distinct sound. `threshold` is the goal's step count.
