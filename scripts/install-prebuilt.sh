@@ -89,9 +89,17 @@ if [[ -n "$LINK_NAME" ]]; then
   fi
 fi
 
+# STAGE_ONLY=1 stages the install (binary + signature + symlink + plist) but
+# skips the two steps that mutate system state — registering the notification
+# identity and loading the LaunchAgent. Useful for building a staged install
+# image, or for testing this script without touching a running daemon.
+stage_only="${STAGE_ONLY:-}"
+
 # Registers the nominal "Treadmill.app" that gives toast notifications their
 # name + icon (src/notify.rs). Uses macos/AppIcon.icns shipped in the tarball.
-bash "$bundle_root/scripts/register-notification-identity.sh"
+if [[ -z "$stage_only" ]]; then
+  bash "$bundle_root/scripts/register-notification-identity.sh"
+fi
 
 plist="$HOME/Library/LaunchAgents/${LABEL}.plist"
 mkdir -p "$(dirname "$plist")"
@@ -129,8 +137,13 @@ cat > "$plist" <<EOF
 </plist>
 EOF
 
-launchctl unload "$plist" 2>/dev/null || true
-launchctl load "$plist"
+if [[ -z "$stage_only" ]]; then
+  launchctl unload "$plist" 2>/dev/null || true
+  launchctl load "$plist"
+else
+  echo "note: STAGE_ONLY — skipped notification-identity registration and" >&2
+  echo "      LaunchAgent load. Run without STAGE_ONLY to activate." >&2
+fi
 
 echo "installed: $plist"
 echo "binary:    $bin"
