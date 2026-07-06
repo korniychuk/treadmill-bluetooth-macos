@@ -1,24 +1,26 @@
-# treadmill-bluetooth-macos
+# 🏃 treadmill-bluetooth-macos
 
 [![CI](https://github.com/korniychuk/treadmill-bluetooth-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/korniychuk/treadmill-bluetooth-macos/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![Platform: macOS](https://img.shields.io/badge/platform-macOS-black.svg)](#-limitations)
+[![Made with Rust](https://img.shields.io/badge/Rust-2024-orange.svg)](https://www.rust-lang.org)
 
-A **macOS** Bluetooth Low Energy connector for a **Yesoul** treadmill, written in **Rust**.
+A **macOS** Bluetooth Low Energy connector for a **Yesoul** treadmill, written in **Rust** 🦀.
 
 It discovers the treadmill over BLE (CoreBluetooth), connects, and streams live
 telemetry — speed, distance, steps — over the standard **Fitness Machine Service**
 (FTMS) GATT profile. A background daemon keeps the link alive, detects whether you
 are actually walking (presence), splits your day into workouts, tracks step goals,
-and can drive the treadmill (start / stop / target speed).
+and can drive the treadmill (start / stop / target speed). 🏃💨
 
 > ⚠️ **Unofficial.** Not affiliated with Yesoul. The BLE protocol was
 > reverse-engineered against a single unit (Yesoul W2 Pro). It speaks generic
 > FTMS, so other FTMS treadmills *may* work, but only the W2 Pro is verified.
-> See [Limitations](#limitations).
+> See [Limitations](#-limitations).
 
 ---
 
-## Features
+## ✨ Features
 
 - 🔎 **Scan & connect** to the first FTMS treadmill nearby.
 - 📈 **Live telemetry** — speed, distance, steps — streamed and logged.
@@ -32,14 +34,14 @@ and can drive the treadmill (start / stop / target speed).
 - 🛟 **Self-healing daemon** — auto reconnect, watchdog, pause/resume speed
   restore, AC-power awareness (won't drain the battery when idle).
 
-## Requirements
+## 📋 Requirements
 
-- **macOS** (Apple Silicon or Intel). No Linux / Windows — see [Limitations](#limitations).
-- Bluetooth, and a treadmill exposing FTMS (`0x1826`).
-- To build from source: **Rust 1.95+** (edition 2024). `rustup` recommended.
-- To regenerate the app icon only: Xcode Command Line Tools (`swift`).
+- 🍎 **macOS** (Apple Silicon or Intel). No Linux / Windows — see [Limitations](#-limitations).
+- 📡 Bluetooth, and a treadmill exposing FTMS (`0x1826`).
+- 🦀 To build from source: **Rust 1.95+** (edition 2024). `rustup` recommended.
+- 🎨 To regenerate the app icon only: Xcode Command Line Tools (`swift`).
 
-## Quickstart (from source)
+## 🚀 Quickstart (from source)
 
 ```bash
 git clone https://github.com/korniychuk/treadmill-bluetooth-macos.git
@@ -59,7 +61,7 @@ Verbose logs:
 RUST_LOG=debug cargo run -- connect
 ```
 
-## Install the background daemon
+## 🎛️ Install the background daemon
 
 The daemon auto-connects, tracks presence and stats, shows toasts, and owns the
 BLE link so CLI control commands can be routed to it.
@@ -75,11 +77,11 @@ auto-starts at login), and symlinks a short `tm` alias into `~/.bin` so you can
 run `tm stats` / `tm status` from anywhere. Add `~/.bin` to your `PATH` if it
 isn't already.
 
-> **Re-run `install-daemon.sh` after every rebuild** — it re-signs and reloads
+> 🔁 **Re-run `install-daemon.sh` after every rebuild** — it re-signs and reloads
 > the LaunchAgent. A bare `cargo build` leaves the daemon pointing at a stale or
 > differently-signed binary.
 
-### Commands
+### 🕹️ Commands
 
 ```bash
 tm                    # = scan: list nearby BLE devices
@@ -95,33 +97,35 @@ tm default-speed      # show the computed default start speed (no BLE)
 tm --help             # full command list
 ```
 
-## Install a prebuilt binary (no Rust needed)
+## ⬇️ Install a prebuilt binary (no Rust needed)
 
-Each tagged release publishes an **unsigned, ad-hoc** macOS binary as a `.tar.gz`
-on the [Releases](https://github.com/korniychuk/treadmill-bluetooth-macos/releases)
-page. Because it is not notarized by Apple, Gatekeeper quarantines it on download.
+Each tagged release ships an **unsigned, ad-hoc** macOS binary (Apple Silicon)
+as a `.tar.gz` on the
+[Releases](https://github.com/korniychuk/treadmill-bluetooth-macos/releases) page.
+One-liner — grab the latest and install it as a daemon:
 
 ```bash
-tar -xzf treadmill-bluetooth-macos-*-macos-*.tar.gz
-cd treadmill-bluetooth-macos-*-macos-*
-
-# Install the prebuilt binary as a LaunchAgent WITHOUT rebuilding:
-scripts/install-prebuilt.sh
+curl -fsSL https://github.com/korniychuk/treadmill-bluetooth-macos/releases/latest/download/treadmill-bluetooth-macos-macos-arm64.tar.gz | tar -xz
+cd treadmill-bluetooth-macos-macos-arm64
+./scripts/install-prebuilt.sh
 ```
 
 `install-prebuilt.sh` strips the quarantine attribute, ad-hoc-signs the binary,
 installs it to a stable location, registers the notification identity, and loads
-the LaunchAgent — no cargo, no toolchain required. To sign with your own
-certificate for a rebuild-stable Bluetooth grant, pass `IDENTITY="<cert name>"`.
+the LaunchAgent — **no cargo, no toolchain**. To sign with your own certificate
+for a rebuild-stable Bluetooth grant, pass `IDENTITY="<cert name>"`.
 
-If you just want to run the binary by hand instead:
+> 🍏 **Apple Silicon only** for prebuilt binaries (CI builds `arm64`). On Intel,
+> build from source (see [Quickstart](#-quickstart-from-source)).
+
+Prefer to just run it by hand instead of installing the daemon:
 
 ```bash
 xattr -d com.apple.quarantine ./treadmill-bluetooth-macos
 ./treadmill-bluetooth-macos connect
 ```
 
-## Configuration — step goals
+## ⚙️ Configuration — step goals
 
 Daily step goals (up to 3) live **outside this repo**, per-user, at:
 
@@ -135,8 +139,8 @@ Copy [`config/goals.example.json`](./config/goals.example.json) there and edit i
 { "goals": [8000, 10000, 12000], "workout_gap_minutes": 15 }
 ```
 
-- `goals` — up to 3 thresholds; each is celebrated once per day with a toast.
-- `workout_gap_minutes` (optional, default 15) — segments closer than this merge
+- 🎯 `goals` — up to 3 thresholds; each is celebrated once per day with a toast.
+- ⏱️ `workout_gap_minutes` (optional, default 15) — segments closer than this merge
   into one displayed workout. Applied **at read time**, so changing it is
   retroactive; no recompute needed.
 
@@ -145,7 +149,7 @@ A missing file is fine (built-in defaults `[8000, 10000, 12000]`); a malformed
 file logs a WARN and falls back to defaults. Override the path with the
 `TREADMILL_GOALS_CONFIG` env var.
 
-## tmux status-bar widget
+## 🖥️ tmux status-bar widget
 
 `tm widget` prints a compact, tab-separated line for a status bar (empty output
 when the treadmill is off, so the segment hides). A reference renderer for
@@ -153,27 +157,27 @@ when the treadmill is off, so the segment hides). A reference renderer for
 [`scripts/tmux/`](./scripts/tmux) — see its README for the install recipe and
 the exact output contract.
 
-## Limitations
+## ⚠️ Limitations
 
-- **macOS only.** The permission flow, notifications, code-signing, LaunchAgent
+- 🍎 **macOS only.** The permission flow, notifications, code-signing, LaunchAgent
   and IOKit/CoreFoundation glue are all macOS-specific. No Linux / Windows.
-- **Verified on one device** — Yesoul W2 Pro (`FW SDC_W2_BT_V3.03-50-54`). Written
+- 🧪 **Verified on one device** — Yesoul W2 Pro (`FW SDC_W2_BT_V3.03-50-54`). Written
   as generic FTMS, so other FTMS treadmills may work, but are untested.
-- **No incline.** The W2 Pro does not expose inclination over FTMS
+- ⛰️ **No incline.** The W2 Pro does not expose inclination over FTMS
   (`SetTargetInclination` → *Operation Failed*, no `0x2AD5`). Incline is remote-only.
-- **Partial control.** Start / stop and target-speed are implemented and
+- 🎚️ **Partial control.** Start / stop and target-speed are implemented and
   hardware-verified. Incline is not. LED backlight control is
   [backlog](./docs/backlog/004-led-control-via-hci-capture.md), not started.
-- **Not in the macOS Bluetooth menu — by design.** The treadmill is app-managed
+- 🔕 **Not in the macOS Bluetooth menu — by design.** The treadmill is app-managed
   BLE, without OS-level pairing/bonding (avoids a race for the single BLE central
   with the phone app). See [ADR 0001](./docs/adr/0001-no-macos-bluetooth-device-list.md).
   Status is via `tm status` / the widget, not System Settings.
-- **Code signing.** Without your own signing identity, macOS re-prompts for
+- 🔏 **Code signing.** Without your own signing identity, macOS re-prompts for
   Bluetooth on every rebuild (ad-hoc signatures change the cdhash). Release
   binaries are **not notarized** — Gatekeeper will warn unless you strip
   quarantine or build locally.
 
-## Development
+## 🧑‍💻 Development
 
 ```bash
 cargo test     # unit tests
@@ -187,6 +191,6 @@ push and PR. See [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 Architecture and protocol notes live in [`CLAUDE.md`](./CLAUDE.md); research,
 decisions (ADRs) and the task journal live in [`docs/`](./docs).
 
-## License
+## 📄 License
 
 MIT — see [`LICENSE`](./LICENSE).

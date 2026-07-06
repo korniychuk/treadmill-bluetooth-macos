@@ -31,7 +31,10 @@ jobs:
 
           version="${GITHUB_REF_NAME}"
           arch="$(uname -m)"
-          stage_dir="treadmill-bluetooth-macos-${version}-macos-${arch}"
+          # Stable, version-less asset name so the README install one-liner
+          # (releases/latest/download/<name>) always resolves. The version
+          # still lives in the release tag/notes.
+          stage_dir="treadmill-bluetooth-macos-macos-${arch}"
           archive_name="${stage_dir}.tar.gz"
 
           mkdir -p "${stage_dir}/scripts" "${stage_dir}/macos"
