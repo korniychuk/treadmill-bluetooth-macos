@@ -34,6 +34,33 @@ and can drive the treadmill (start / stop / target speed). 🏃💨
 - 🛟 **Self-healing daemon** — auto reconnect, watchdog, pause/resume speed
   restore, AC-power awareness (won't drain the battery when idle).
 
+## 📸 Demo
+
+**Live workout in your tmux status bar** (walking = green, paused = yellow):
+
+![tmux status-bar widget — walking](./docs/screenshots/tmux-widget-walking.png)
+
+**Native macOS toasts** for milestones, presence and connection state:
+
+<table>
+  <tr>
+    <td><img width="400" src="./docs/screenshots/toast-milestone.png" alt="12,000 steps milestone toast"></td>
+    <td><img width="400" src="./docs/screenshots/toast-goal.png" alt="daily step goal reached toast"></td>
+  </tr>
+  <tr>
+    <td><img width="400" src="./docs/screenshots/toast-speed-restore.png" alt="pause / resume speed restore toast"></td>
+    <td><img width="400" src="./docs/screenshots/toast-connection-lost.png" alt="connection lost toast"></td>
+  </tr>
+  <tr>
+    <td><img width="400" src="./docs/screenshots/toast-away.png" alt="away-while-running toast"></td>
+    <td><img width="400" src="./docs/screenshots/toast-back.png" alt="steps counting again toast"></td>
+  </tr>
+</table>
+
+**CLI** — control the belt, then read stats & status:
+
+![tm start / stop / stats / status](./docs/screenshots/cli-overview.png)
+
 ## 📋 Requirements
 
 - 🍎 **macOS** (Apple Silicon or Intel). No Linux / Windows — see [Limitations](#-limitations).
@@ -156,6 +183,8 @@ when the treadmill is off, so the segment hides). A reference renderer for
 **Dracula** (and a plain-tmux variant) lives in
 [`scripts/tmux/`](./scripts/tmux) — see its README for the install recipe and
 the exact output contract.
+
+![tmux widget — paused state](./docs/screenshots/tmux-widget-paused.png)
 
 ## ⚠️ Limitations
 
