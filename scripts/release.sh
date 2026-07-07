@@ -37,8 +37,9 @@ cd "$repo_root"
 branch="$(git rev-parse --abbrev-ref HEAD)"
 [[ "$branch" == "$MAIN_BRANCH" ]] || die "must release from '$MAIN_BRANCH', on '$branch'"
 
-git diff --quiet && git diff --cached --quiet \
-  || die "working tree is dirty — commit or stash first (only version+changelog should change here)"
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  die "working tree is dirty — commit or stash first (only version+changelog should change here)"
+fi
 
 git rev-parse -q --verify "refs/tags/${tag}" >/dev/null \
   && die "tag ${tag} already exists"
