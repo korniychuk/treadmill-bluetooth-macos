@@ -6,6 +6,8 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-07-07
+
 ### Added
 
 - Idle-belt auto-pause: when the belt keeps running with nobody walking (you
