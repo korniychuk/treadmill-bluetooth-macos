@@ -187,6 +187,16 @@ const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
 /// spell. A *successful* pause is one-shot per spell (no cooldown needed).
 const AUTO_PAUSE_RETRY_COOLDOWN: Duration = Duration::from_secs(15);
 
+/// The two hot-reloadable config values, bundled so they thread through the
+/// session loop as one `&mut`: they share a lifecycle — loaded together in
+/// [`run`], reloaded together on the `config.json` mtime watch, and snapshotted
+/// together for `tm status` (задачи 017/020/022). Keeps the config as one
+/// cohesive unit rather than two parallel parameters.
+struct LiveConfig {
+    goals: Vec<Goal>,
+    auto_pause: Option<Duration>,
+}
+
 /// Run the daemon forever: scan → connect → stream with presence tracking →
 /// on disconnect, toast and go back to scanning. Reacts to power/sleep
 /// events instead of polling — see module docs.
@@ -194,11 +204,15 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
     let mut power_events = power::spawn_power_event_listener();
     let mut store = Store::open()?;
     // Loaded once here (not per session): config edits take effect on the next
-    // daemon restart, matching the "edit the committed repo file" workflow.
-    // Mutable so a live session can hot-reload it when goals.json changes on
-    // disk, without a daemon restart (задача 017).
-    let mut step_goals = goals::load_goals();
-    info!(goals = ?step_goals, "loaded daily step goals");
+    // daemon restart or a live hot-reload when config.json changes on disk
+    // (задача 017). Bundled as `LiveConfig` and threaded by `&mut` into
+    // `stream_with_presence`, which reloads it and keeps the `tm status`
+    // snapshot in sync (задачи 020/022). `auto_pause` is `None` when disabled.
+    let mut live_config = LiveConfig {
+        goals: goals::load_goals(),
+        auto_pause: goals::load_auto_pause(),
+    };
+    info!(goals = ?live_config.goals, auto_pause = ?live_config.auto_pause, "loaded config (goals + idle-belt auto-pause)");
     let watchdog = Watchdog::new();
     watchdog.spawn_monitor();
     // Refreshes `daemon_status.updated_at` (and the watchdog) while idle, so
@@ -221,6 +235,9 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
     };
 
     let mut state = DaemonState::new(on_ac);
+    // Seed the loaded-config snapshot so `tm status` shows it even before the
+    // first connection/session (задача 022).
+    state.set_config(&live_config.goals, live_config.auto_pause);
     state.persist(&store, &watchdog)?;
 
     loop {
@@ -323,7 +340,7 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                             &mut state,
                             &watchdog,
                             &mut on_ac,
-                            &mut step_goals,
+                            &mut live_config,
                         )
                         .await
                         {
@@ -370,7 +387,7 @@ async fn stream_with_presence(
     state: &mut DaemonState,
     watchdog: &Watchdog,
     on_ac: &mut bool,
-    step_goals: &mut Vec<Goal>,
+    config: &mut LiveConfig,
 ) -> Result<()> {
     scan::subscribe_treadmill_data(peripheral).await?;
     scan::subscribe_treadmill_status(peripheral).await?;
@@ -401,18 +418,11 @@ async fn stream_with_presence(
     // that sleeps mid-away drops the BLE link and re-enters here fresh anyway.
     let mut away_since: Option<Instant> = None;
     let mut paused_since: Option<Instant> = None;
-    // Idle-belt auto-pause (задача 020): pause a belt left running while the
-    // operator is away past a configured threshold, so the machine's own
-    // built-in shutoff can then power it down. `auto_pause_threshold` is `None`
-    // when disabled and is hot-reloaded on the goals-config mtime watch below
-    // (задача 017). `auto_pause_fired` is whether we already paused the current
-    // away spell (reset when a fresh spell begins); `auto_pause_last_attempt`
-    // gates retries after a failed write by `AUTO_PAUSE_RETRY_COOLDOWN`.
-    let mut auto_pause_threshold = goals::load_auto_pause();
-    info!(
-        ?auto_pause_threshold,
-        "loaded idle-belt auto-pause threshold"
-    );
+    // Idle-belt auto-pause (задача 020): the threshold lives in `config.auto_pause`
+    // (loaded in `run()`, hot-reloaded on the mtime watch below), `None` when
+    // disabled. `auto_pause_fired` is whether we already paused the current away
+    // spell (reset when a fresh spell begins); `auto_pause_last_attempt` gates
+    // retries after a failed write by `AUTO_PAUSE_RETRY_COOLDOWN`.
     let mut auto_pause_fired = false;
     let mut auto_pause_last_attempt: Option<Instant> = None;
     // Recent (timestamp, belt speed) samples, used to estimate the walking
@@ -432,7 +442,7 @@ async fn stream_with_presence(
     // Backstop poll for queued control commands during quiet stretches; the
     // primary check runs at the end of each telemetry sample below (задача 013).
     let mut command_tick = tokio::time::interval(CONTROL_POLL_INTERVAL);
-    // Hot-reload of goals.json (задача 017): `None` forces the first tick to
+    // Hot-reload of config.json (задача 017): `None` forces the first tick to
     // reconcile against disk, so a config edited while the daemon was idle is
     // picked up at session start too.
     let mut config_tick = tokio::time::interval(CONFIG_RELOAD_INTERVAL);
@@ -604,7 +614,7 @@ async fn stream_with_presence(
                 if accumulator.state() == PresenceState::AwayWhileRunning {
                     let away_for = away_duration(away_since).unwrap_or_default();
                     let since_last_attempt = auto_pause_last_attempt.map(|t| t.elapsed());
-                    if auto_pause_due(auto_pause_threshold, away_for, auto_pause_fired, since_last_attempt) {
+                    if auto_pause_due(config.auto_pause, away_for, auto_pause_fired, since_last_attempt) {
                         match tokio::time::timeout(
                             SPEED_RESTORE_TIMEOUT,
                             execute_control_command(peripheral, ControlCommand::Stop),
@@ -639,7 +649,7 @@ async fn stream_with_presence(
                 // credited, so gate the goal check on that to avoid a query
                 // every idle second.
                 if deltas.steps > 0 {
-                    celebrate_reached_goals(store, step_goals)?;
+                    celebrate_reached_goals(store, &config.goals)?;
                 }
                 state.persist(store, watchdog)?;
                 // Primary control-command check: telemetry arrives ~1/s while
@@ -652,23 +662,27 @@ async fn stream_with_presence(
                 process_control_commands(peripheral, store).await?;
             }
             _ = config_tick.tick() => {
-                // Reload goals only when goals.json actually changed on disk —
+                // Reload config only when config.json actually changed on disk —
                 // one cheap `stat`, re-read/re-log only on a real edit (задача 017).
                 let now_mtime = goals::config_mtime();
                 if now_mtime != goals_mtime {
                     goals_mtime = now_mtime;
                     let reloaded = goals::load_goals();
-                    if reloaded != *step_goals {
+                    if reloaded != config.goals {
                         info!(goals = ?reloaded, "goals config changed on disk — reloaded without a daemon restart");
-                        *step_goals = reloaded;
+                        config.goals = reloaded;
                     }
                     // Same mtime gate reloads the idle-belt auto-pause threshold
                     // (задача 020) — an edit takes effect without a restart.
                     let reloaded_auto_pause = goals::load_auto_pause();
-                    if reloaded_auto_pause != auto_pause_threshold {
+                    if reloaded_auto_pause != config.auto_pause {
                         info!(?reloaded_auto_pause, "auto-pause threshold changed on disk — reloaded without a daemon restart");
-                        auto_pause_threshold = reloaded_auto_pause;
+                        config.auto_pause = reloaded_auto_pause;
                     }
+                    // Refresh the loaded-config snapshot + last-read time shown by
+                    // `tm status` (задача 022): the file was actually re-read here.
+                    state.set_config(&config.goals, config.auto_pause);
+                    state.persist(store, watchdog)?;
                 }
             }
         }
@@ -985,6 +999,13 @@ struct DaemonState {
     last_disconnected_at: Option<String>,
     power_mode: &'static str,
     power_mode_since: DateTime<Utc>,
+    // Snapshot of the config the daemon currently holds, surfaced by `tm status`
+    // (задача 022): comma-joined goals, auto-pause threshold in seconds (`None` =
+    // disabled), and when the config file was last read. Updated by `set_config`
+    // at startup and on each mtime-triggered reload.
+    config_goals: Option<String>,
+    config_auto_pause_secs: Option<i64>,
+    config_loaded_at: Option<String>,
 }
 
 impl DaemonState {
@@ -996,7 +1017,25 @@ impl DaemonState {
             last_disconnected_at: None,
             power_mode: power_mode_label(on_ac),
             power_mode_since: Utc::now(),
+            config_goals: None,
+            config_auto_pause_secs: None,
+            config_loaded_at: None,
         }
+    }
+
+    /// Snapshot the config the daemon just (re)loaded, stamping the read time —
+    /// surfaced by `tm status` (задача 022). Called at startup and whenever the
+    /// config file is re-read on the mtime watch (задача 017).
+    fn set_config(&mut self, goals: &[Goal], auto_pause: Option<Duration>) {
+        self.config_goals = Some(
+            goals
+                .iter()
+                .map(|g| g.threshold.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        self.config_auto_pause_secs = auto_pause.map(|d| d.as_secs() as i64);
+        self.config_loaded_at = Some(Utc::now().to_rfc3339());
     }
 
     /// Update the power mode, bumping `power_mode_since` only on an actual
@@ -1022,6 +1061,9 @@ impl DaemonState {
             power_mode: self.power_mode.to_string(),
             power_mode_since: self.power_mode_since.to_rfc3339(),
             updated_at: Utc::now().to_rfc3339(),
+            config_goals: self.config_goals.clone(),
+            config_auto_pause_secs: self.config_auto_pause_secs,
+            config_loaded_at: self.config_loaded_at.clone(),
         })?;
         watchdog.touch();
         Ok(())
@@ -1152,6 +1194,14 @@ mod tests {
         let mut state = DaemonState::new(true);
         state.connected = true;
         state.presence_state = Some("Walking".to_string());
+        // Loaded-config snapshot is persisted too (задача 022).
+        state.set_config(
+            &[Goal {
+                threshold: 8500,
+                tier: 1,
+            }],
+            Some(Duration::from_secs(300)),
+        );
         state.persist(&store, &watchdog).unwrap();
 
         // `persist` touched the watchdog just now: fresh well inside the
@@ -1163,6 +1213,9 @@ mod tests {
         assert!(status.connected);
         assert_eq!(status.presence_state.as_deref(), Some("Walking"));
         assert_eq!(status.power_mode, "ac_scanning");
+        assert_eq!(status.config_goals.as_deref(), Some("8500"));
+        assert_eq!(status.config_auto_pause_secs, Some(300));
+        assert!(status.config_loaded_at.is_some());
     }
 
     #[test]

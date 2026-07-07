@@ -152,29 +152,33 @@ xattr -d com.apple.quarantine ./treadmill-bluetooth-macos
 ./treadmill-bluetooth-macos connect
 ```
 
-## ⚙️ Configuration — step goals
+## ⚙️ Configuration
 
-Daily step goals (up to 3) live **outside this repo**, per-user, at:
+Per-user config lives **outside this repo**, at:
 
 ```
-~/.config/treadmill-bluetooth-macos/goals.json
+~/.config/treadmill-bluetooth-macos/config.json
 ```
 
-Copy [`config/goals.example.json`](./config/goals.example.json) there and edit it:
+Copy [`config/config.example.json`](./config/config.example.json) there and edit it:
 
 ```json
-{ "goals": [8000, 10000, 12000], "workout_gap_minutes": 15 }
+{ "goals": [8000, 10000, 12000], "workout_gap_minutes": 15, "auto_pause_minutes": 5 }
 ```
 
 - 🎯 `goals` — up to 3 thresholds; each is celebrated once per day with a toast.
 - ⏱️ `workout_gap_minutes` (optional, default 15) — segments closer than this merge
   into one displayed workout. Applied **at read time**, so changing it is
   retroactive; no recompute needed.
+- ⏸️ `auto_pause_minutes` (optional, default 5, `0` = off) — how long the belt may
+  keep running while nobody is walking (you stepped off) before the daemon pauses
+  it; the machine's own shutoff then powers it down.
 
 Edits are **hot-reloaded** by the daemon within ~5s (see [`docs/tasks/017`](./docs/tasks/017-hot-reload-goals-config.md)).
 A missing file is fine (built-in defaults `[8000, 10000, 12000]`); a malformed
 file logs a WARN and falls back to defaults. Override the path with the
-`TREADMILL_GOALS_CONFIG` env var.
+`TREADMILL_CONFIG` env var (the legacy `TREADMILL_GOALS_CONFIG` and an existing
+`goals.json` are still honored as fallbacks).
 
 ## 🖥️ tmux status-bar widget
 

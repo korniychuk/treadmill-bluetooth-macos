@@ -99,6 +99,16 @@ pub struct DaemonStatus {
     pub power_mode: String,
     pub power_mode_since: String,
     pub updated_at: String,
+    /// Snapshot of the config the daemon currently holds in memory, so `tm
+    /// status` can show what is actually loaded and when (задача 022). All three
+    /// are `None` on a row written by a pre-022 daemon (columns added by
+    /// migration default to NULL) — the CLI then just omits the config line.
+    /// `config_goals` is the comma-joined step thresholds (e.g. `8500,10750`);
+    /// `config_auto_pause_secs` is the auto-pause threshold in seconds (`None` =
+    /// disabled); `config_loaded_at` is the RFC3339 time of the last config read.
+    pub config_goals: Option<String>,
+    pub config_auto_pause_secs: Option<i64>,
+    pub config_loaded_at: Option<String>,
 }
 
 /// Per-sample deltas against the persisted device baseline. Not yet a
@@ -252,7 +262,31 @@ impl Store {
                 ",
             )
             .context("run schema migration")?;
+
+        // Loaded-config snapshot on daemon_status (задача 022). Added via ALTER so
+        // an existing DB migrates in place — the CREATE above only fires on a
+        // fresh install, so a long-lived install needs these columns backfilled.
+        self.add_column_if_missing("ALTER TABLE daemon_status ADD COLUMN config_goals TEXT")?;
+        self.add_column_if_missing(
+            "ALTER TABLE daemon_status ADD COLUMN config_auto_pause_secs INTEGER",
+        )?;
+        self.add_column_if_missing("ALTER TABLE daemon_status ADD COLUMN config_loaded_at TEXT")?;
         Ok(())
+    }
+
+    /// Add a column if it isn't already there. SQLite has no `ADD COLUMN IF NOT
+    /// EXISTS`, so a "duplicate column name" failure is the expected no-op on an
+    /// already-migrated DB; any other error propagates (задача 022).
+    fn add_column_if_missing(&self, alter_sql: &str) -> Result<()> {
+        match self.conn.execute(alter_sql, []) {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+                if msg.contains("duplicate column name") =>
+            {
+                Ok(())
+            }
+            Err(err) => Err(err).with_context(|| format!("run migration: {alter_sql}")),
+        }
     }
 
     /// Record the start of a new BLE connection to the treadmill. Returns the
@@ -728,8 +762,9 @@ impl Store {
             .execute(
                 "INSERT INTO daemon_status
                     (id, connected, presence_state, last_connected_at, last_disconnected_at,
-                     power_mode, power_mode_since, updated_at)
-                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     power_mode, power_mode_since, updated_at,
+                     config_goals, config_auto_pause_secs, config_loaded_at)
+                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(id) DO UPDATE SET
                     connected = excluded.connected,
                     presence_state = excluded.presence_state,
@@ -737,7 +772,10 @@ impl Store {
                     last_disconnected_at = excluded.last_disconnected_at,
                     power_mode = excluded.power_mode,
                     power_mode_since = excluded.power_mode_since,
-                    updated_at = excluded.updated_at",
+                    updated_at = excluded.updated_at,
+                    config_goals = excluded.config_goals,
+                    config_auto_pause_secs = excluded.config_auto_pause_secs,
+                    config_loaded_at = excluded.config_loaded_at",
                 params![
                     status.connected,
                     status.presence_state,
@@ -746,6 +784,9 @@ impl Store {
                     status.power_mode,
                     status.power_mode_since,
                     status.updated_at,
+                    status.config_goals,
+                    status.config_auto_pause_secs,
+                    status.config_loaded_at,
                 ],
             )
             .context("upsert daemon_status")?;
@@ -758,7 +799,8 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT connected, presence_state, last_connected_at, last_disconnected_at,
-                        power_mode, power_mode_since, updated_at
+                        power_mode, power_mode_since, updated_at,
+                        config_goals, config_auto_pause_secs, config_loaded_at
                  FROM daemon_status WHERE id = 0",
                 [],
                 |row| {
@@ -770,6 +812,9 @@ impl Store {
                         power_mode: row.get(4)?,
                         power_mode_since: row.get(5)?,
                         updated_at: row.get(6)?,
+                        config_goals: row.get(7)?,
+                        config_auto_pause_secs: row.get(8)?,
+                        config_loaded_at: row.get(9)?,
                     })
                 },
             )
@@ -1326,12 +1371,22 @@ mod tests {
             power_mode: "ac_scanning".to_string(),
             power_mode_since: "2026-07-05T09:00:00+00:00".to_string(),
             updated_at: "2026-07-05T10:00:01+00:00".to_string(),
+            config_goals: Some("8500,10750,13000".to_string()),
+            config_auto_pause_secs: Some(300),
+            config_loaded_at: Some("2026-07-05T09:59:00+00:00".to_string()),
         };
         store.upsert_daemon_status(&status).unwrap();
 
         let read_back = store.daemon_status().unwrap().expect("status row present");
         assert!(read_back.connected);
         assert_eq!(read_back.presence_state.as_deref(), Some("Walking"));
+        // Loaded-config snapshot round-trips (задача 022).
+        assert_eq!(read_back.config_goals.as_deref(), Some("8500,10750,13000"));
+        assert_eq!(read_back.config_auto_pause_secs, Some(300));
+        assert_eq!(
+            read_back.config_loaded_at.as_deref(),
+            Some("2026-07-05T09:59:00+00:00")
+        );
 
         // Second upsert overwrites in place — still exactly one row (id=0).
         let status2 = DaemonStatus {

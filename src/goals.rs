@@ -42,16 +42,23 @@ pub const DEFAULT_AUTO_PAUSE_MINUTES: i64 = 5;
 /// (lowest kept) with a WARN.
 const MAX_GOALS: usize = 3;
 
-/// Optional environment variable to point at a goals config in a non-standard
+/// Optional environment variable to point at the config in a non-standard
 /// location (tests, or a user who does not want the `$HOME`-default path).
-/// Normally unset — the `$HOME`-anchored default is used.
-const CONFIG_ENV: &str = "TREADMILL_GOALS_CONFIG";
+/// Normally unset — the `$HOME`-anchored default is used. `TREADMILL_GOALS_CONFIG`
+/// stays honored as a legacy fallback (задача 021).
+const CONFIG_ENV: &str = "TREADMILL_CONFIG";
+const CONFIG_ENV_LEGACY: &str = "TREADMILL_GOALS_CONFIG";
 
 /// Per-user config path relative to `$HOME`. `$HOME`-anchored (not cwd) because
 /// the daemon runs under launchd with no reliable working directory — same
 /// reasoning as `store::open`. Users own this file (a personal dotfiles repo
 /// typically symlinks it here); it is intentionally NOT committed to this repo.
-const HOME_CONFIG_RELPATH: &str = ".config/treadmill-bluetooth-macos/goals.json";
+/// Renamed from `goals.json` (задача 021): the file holds goals + workout-gap +
+/// auto-pause, so `config.json` fits better than a goals-only name.
+const HOME_CONFIG_RELPATH: &str = ".config/treadmill-bluetooth-macos/config.json";
+/// Legacy filename, still read when the new `config.json` is absent so a
+/// not-yet-migrated install keeps working (задача 021).
+const HOME_CONFIG_RELPATH_LEGACY: &str = ".config/treadmill-bluetooth-macos/goals.json";
 
 /// One configured daily step goal, with its celebration intensity tier
 /// (1 = quietest, 3 = loudest) derived from its rank among the goals.
@@ -95,14 +102,41 @@ pub fn config_mtime() -> Option<SystemTime> {
     std::fs::metadata(&path).ok()?.modified().ok()
 }
 
-/// Resolve the config file path: explicit [`CONFIG_ENV`] override first, else
-/// the `$HOME`-anchored default. `None` only when `$HOME` is unset.
+/// Resolve the config file path (задача 021): explicit env override first (new
+/// [`CONFIG_ENV`], then legacy [`CONFIG_ENV_LEGACY`]), else the `$HOME`-anchored
+/// path via [`resolve_config_path`] (prefers `config.json`, falls back to a
+/// pre-existing legacy `goals.json`). `None` only when `$HOME` is unset. Silent
+/// by design — it runs on the hot `widget` poll; the `load_*` callers own the
+/// fallback/anomaly logging.
 fn config_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var(CONFIG_ENV) {
         return Some(PathBuf::from(path));
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(HOME_CONFIG_RELPATH))
+    if let Ok(path) = std::env::var(CONFIG_ENV_LEGACY) {
+        return Some(PathBuf::from(path));
+    }
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    Some(resolve_config_path(&home, |p| p.exists()))
+}
+
+/// Pure `$HOME`-relative resolution: prefer `config.json`; if it does not exist
+/// but the legacy `goals.json` does, use the legacy file; otherwise default to
+/// the new `config.json` (even absent), so "no file" messages name the new path.
+/// `exists` is injected so the preference logic is unit-testable without touching
+/// the filesystem or env (задача 021).
+fn resolve_config_path(
+    home: &std::path::Path,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> PathBuf {
+    let preferred = home.join(HOME_CONFIG_RELPATH);
+    if exists(&preferred) {
+        return preferred;
+    }
+    let legacy = home.join(HOME_CONFIG_RELPATH_LEGACY);
+    if exists(&legacy) {
+        return legacy;
+    }
+    preferred
 }
 
 /// Read and parse `{ "goals": [8000, 10000, 12000] }`. Returns `None` on any
@@ -489,6 +523,21 @@ mod tests {
         for f in [good, absent, zero, neg, str_val, junk] {
             std::fs::remove_file(f).ok();
         }
+    }
+
+    #[test]
+    fn resolve_config_path_prefers_new_then_falls_back_to_legacy() {
+        let home = std::path::Path::new("/home/x");
+        let new_path = home.join(HOME_CONFIG_RELPATH);
+        let legacy_path = home.join(HOME_CONFIG_RELPATH_LEGACY);
+
+        // Neither file exists → default to the new config.json.
+        assert_eq!(resolve_config_path(home, |_| false), new_path);
+        // Only the legacy goals.json exists → use it (not-yet-migrated install).
+        let legacy_only = |p: &std::path::Path| p == legacy_path;
+        assert_eq!(resolve_config_path(home, legacy_only), legacy_path);
+        // config.json exists (regardless of legacy) → prefer the new name.
+        assert_eq!(resolve_config_path(home, |_| true), new_path);
     }
 
     #[test]

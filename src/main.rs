@@ -489,6 +489,32 @@ fn run_status() -> Result<()> {
                 );
             }
 
+            // Config the daemon currently holds in memory (задача 022): answers
+            // "what's loaded right now" and "when did it last read the file".
+            // Only printed once a 022-aware daemon has written the snapshot
+            // (older rows leave these columns NULL).
+            if let Some(loaded_at) = &status.config_loaded_at {
+                let goals_desc = status
+                    .config_goals
+                    .as_deref()
+                    .map(format_goal_list)
+                    .unwrap_or_else(|| "—".to_string());
+                let auto_pause = match status.config_auto_pause_secs {
+                    Some(secs) => format_secs_short(secs),
+                    None => "off".to_string(),
+                };
+                println!(
+                    "config (in daemon): goals {goals_desc} · auto-pause {auto_pause} · read {}",
+                    describe_timestamp(loaded_at)
+                );
+                // The workout-gap is read-time (задача 014) — the CLI resolves it
+                // itself, the daemon does not hold it; shown here for completeness.
+                println!(
+                    "  workout gap: {}m (read-time, applied when stats are read)",
+                    goals::load_workout_gap_minutes()
+                );
+            }
+
             match DateTime::parse_from_rfc3339(&status.updated_at) {
                 Ok(updated_at) => {
                     let stale_s = (Utc::now() - updated_at.with_timezone(&Utc)).num_seconds();
@@ -652,6 +678,24 @@ fn widget_state(presence_state: Option<&str>) -> &'static str {
 }
 
 /// `now (Xm ago)`-style rendering of an RFC3339 timestamp in local time.
+/// Render a comma-joined goal list ("8500,10750,13000") for `status`
+/// ("8500 / 10750 / 13000"). Kept as the stored CSV in `daemon_status` so the
+/// daemon does not couple to a display format (задача 022).
+fn format_goal_list(csv: &str) -> String {
+    csv.split(',').collect::<Vec<_>>().join(" / ")
+}
+
+/// Compact duration for the config line (задача 022): whole minutes as `5m`,
+/// anything else as raw seconds (`90s`). Auto-pause is always whole minutes, so
+/// the seconds branch is just a defensive fallback.
+fn format_secs_short(secs: i64) -> String {
+    if secs % 60 == 0 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
 fn describe_timestamp(rfc3339: &str) -> String {
     match DateTime::parse_from_rfc3339(rfc3339) {
         Ok(dt) => {
