@@ -83,11 +83,16 @@ echo "release: pushed ${tag}"
 # --- watch the Release workflow --------------------------------------------
 if command -v gh >/dev/null 2>&1; then
   echo "release: waiting for the Release workflow to pick up ${tag}…"
+  # Match the run for THIS tag by its ref (headBranch), not just any push-event
+  # release run — otherwise the previous release's run is grabbed before the new
+  # one registers (found by dogfooding v0.2.0). The run takes a few seconds to
+  # appear after the tag push, so poll.
   run_id=""
   for _ in {1..10}; do
-    run_id="$(gh run list --workflow=release.yml -L 1 --json databaseId,event \
-      --jq '.[] | select(.event == "push") | .databaseId' 2>/dev/null || true)"
-    [[ -n "$run_id" ]] && break
+    run_id="$(gh run list --workflow=release.yml -L 20 --json databaseId,headBranch \
+      --jq "[.[] | select(.headBranch == \"${tag}\")][0].databaseId" 2>/dev/null || true)"
+    [[ -n "$run_id" && "$run_id" != "null" ]] && break
+    run_id=""
     sleep 6
   done
   if [[ -n "$run_id" ]]; then
