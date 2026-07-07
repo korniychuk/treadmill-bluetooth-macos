@@ -3,7 +3,7 @@
 //! Up to three goals (default 8000 / 10000 / 12000) each fire exactly one
 //! celebratory toast per calendar day when today's cumulative steps cross the
 //! threshold. This module owns three orthogonal, individually-testable pieces:
-//! loading/resolving the JSON config, mapping thresholds to celebration tiers,
+//! loading/resolving the TOML config, mapping thresholds to celebration tiers,
 //! and the pure crossing decision. Persisting *which* goals were already
 //! celebrated today (restart safety) lives in [`crate::store`]; delivering the
 //! toast lives in [`crate::notify`].
@@ -44,21 +44,16 @@ const MAX_GOALS: usize = 3;
 
 /// Optional environment variable to point at the config in a non-standard
 /// location (tests, or a user who does not want the `$HOME`-default path).
-/// Normally unset — the `$HOME`-anchored default is used. `TREADMILL_GOALS_CONFIG`
-/// stays honored as a legacy fallback (задача 021).
+/// Normally unset — the `$HOME`-anchored default is used.
 const CONFIG_ENV: &str = "TREADMILL_CONFIG";
-const CONFIG_ENV_LEGACY: &str = "TREADMILL_GOALS_CONFIG";
 
 /// Per-user config path relative to `$HOME`. `$HOME`-anchored (not cwd) because
 /// the daemon runs under launchd with no reliable working directory — same
 /// reasoning as `store::open`. Users own this file (a personal dotfiles repo
 /// typically symlinks it here); it is intentionally NOT committed to this repo.
-/// Renamed from `goals.json` (задача 021): the file holds goals + workout-gap +
-/// auto-pause, so `config.json` fits better than a goals-only name.
-const HOME_CONFIG_RELPATH: &str = ".config/treadmill-bluetooth-macos/config.json";
-/// Legacy filename, still read when the new `config.json` is absent so a
-/// not-yet-migrated install keeps working (задача 021).
-const HOME_CONFIG_RELPATH_LEGACY: &str = ".config/treadmill-bluetooth-macos/goals.json";
+/// TOML since задача 023 (was JSON `config.json`/`goals.json`): comments let the
+/// example config document each key's default inline.
+const HOME_CONFIG_RELPATH: &str = ".config/treadmill-bluetooth-macos/config.toml";
 
 /// One configured daily step goal, with its celebration intensity tier
 /// (1 = quietest, 3 = loudest) derived from its rank among the goals.
@@ -69,7 +64,7 @@ pub struct Goal {
 }
 
 /// Load the configured goals, falling back to [`DEFAULT_THRESHOLDS`] on any
-/// problem (missing file, unreadable, malformed JSON, no usable thresholds).
+/// problem (missing file, unreadable, malformed TOML, no usable thresholds).
 /// Every fallback path logs a WARN — a silently-wrong goal set would be hard
 /// to diagnose later.
 pub fn load_goals() -> Vec<Goal> {
@@ -102,52 +97,27 @@ pub fn config_mtime() -> Option<SystemTime> {
     std::fs::metadata(&path).ok()?.modified().ok()
 }
 
-/// Resolve the config file path (задача 021): explicit env override first (new
-/// [`CONFIG_ENV`], then legacy [`CONFIG_ENV_LEGACY`]), else the `$HOME`-anchored
-/// path via [`resolve_config_path`] (prefers `config.json`, falls back to a
-/// pre-existing legacy `goals.json`). `None` only when `$HOME` is unset. Silent
-/// by design — it runs on the hot `widget` poll; the `load_*` callers own the
-/// fallback/anomaly logging.
+/// Resolve the config file path: explicit [`CONFIG_ENV`] override first, else
+/// the `$HOME`-anchored [`HOME_CONFIG_RELPATH`]. `None` only when `$HOME` is
+/// unset (and no override). Since задача 023 there is a single TOML path — the
+/// transitional JSON/`goals.json` fallbacks were dropped.
 fn config_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var(CONFIG_ENV) {
         return Some(PathBuf::from(path));
     }
-    if let Ok(path) = std::env::var(CONFIG_ENV_LEGACY) {
-        return Some(PathBuf::from(path));
-    }
-    let home = PathBuf::from(std::env::var_os("HOME")?);
-    Some(resolve_config_path(&home, |p| p.exists()))
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(HOME_CONFIG_RELPATH))
 }
 
-/// Pure `$HOME`-relative resolution: prefer `config.json`; if it does not exist
-/// but the legacy `goals.json` does, use the legacy file; otherwise default to
-/// the new `config.json` (even absent), so "no file" messages name the new path.
-/// `exists` is injected so the preference logic is unit-testable without touching
-/// the filesystem or env (задача 021).
-fn resolve_config_path(
-    home: &std::path::Path,
-    exists: impl Fn(&std::path::Path) -> bool,
-) -> PathBuf {
-    let preferred = home.join(HOME_CONFIG_RELPATH);
-    if exists(&preferred) {
-        return preferred;
-    }
-    let legacy = home.join(HOME_CONFIG_RELPATH_LEGACY);
-    if exists(&legacy) {
-        return legacy;
-    }
-    preferred
-}
-
-/// Read and parse `{ "goals": [8000, 10000, 12000] }`. Returns `None` on any
+/// Read and parse TOML `goals = [8000, 10000, 12000]`. Returns `None` on any
 /// failure so the caller can fall back to defaults and log once.
 fn read_thresholds(path: &std::path::Path) -> Option<Vec<i64>> {
     let raw = std::fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let value: toml::Value = toml::from_str(&raw).ok()?;
     let goals = value.get("goals")?.as_array()?;
     let thresholds: Vec<i64> = goals
         .iter()
-        .filter_map(|v| v.as_i64())
+        .filter_map(|v| v.as_integer())
         .filter(|&t| t > 0)
         .collect();
     (!thresholds.is_empty()).then_some(thresholds)
@@ -173,12 +143,12 @@ fn read_workout_gap_minutes(path: &std::path::Path) -> GapSetting {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return GapSetting::Invalid;
     };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+    let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
         return GapSetting::Invalid;
     };
     match value.get("workout_gap_minutes") {
         None => GapSetting::Unset,
-        Some(v) => match v.as_i64() {
+        Some(v) => match v.as_integer() {
             Some(n) if n > 0 => GapSetting::Configured(n),
             _ => GapSetting::Invalid,
         },
@@ -233,13 +203,13 @@ fn read_auto_pause_minutes(path: &std::path::Path) -> AutoPauseSetting {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return AutoPauseSetting::Invalid;
     };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+    let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
         return AutoPauseSetting::Invalid;
     };
     match value.get("auto_pause_minutes") {
         None => AutoPauseSetting::Unset,
         // `0` disables (kept), negatives/non-integers are a config mistake.
-        Some(v) => match v.as_i64() {
+        Some(v) => match v.as_integer() {
             Some(n) if n >= 0 => AutoPauseSetting::Configured(n),
             _ => AutoPauseSetting::Invalid,
         },
@@ -458,8 +428,8 @@ mod tests {
         // as the committed config) can't disguise a parse regression.
         let dir = std::env::temp_dir().join(format!("tm-goals-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("goals.json");
-        std::fs::write(&path, r#"{ "goals": [5000, 7000] }"#).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "goals = [5000, 7000]\n").unwrap();
 
         let parsed = read_thresholds(&path);
         std::fs::remove_file(&path).ok();
@@ -471,19 +441,19 @@ mod tests {
     fn read_thresholds_rejects_junk_and_empty() {
         let dir = std::env::temp_dir().join(format!("tm-goals-junk-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let bad = dir.join("bad.json");
-        std::fs::write(&bad, "not json at all").unwrap();
+        let bad = dir.join("bad.toml");
+        std::fs::write(&bad, "not valid toml at all").unwrap();
         assert_eq!(
             read_thresholds(&bad),
             None,
-            "malformed JSON → None (caller uses defaults)"
+            "malformed TOML → None (caller uses defaults)"
         );
 
-        let empty = dir.join("empty.json");
-        std::fs::write(&empty, r#"{ "goals": [] }"#).unwrap();
+        let empty = dir.join("empty.toml");
+        std::fs::write(&empty, "goals = []\n").unwrap();
         assert_eq!(read_thresholds(&empty), None, "no usable thresholds → None");
 
-        let missing = dir.join("does-not-exist.json");
+        let missing = dir.join("does-not-exist.toml");
         assert_eq!(read_thresholds(&missing), None, "missing file → None");
 
         std::fs::remove_file(&bad).ok();
@@ -495,29 +465,29 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tm-gap-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let good = dir.join("good.json");
-        std::fs::write(&good, r#"{ "goals": [8000], "workout_gap_minutes": 20 }"#).unwrap();
+        let good = dir.join("good.toml");
+        std::fs::write(&good, "goals = [8000]\nworkout_gap_minutes = 20\n").unwrap();
         assert_eq!(read_workout_gap_minutes(&good), GapSetting::Configured(20));
 
         // Key absent — normal for a config written before задача 014.
-        let absent = dir.join("absent.json");
-        std::fs::write(&absent, r#"{ "goals": [8000] }"#).unwrap();
+        let absent = dir.join("absent.toml");
+        std::fs::write(&absent, "goals = [8000]\n").unwrap();
         assert_eq!(read_workout_gap_minutes(&absent), GapSetting::Unset);
 
         // Present but not a positive integer → Invalid (caller WARNs + defaults).
-        let zero = dir.join("zero.json");
-        std::fs::write(&zero, r#"{ "workout_gap_minutes": 0 }"#).unwrap();
+        let zero = dir.join("zero.toml");
+        std::fs::write(&zero, "workout_gap_minutes = 0\n").unwrap();
         assert_eq!(read_workout_gap_minutes(&zero), GapSetting::Invalid);
-        let neg = dir.join("neg.json");
-        std::fs::write(&neg, r#"{ "workout_gap_minutes": -5 }"#).unwrap();
+        let neg = dir.join("neg.toml");
+        std::fs::write(&neg, "workout_gap_minutes = -5\n").unwrap();
         assert_eq!(read_workout_gap_minutes(&neg), GapSetting::Invalid);
-        let str_val = dir.join("str.json");
-        std::fs::write(&str_val, r#"{ "workout_gap_minutes": "15" }"#).unwrap();
+        let str_val = dir.join("str.toml");
+        std::fs::write(&str_val, "workout_gap_minutes = \"15\"\n").unwrap();
         assert_eq!(read_workout_gap_minutes(&str_val), GapSetting::Invalid);
 
-        // Malformed JSON → Invalid.
-        let junk = dir.join("junk.json");
-        std::fs::write(&junk, "not json").unwrap();
+        // Malformed TOML → Invalid.
+        let junk = dir.join("junk.toml");
+        std::fs::write(&junk, "not valid toml").unwrap();
         assert_eq!(read_workout_gap_minutes(&junk), GapSetting::Invalid);
 
         for f in [good, absent, zero, neg, str_val, junk] {
@@ -526,54 +496,39 @@ mod tests {
     }
 
     #[test]
-    fn resolve_config_path_prefers_new_then_falls_back_to_legacy() {
-        let home = std::path::Path::new("/home/x");
-        let new_path = home.join(HOME_CONFIG_RELPATH);
-        let legacy_path = home.join(HOME_CONFIG_RELPATH_LEGACY);
-
-        // Neither file exists → default to the new config.json.
-        assert_eq!(resolve_config_path(home, |_| false), new_path);
-        // Only the legacy goals.json exists → use it (not-yet-migrated install).
-        let legacy_only = |p: &std::path::Path| p == legacy_path;
-        assert_eq!(resolve_config_path(home, legacy_only), legacy_path);
-        // config.json exists (regardless of legacy) → prefer the new name.
-        assert_eq!(resolve_config_path(home, |_| true), new_path);
-    }
-
-    #[test]
     fn read_auto_pause_minutes_distinguishes_configured_disabled_absent_and_invalid() {
         let dir = std::env::temp_dir().join(format!("tm-autopause-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let good = dir.join("good.json");
-        std::fs::write(&good, r#"{ "goals": [8000], "auto_pause_minutes": 7 }"#).unwrap();
+        let good = dir.join("good.toml");
+        std::fs::write(&good, "goals = [8000]\nauto_pause_minutes = 7\n").unwrap();
         assert_eq!(
             read_auto_pause_minutes(&good),
             AutoPauseSetting::Configured(7)
         );
 
         // 0 is a valid value here — it disables auto-pause (not Invalid).
-        let disabled = dir.join("disabled.json");
-        std::fs::write(&disabled, r#"{ "auto_pause_minutes": 0 }"#).unwrap();
+        let disabled = dir.join("disabled.toml");
+        std::fs::write(&disabled, "auto_pause_minutes = 0\n").unwrap();
         assert_eq!(
             read_auto_pause_minutes(&disabled),
             AutoPauseSetting::Configured(0),
         );
 
         // Key absent — normal for a config written before задача 020.
-        let absent = dir.join("absent.json");
-        std::fs::write(&absent, r#"{ "goals": [8000] }"#).unwrap();
+        let absent = dir.join("absent.toml");
+        std::fs::write(&absent, "goals = [8000]\n").unwrap();
         assert_eq!(read_auto_pause_minutes(&absent), AutoPauseSetting::Unset);
 
         // Negative / non-integer → Invalid (caller WARNs + defaults).
-        let neg = dir.join("neg.json");
-        std::fs::write(&neg, r#"{ "auto_pause_minutes": -3 }"#).unwrap();
+        let neg = dir.join("neg.toml");
+        std::fs::write(&neg, "auto_pause_minutes = -3\n").unwrap();
         assert_eq!(read_auto_pause_minutes(&neg), AutoPauseSetting::Invalid);
-        let str_val = dir.join("str.json");
-        std::fs::write(&str_val, r#"{ "auto_pause_minutes": "5" }"#).unwrap();
+        let str_val = dir.join("str.toml");
+        std::fs::write(&str_val, "auto_pause_minutes = \"5\"\n").unwrap();
         assert_eq!(read_auto_pause_minutes(&str_val), AutoPauseSetting::Invalid);
-        let junk = dir.join("junk.json");
-        std::fs::write(&junk, "not json").unwrap();
+        let junk = dir.join("junk.toml");
+        std::fs::write(&junk, "not valid toml").unwrap();
         assert_eq!(read_auto_pause_minutes(&junk), AutoPauseSetting::Invalid);
 
         for f in [good, disabled, absent, neg, str_val, junk] {

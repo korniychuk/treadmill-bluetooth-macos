@@ -154,16 +154,19 @@ xattr -d com.apple.quarantine ./treadmill-bluetooth-macos
 
 ## ⚙️ Configuration
 
-Per-user config lives **outside this repo**, at:
+Per-user config (TOML) lives **outside this repo**, at:
 
 ```
-~/.config/treadmill-bluetooth-macos/config.json
+~/.config/treadmill-bluetooth-macos/config.toml
 ```
 
-Copy [`config/config.example.json`](./config/config.example.json) there and edit it:
+Copy [`config/config.example.toml`](./config/config.example.toml) there and edit it
+(every key is optional; the example documents each default as a commented line):
 
-```json
-{ "goals": [8000, 10000, 12000], "workout_gap_minutes": 15, "auto_pause_minutes": 5 }
+```toml
+goals = [8000, 10000, 12000]
+# workout_gap_minutes = 15
+# auto_pause_minutes = 5
 ```
 
 - 🎯 `goals` — up to 3 thresholds; each is celebrated once per day with a toast.
@@ -174,11 +177,12 @@ Copy [`config/config.example.json`](./config/config.example.json) there and edit
   keep running while nobody is walking (you stepped off) before the daemon pauses
   it; the machine's own shutoff then powers it down.
 
-Edits are **hot-reloaded** by the daemon within ~5s (see [`docs/tasks/017`](./docs/tasks/017-hot-reload-goals-config.md)).
+Edits are **hot-reloaded** by the daemon within ~5s while it is connected to the
+treadmill (see [`docs/tasks/017`](./docs/tasks/017-hot-reload-goals-config.md)).
 A missing file is fine (built-in defaults `[8000, 10000, 12000]`); a malformed
 file logs a WARN and falls back to defaults. Override the path with the
-`TREADMILL_CONFIG` env var (the legacy `TREADMILL_GOALS_CONFIG` and an existing
-`goals.json` are still honored as fallbacks).
+`TREADMILL_CONFIG` env var. `tm status` shows the config the daemon currently
+has loaded and when it last read it.
 
 ## 🖥️ tmux status-bar widget
 

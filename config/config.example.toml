@@ -1,0 +1,23 @@
+# treadmill-bluetooth-macos — per-user config.
+#
+# Lives OUTSIDE this repo at ~/.config/treadmill-bluetooth-macos/config.toml
+# (bring your own, e.g. symlinked from a personal dotfiles repo). Every key is
+# optional; the commented lines below show the built-in default for each — copy
+# a line, uncomment it, and change the value to override.
+#
+# Edits are hot-reloaded by the daemon within ~5s while it is connected to the
+# treadmill (no restart needed).
+
+# Daily step goals (up to 3). Each is celebrated once per day with a toast,
+# graduated by rank (lowest = quietest). This is the only key most people set.
+goals = [8000, 10000, 12000]
+
+# Merge activity segments closer than this many minutes into one displayed
+# workout. Read-time and retroactive — changing it re-groups history with no
+# recompute.
+# workout_gap_minutes = 15
+
+# Auto-pause the belt once it has run this many minutes with nobody walking
+# (you stepped off but the belt kept going). 0 disables auto-pause entirely.
+# After the pause the treadmill's own built-in shutoff powers it down.
+# auto_pause_minutes = 5

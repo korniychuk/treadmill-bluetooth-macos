@@ -103,7 +103,7 @@ cat > "$plist" <<EOF
         <key>RUST_LOG</key>
         <string>treadmill_bluetooth_macos=info,warn</string>
         <!-- Config is read from a per-user file under $HOME
-             (~/.config/treadmill-bluetooth-macos/config.json); no env needed.
+             (~/.config/treadmill-bluetooth-macos/config.toml); no env needed.
              Set TREADMILL_CONFIG here only to override that path. -->
     </dict>
 </dict>
