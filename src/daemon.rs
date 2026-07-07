@@ -180,6 +180,13 @@ const CONTROL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// 5s is a snappy pickup latency for a config edit while negligible in cost.
 const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
 
+/// After a *failed* idle-belt auto-pause write (задача 020), how long to wait
+/// before retrying while the operator is still away. Long enough not to hammer a
+/// wedged Control Point every telemetry sample (~1/s), short enough that a
+/// transient BLE glitch does not leave the belt running idle for the whole away
+/// spell. A *successful* pause is one-shot per spell (no cooldown needed).
+const AUTO_PAUSE_RETRY_COOLDOWN: Duration = Duration::from_secs(15);
+
 /// Run the daemon forever: scan → connect → stream with presence tracking →
 /// on disconnect, toast and go back to scanning. Reacts to power/sleep
 /// events instead of polling — see module docs.
@@ -394,6 +401,17 @@ async fn stream_with_presence(
     // that sleeps mid-away drops the BLE link and re-enters here fresh anyway.
     let mut away_since: Option<Instant> = None;
     let mut paused_since: Option<Instant> = None;
+    // Idle-belt auto-pause (задача 020): pause a belt left running while the
+    // operator is away past a configured threshold, so the machine's own
+    // built-in shutoff can then power it down. `auto_pause_threshold` is `None`
+    // when disabled and is hot-reloaded on the goals-config mtime watch below
+    // (задача 017). `auto_pause_fired` is whether we already paused the current
+    // away spell (reset when a fresh spell begins); `auto_pause_last_attempt`
+    // gates retries after a failed write by `AUTO_PAUSE_RETRY_COOLDOWN`.
+    let mut auto_pause_threshold = goals::load_auto_pause();
+    info!(?auto_pause_threshold, "loaded idle-belt auto-pause threshold");
+    let mut auto_pause_fired = false;
+    let mut auto_pause_last_attempt: Option<Instant> = None;
     // Recent (timestamp, belt speed) samples, used to estimate the walking
     // ("cruising") speed to restore on resume — snapshotted when a pause begins.
     // The machine resets the belt to a crawl (~0.5 km/h) after a pause, and it
@@ -509,6 +527,11 @@ async fn stream_with_presence(
                     match next_state {
                         PresenceState::AwayWhileRunning => {
                             away_since = Some(Instant::now());
+                            // Arm a fresh auto-pause spell (задача 020): each new
+                            // absence gets its own threshold countdown and one
+                            // guaranteed attempt, independent of prior spells.
+                            auto_pause_fired = false;
+                            auto_pause_last_attempt = None;
                             notify::walker_away();
                         }
                         PresenceState::Walking if prev_state == PresenceState::AwayWhileRunning => {
@@ -553,7 +576,13 @@ async fn stream_with_presence(
                             // last non-zero sample for a too-short session.
                             pre_pause_speed =
                                 cruising_speed(speed_history.make_contiguous(), Instant::now()).or(last_walking_speed);
-                            notify::treadmill_paused();
+                            // Suppress the generic "Paused" toast when this pause
+                            // is our own auto-pause: the belt going to 0 after our
+                            // Stop transitions AwayWhileRunning→Paused, and the
+                            // auto-pause toast already told the operator why (020).
+                            if !auto_pause_fired {
+                                notify::treadmill_paused();
+                            }
                         }
                         _ => {}
                     }
@@ -561,6 +590,42 @@ async fn stream_with_presence(
                     // on any transition leaving Walking (Paused/AwayWhileRunning):
                     // the next credited step opens a fresh one, and read-time
                     // merge regroups by gap (задача 014). No DB write.
+                }
+
+                // Auto-pause an idle belt (задача 020). Checked every sample, not
+                // just on transition: staying AwayWhileRunning fires none, so the
+                // threshold must be polled while the state persists. Pure decision,
+                // then the same bounded Control-Point round-trip as the command
+                // queue — a failed/timed-out write is logged and retried after a
+                // cooldown, never tears down the session.
+                if accumulator.state() == PresenceState::AwayWhileRunning {
+                    let away_for = away_duration(away_since).unwrap_or_default();
+                    let since_last_attempt = auto_pause_last_attempt.map(|t| t.elapsed());
+                    if auto_pause_due(auto_pause_threshold, away_for, auto_pause_fired, since_last_attempt) {
+                        match tokio::time::timeout(
+                            SPEED_RESTORE_TIMEOUT,
+                            execute_control_command(peripheral, ControlCommand::Stop),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {
+                                info!(away_s = away_for.as_secs(), "auto-paused idle belt after inactivity threshold");
+                                auto_pause_fired = true;
+                                notify::auto_paused(away_for);
+                            }
+                            Ok(Err(err)) => {
+                                warn!(%err, "auto-pause Control Point write failed — retrying after cooldown");
+                                auto_pause_last_attempt = Some(Instant::now());
+                            }
+                            Err(_) => {
+                                warn!(
+                                    timeout_s = SPEED_RESTORE_TIMEOUT.as_secs(),
+                                    "auto-pause timed out (possible CoreBluetooth hang) — retrying after cooldown"
+                                );
+                                auto_pause_last_attempt = Some(Instant::now());
+                            }
+                        }
+                    }
                 }
 
                 // Credit this sample. `Utc::now()` matches the timestamp already
@@ -593,6 +658,13 @@ async fn stream_with_presence(
                     if reloaded != *step_goals {
                         info!(goals = ?reloaded, "goals config changed on disk — reloaded without a daemon restart");
                         *step_goals = reloaded;
+                    }
+                    // Same mtime gate reloads the idle-belt auto-pause threshold
+                    // (задача 020) — an edit takes effect without a restart.
+                    let reloaded_auto_pause = goals::load_auto_pause();
+                    if reloaded_auto_pause != auto_pause_threshold {
+                        info!(?reloaded_auto_pause, "auto-pause threshold changed on disk — reloaded without a daemon restart");
+                        auto_pause_threshold = reloaded_auto_pause;
                     }
                 }
             }
@@ -654,6 +726,35 @@ fn cruising_speed(samples: &[(Instant, f32)], pause_at: Instant) -> Option<f32> 
 /// and unit-tested — the BLE write lives in [`restore_speed`].
 fn speed_restore_target(pre_pause_kmh: f32, resumed_kmh: f32) -> Option<f32> {
     (pre_pause_kmh > resumed_kmh + SPEED_RESTORE_EPSILON_KMH).then_some(pre_pause_kmh)
+}
+
+/// Whether to send an idle-belt auto-pause right now (задача 020). Pure so the
+/// policy is unit-testable without a clock or BLE. `threshold` is `None` when
+/// auto-pause is disabled; `away_for` is the honest belt-ran-idle duration (see
+/// [`away_duration`]); `fired` is whether we already paused this away spell;
+/// `since_last_attempt` is how long ago the last *failed* attempt was (`None`
+/// if none yet), gating retries by [`AUTO_PAUSE_RETRY_COOLDOWN`] so a wedged
+/// Control Point is not hammered every telemetry sample.
+fn auto_pause_due(
+    threshold: Option<Duration>,
+    away_for: Duration,
+    fired: bool,
+    since_last_attempt: Option<Duration>,
+) -> bool {
+    let Some(threshold) = threshold else {
+        return false; // disabled via config (auto_pause_minutes = 0)
+    };
+    if fired {
+        return false; // already paused for this away spell
+    }
+    if away_for < threshold {
+        return false; // not idle long enough yet
+    }
+    match since_last_attempt {
+        // Cooling down after a failed write — don't retry every ~1s sample.
+        Some(elapsed) if elapsed < AUTO_PAUSE_RETRY_COOLDOWN => false,
+        _ => true,
+    }
 }
 
 /// Best-effort restore of the pre-pause belt speed on a pause→walk resume
@@ -1143,6 +1244,44 @@ mod tests {
             (pause - Duration::from_secs(2), 0.6),
         ];
         assert_eq!(cruising_speed(&samples, pause), None);
+    }
+
+    #[test]
+    fn auto_pause_due_is_off_when_disabled_or_already_fired() {
+        let away = Duration::from_secs(600);
+        // Disabled (no threshold) → never fires regardless of how long away.
+        assert!(!auto_pause_due(None, away, false, None));
+        // Already paused this spell → never re-fires until a fresh spell resets it.
+        assert!(!auto_pause_due(Some(Duration::from_secs(300)), away, true, None));
+    }
+
+    #[test]
+    fn auto_pause_due_waits_for_threshold_then_fires() {
+        let threshold = Some(Duration::from_secs(300));
+        // Below threshold → not yet.
+        assert!(!auto_pause_due(threshold, Duration::from_secs(299), false, None));
+        // At the threshold with no prior attempt → fire.
+        assert!(auto_pause_due(threshold, Duration::from_secs(300), false, None));
+    }
+
+    #[test]
+    fn auto_pause_due_cooldown_gates_retries_after_a_failure() {
+        let threshold = Some(Duration::from_secs(300));
+        let away = Duration::from_secs(400);
+        // A failed attempt 5s ago is inside the cooldown → wait.
+        assert!(!auto_pause_due(
+            threshold,
+            away,
+            false,
+            Some(Duration::from_secs(5))
+        ));
+        // Past the cooldown → retry.
+        assert!(auto_pause_due(
+            threshold,
+            away,
+            false,
+            Some(AUTO_PAUSE_RETRY_COOLDOWN + Duration::from_secs(1))
+        ));
     }
 
     #[test]

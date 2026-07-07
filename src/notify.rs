@@ -150,6 +150,21 @@ pub fn treadmill_paused() {
     toast("Treadmill", "Paused");
 }
 
+/// Fired when the daemon auto-pauses an idle belt (задача 020): it ran
+/// `AwayWhileRunning` for `away` (nobody walking) past the configured threshold,
+/// so we sent a Control-Point pause. The machine's own built-in shutoff powers
+/// it down from here. Replaces the generic "Paused" toast for this case (the
+/// daemon suppresses that follow-up), so the operator sees why it stopped.
+pub fn auto_paused(away: Duration) {
+    toast(
+        "Treadmill",
+        &format!(
+            "Auto-paused — belt ran idle {} after you stepped off",
+            humanize_short(away)
+        ),
+    );
+}
+
 /// A belt-speed restore performed on resume (задача 012, Task D): the machine
 /// reset to `from_kmh` on pause-resume and we re-sent `to_kmh` (the pre-pause
 /// walking speed) over the FTMS Control Point.
