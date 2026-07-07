@@ -6,6 +6,32 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Idle-belt auto-pause: when the belt keeps running with nobody walking (you
+  stepped off), the daemon pauses it after `auto_pause_minutes` (default 5, `0`
+  disables); the treadmill's own shutoff then powers it down.
+- `tm status` now shows the config the daemon currently has loaded (goals,
+  auto-pause) and when it last read the config file.
+
+### Changed
+
+- **Config is now TOML** at `~/.config/treadmill-bluetooth-macos/config.toml`
+  (was JSON `goals.json`). TOML lets the example config document each key's
+  default as a comment. The file already held more than goals (workout gap,
+  auto-pause), so the name changed too.
+
+### Removed
+
+- JSON config support and the transitional `goals.json` filename /
+  `TREADMILL_GOALS_CONFIG` env fallbacks — config is TOML-only.
+
+### Migration
+
+- Rename `~/.config/treadmill-bluetooth-macos/goals.json` → `config.toml` and
+  convert it to TOML, e.g. `goals = [8000, 10000, 12000]` with optional
+  `workout_gap_minutes` / `auto_pause_minutes`. See `config/config.example.toml`.
+
 ## [0.1.0] — 2026-07-06 — First public release
 
 First open-source release. macOS BLE connector for a Yesoul (FTMS) treadmill.

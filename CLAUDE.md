@@ -104,6 +104,7 @@ RUST_LOG=debug cargo run  # подробные логи (env-filter)
 scripts/install-daemon.sh    # собрать, подписать, поставить LaunchAgent (авто-старт при логине)
 scripts/uninstall-daemon.sh  # снять LaunchAgent (данные в Application Support не трогает)
 scripts/build-icon.sh        # перегенерировать macos/AppIcon.icns из SF Symbol (см. generate-icon.swift)
+scripts/release.sh 0.2.0     # выпустить релиз: бамп версии + дата CHANGELOG + коммит + тег + пуш → Release-workflow (задача 024)
 ```
 
 Короткий алиас `tm` — симлинк на release-бинарь в `~/.bin` (в `PATH`), чтобы
