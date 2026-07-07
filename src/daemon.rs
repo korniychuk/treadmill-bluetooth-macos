@@ -409,7 +409,10 @@ async fn stream_with_presence(
     // away spell (reset when a fresh spell begins); `auto_pause_last_attempt`
     // gates retries after a failed write by `AUTO_PAUSE_RETRY_COOLDOWN`.
     let mut auto_pause_threshold = goals::load_auto_pause();
-    info!(?auto_pause_threshold, "loaded idle-belt auto-pause threshold");
+    info!(
+        ?auto_pause_threshold,
+        "loaded idle-belt auto-pause threshold"
+    );
     let mut auto_pause_fired = false;
     let mut auto_pause_last_attempt: Option<Instant> = None;
     // Recent (timestamp, belt speed) samples, used to estimate the walking
@@ -1252,16 +1255,31 @@ mod tests {
         // Disabled (no threshold) → never fires regardless of how long away.
         assert!(!auto_pause_due(None, away, false, None));
         // Already paused this spell → never re-fires until a fresh spell resets it.
-        assert!(!auto_pause_due(Some(Duration::from_secs(300)), away, true, None));
+        assert!(!auto_pause_due(
+            Some(Duration::from_secs(300)),
+            away,
+            true,
+            None
+        ));
     }
 
     #[test]
     fn auto_pause_due_waits_for_threshold_then_fires() {
         let threshold = Some(Duration::from_secs(300));
         // Below threshold → not yet.
-        assert!(!auto_pause_due(threshold, Duration::from_secs(299), false, None));
+        assert!(!auto_pause_due(
+            threshold,
+            Duration::from_secs(299),
+            false,
+            None
+        ));
         // At the threshold with no prior attempt → fire.
-        assert!(auto_pause_due(threshold, Duration::from_secs(300), false, None));
+        assert!(auto_pause_due(
+            threshold,
+            Duration::from_secs(300),
+            false,
+            None
+        ));
     }
 
     #[test]

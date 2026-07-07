@@ -498,7 +498,10 @@ mod tests {
 
         let good = dir.join("good.json");
         std::fs::write(&good, r#"{ "goals": [8000], "auto_pause_minutes": 7 }"#).unwrap();
-        assert_eq!(read_auto_pause_minutes(&good), AutoPauseSetting::Configured(7));
+        assert_eq!(
+            read_auto_pause_minutes(&good),
+            AutoPauseSetting::Configured(7)
+        );
 
         // 0 is a valid value here — it disables auto-pause (not Invalid).
         let disabled = dir.join("disabled.json");
