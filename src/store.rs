@@ -125,6 +125,21 @@ pub struct DaemonStatus {
     /// has read it at least once this link (Polar devices only support Read,
     /// not notify, for this value — see `scan::read_hr_battery`).
     pub hr_battery_pct: Option<i64>,
+    /// Zone Hold snapshot (задача 027), same "daemon mirrors what it just
+    /// decided" pattern as the rest of this struct. `zone_hold_active` is true
+    /// only while the controller is actually driving speed corrections (ramp
+    /// or closed-loop) — not merely "enabled in config". `zone_hold_phase` is
+    /// one of `ramp`/`hold`/`frozen`/`grace`/`off`. `zone_hold_position`
+    /// (`below`/`in`/`above`) is what `tm widget`'s `HR_ZONE` field mirrors —
+    /// `None` unless `zone_hold_active` is true, so the widget only colours
+    /// the heart glyph while the controller is really in charge (§Индикация
+    /// зоны in the task doc).
+    pub zone_hold_active: bool,
+    pub zone_hold_target_lo: Option<i64>,
+    pub zone_hold_target_hi: Option<i64>,
+    pub zone_hold_last_speed: Option<f64>,
+    pub zone_hold_phase: Option<String>,
+    pub zone_hold_position: Option<String>,
 }
 
 /// Per-sample deltas against the persisted device baseline. Not yet a
@@ -322,6 +337,24 @@ impl Store {
         self.add_column_if_missing("ALTER TABLE daemon_status ADD COLUMN last_bpm INTEGER")?;
         self.add_column_if_missing("ALTER TABLE daemon_status ADD COLUMN last_bpm_ts INTEGER")?;
         self.add_column_if_missing("ALTER TABLE daemon_status ADD COLUMN hr_battery_pct INTEGER")?;
+
+        // Zone Hold snapshot columns (задача 027). `zone_hold_active` defaults
+        // to 0 (not active) so a pre-027 row reads as "not engaged" rather
+        // than NULL, mirroring `hr_connected` above.
+        self.add_column_if_missing(
+            "ALTER TABLE daemon_status ADD COLUMN zone_hold_active INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_column_if_missing(
+            "ALTER TABLE daemon_status ADD COLUMN zone_hold_target_lo INTEGER",
+        )?;
+        self.add_column_if_missing(
+            "ALTER TABLE daemon_status ADD COLUMN zone_hold_target_hi INTEGER",
+        )?;
+        self.add_column_if_missing(
+            "ALTER TABLE daemon_status ADD COLUMN zone_hold_last_speed REAL",
+        )?;
+        self.add_column_if_missing("ALTER TABLE daemon_status ADD COLUMN zone_hold_phase TEXT")?;
+        self.add_column_if_missing("ALTER TABLE daemon_status ADD COLUMN zone_hold_position TEXT")?;
         Ok(())
     }
 
@@ -886,8 +919,11 @@ impl Store {
                     (id, connected, presence_state, last_connected_at, last_disconnected_at,
                      power_mode, power_mode_since, updated_at,
                      config_goals, config_auto_pause_secs, config_loaded_at,
-                     hr_connected, last_bpm, last_bpm_ts, hr_battery_pct)
-                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                     hr_connected, last_bpm, last_bpm_ts, hr_battery_pct,
+                     zone_hold_active, zone_hold_target_lo, zone_hold_target_hi,
+                     zone_hold_last_speed, zone_hold_phase, zone_hold_position)
+                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                         ?15, ?16, ?17, ?18, ?19, ?20)
                  ON CONFLICT(id) DO UPDATE SET
                     connected = excluded.connected,
                     presence_state = excluded.presence_state,
@@ -902,7 +938,13 @@ impl Store {
                     hr_connected = excluded.hr_connected,
                     last_bpm = excluded.last_bpm,
                     last_bpm_ts = excluded.last_bpm_ts,
-                    hr_battery_pct = excluded.hr_battery_pct",
+                    hr_battery_pct = excluded.hr_battery_pct,
+                    zone_hold_active = excluded.zone_hold_active,
+                    zone_hold_target_lo = excluded.zone_hold_target_lo,
+                    zone_hold_target_hi = excluded.zone_hold_target_hi,
+                    zone_hold_last_speed = excluded.zone_hold_last_speed,
+                    zone_hold_phase = excluded.zone_hold_phase,
+                    zone_hold_position = excluded.zone_hold_position",
                 params![
                     status.connected,
                     status.presence_state,
@@ -918,6 +960,12 @@ impl Store {
                     status.last_bpm,
                     status.last_bpm_ts,
                     status.hr_battery_pct,
+                    status.zone_hold_active,
+                    status.zone_hold_target_lo,
+                    status.zone_hold_target_hi,
+                    status.zone_hold_last_speed,
+                    status.zone_hold_phase,
+                    status.zone_hold_position,
                 ],
             )
             .context("upsert daemon_status")?;
@@ -932,7 +980,9 @@ impl Store {
                 "SELECT connected, presence_state, last_connected_at, last_disconnected_at,
                         power_mode, power_mode_since, updated_at,
                         config_goals, config_auto_pause_secs, config_loaded_at,
-                        hr_connected, last_bpm, last_bpm_ts, hr_battery_pct
+                        hr_connected, last_bpm, last_bpm_ts, hr_battery_pct,
+                        zone_hold_active, zone_hold_target_lo, zone_hold_target_hi,
+                        zone_hold_last_speed, zone_hold_phase, zone_hold_position
                  FROM daemon_status WHERE id = 0",
                 [],
                 |row| {
@@ -951,6 +1001,12 @@ impl Store {
                         last_bpm: row.get(11)?,
                         last_bpm_ts: row.get(12)?,
                         hr_battery_pct: row.get(13)?,
+                        zone_hold_active: row.get(14)?,
+                        zone_hold_target_lo: row.get(15)?,
+                        zone_hold_target_hi: row.get(16)?,
+                        zone_hold_last_speed: row.get(17)?,
+                        zone_hold_phase: row.get(18)?,
+                        zone_hold_position: row.get(19)?,
                     })
                 },
             )
@@ -1524,6 +1580,12 @@ mod tests {
             last_bpm: Some(118),
             last_bpm_ts: Some(1_720_000_000_000),
             hr_battery_pct: Some(42),
+            zone_hold_active: true,
+            zone_hold_target_lo: Some(112),
+            zone_hold_target_hi: Some(131),
+            zone_hold_last_speed: Some(3.2),
+            zone_hold_phase: Some("hold".to_string()),
+            zone_hold_position: Some("in".to_string()),
         };
         store.upsert_daemon_status(&status).unwrap();
 
@@ -1541,6 +1603,12 @@ mod tests {
         assert_eq!(read_back.last_bpm, Some(118));
         assert_eq!(read_back.last_bpm_ts, Some(1_720_000_000_000));
         assert_eq!(read_back.hr_battery_pct, Some(42));
+        assert!(read_back.zone_hold_active);
+        assert_eq!(read_back.zone_hold_target_lo, Some(112));
+        assert_eq!(read_back.zone_hold_target_hi, Some(131));
+        assert_eq!(read_back.zone_hold_last_speed, Some(3.2));
+        assert_eq!(read_back.zone_hold_phase.as_deref(), Some("hold"));
+        assert_eq!(read_back.zone_hold_position.as_deref(), Some("in"));
 
         // Second upsert overwrites in place — still exactly one row (id=0).
         let status2 = DaemonStatus {

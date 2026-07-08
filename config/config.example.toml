@@ -21,3 +21,35 @@ goals = [8000, 10000, 12000]
 # (you stepped off but the belt kept going). 0 disables auto-pause entirely.
 # After the pause the treadmill's own built-in shutoff powers it down.
 # auto_pause_minutes = 5
+
+# Zone Hold (задача 027): closed-loop mode that auto-adjusts belt speed off a
+# worn heart-rate sensor (задача 025) to hold a target heart-rate zone during
+# desk walking. Off by default — turn it on with `tm zone on` (interactive
+# onboarding: asks your age, writes this section) rather than hand-editing
+# `enabled`/`age` here. Everything below is optional; defaults shown in
+# comments. See docs/tasks/027 for the full design.
+# [zone_hold]
+# enabled = false          # master-switch; tm zone on/off manages this
+# age = 30                 # for HRmax = 208 - 0.7*age (Tanaka formula)
+# resting_hr = 70          # optional; set it to unlock the karvonen method
+# method = "hrmax"         # "hrmax" (% of HRmax) | "karvonen" (% of heart-rate reserve)
+# target_zone = 2          # 1-based index into the zones below (2 = Aerobic base)
+# min_speed = 2.0          # km/h, hard floor
+# max_speed = 4.5          # km/h, global ceiling (a zone below can override it)
+# tracking = "band"        # "band" (hold the whole zone) | "center" (hold the midpoint)
+# warmup_minutes = 5       # linear ramp at session start, HR ignored
+# correction_interval_seconds = 20
+# deadband_bpm = 3         # only used by tracking = "center"
+# max_step_kmh = 0.3       # max speed change per correction
+# reentry_grace_seconds = 45   # no corrections for this long after returning to the belt
+# safety_cap_percent = 80      # HR above this % of HRmax forces a speed reduction
+
+# Custom zones: any number, your own names/bounds. Give each EITHER a percent
+# range (interpreted per `method` above) OR an absolute bpm range (min_bpm/
+# max_bpm) for manual fine-tuning. Omitted entirely -> the built-in 5 zones
+# (Recovery/Aerobic base/Tempo/Threshold/VO2max).
+# [[zone_hold.zones]]
+# name = "Aerobic base"
+# min_percent = 60
+# max_percent = 70
+# max_speed = 5.0          # optional per-zone override of the global max_speed

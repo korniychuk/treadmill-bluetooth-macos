@@ -3,12 +3,12 @@
 # Treadmill workout widget for a tmux status bar.
 #
 # Reference implementation: renders the state/metrics of `tm widget` (see
-# treadmill-bluetooth-macos docs/tasks/009, 025 and 026) as a colour-coded
+# treadmill-bluetooth-macos docs/tasks/009, 025, 026 and 027) as a colour-coded
 # powerline pill. Presentation only — the data + visibility contract lives in
-# the treadmill CLI, which prints one 10-field TSV line while the treadmill is
+# the treadmill CLI, which prints one 11-field TSV line while the treadmill is
 # connected and the daemon heartbeat is fresh, or nothing otherwise:
 #   state, workout_count, cur_walking_s, cur_steps, cur_distance_m,
-#   day_walking_s, day_steps, day_distance_m, hr_bpm, hr_battery_pct
+#   day_walking_s, day_steps, day_distance_m, hr_bpm, hr_battery_pct, hr_zone
 # (cur_* = current/latest workout today, day_* = today's totals across all
 # workouts). cur_* are all zero when there is no LIVE workout (connected but
 # idle — the last workout ended longer ago than the merge gap); the body
@@ -17,7 +17,11 @@
 # heart glyph is drawn only then. `hr_battery_pct` is the sensor's last-read
 # battery level (raw number, may be empty); this script only turns it into a
 # small low-battery warning glyph once it drops to/below $LOW_BATTERY_PCT —
-# the exact percentage is a `tm status` detail, not a widget detail.
+# the exact percentage is a `tm status` detail, not a widget detail. `hr_zone`
+# (задача 027) is `below`/`in`/`above`/empty — Zone Hold's classification of
+# the current bpm against the target zone, populated only while Zone Hold is
+# actually driving corrections in the `walking` state; this script colours
+# the whole `♥ NNN` token by it (see §Zone Hold colour below).
 #
 # HIDE-WHEN-OFF: when `tm widget` prints nothing (or fails), this script
 # exits 0 with no output. Whether that actually hides the segment in your
@@ -109,6 +113,24 @@ LOW_BATTERY_PCT=20
 ICON_BATTERY_LOW=$(printf '\xf3\xb0\x82\x83')  # nf-md-battery_alert U+F0083
 BATTERY_LOW_FG='#ff5555'  # Dracula red
 
+# Zone Hold colour (задача 027): the WHOLE `♥ NNN` token (glyph + number, not
+# just the glyph — the number is the bigger visual mass) is recoloured by
+# `hr_zone` while Zone Hold is actively correcting. `walking`'s pill is always
+# emerald (`$BG_WALKING`), so these are chosen for contrast against that one
+# background specifically, per the operator's colour decision:
+#   below zone (belt about to speed up)  -> deep/saturated blue
+#   above zone (belt about to slow down) -> burnt/dark orange, distinct from
+#                                            the lighter `$BG_AWAY` orange
+#   in zone (locked on target)           -> NOT green (would vanish into the
+#                                            emerald pill) — reuse $STEPS_FG
+#                                            bold instead: the pill itself
+#                                            already signals "ok", the dark
+#                                            bold heart reads as "on target"
+# Empty `hr_zone` (Zone Hold off/not engaged) draws the heart in the plain
+# per-state `$fg`, i.e. unchanged from задача 025/026 — see the fallback below.
+ZONE_BELOW_FG='#2563eb'  # deep blue
+ZONE_ABOVE_FG='#c2410c'  # burnt/dark orange (vs $BG_AWAY's lighter '#ffb86c')
+
 # --- Helpers -------------------------------------------------------------------
 
 # Seconds -> `M:SS`, or `H:MM:SS` past an hour.
@@ -138,12 +160,13 @@ fmt_dist() {
 line="$("$TM" widget 2>/dev/null || true)"
 [[ -n "$line" ]] || exit 0
 
-# `tm widget` emits 10 tab-separated fields (see treadmill repo docs/tasks/009,
-# 025, 026): state, workout_count today, then the CURRENT workout's (walking_s,
-# steps, distance_m), then TODAY's totals (walking_s, steps, distance_m),
-# then hr_bpm (empty unless a sensor is worn and fresh), then hr_battery_pct
-# (empty unless read at least once).
-IFS=$'\t' read -r state wcount cur_s cur_steps cur_dist day_s day_steps day_dist hr_bpm hr_batt <<<"$line"
+# `tm widget` emits 11 tab-separated fields (see treadmill repo docs/tasks/009,
+# 025, 026, 027): state, workout_count today, then the CURRENT workout's
+# (walking_s, steps, distance_m), then TODAY's totals (walking_s, steps,
+# distance_m), then hr_bpm (empty unless a sensor is worn and fresh), then
+# hr_battery_pct (empty unless read at least once), then hr_zone (empty unless
+# Zone Hold is actively correcting).
+IFS=$'\t' read -r state wcount cur_s cur_steps cur_dist day_s day_steps day_dist hr_bpm hr_batt hr_zone <<<"$line"
 
 # Defend against a malformed line: any missing/non-numeric numeric field -> hide.
 for n in "$wcount" "$cur_s" "$cur_steps" "$cur_dist" "$day_s" "$day_steps" "$day_dist"; do
@@ -154,6 +177,9 @@ done
 # the whole segment.
 [[ -z "$hr_bpm" || "$hr_bpm" =~ ^[0-9]+$ ]] || hr_bpm=''
 [[ -z "$hr_batt" || "$hr_batt" =~ ^[0-9]+$ ]] || hr_batt=''
+# hr_zone is a closed set (задача 027); any other value degrades to "neutral"
+# rather than trusting an unrecognised token from a future/older daemon build.
+case "$hr_zone" in below|in|above) ;; *) hr_zone='' ;; esac
 
 case "$state" in
   walking) icon=$ICON_WALKING; bg=$BG_WALKING; fg=$FG_WALKING; dim=$DIM_DARK ;;
@@ -192,11 +218,24 @@ fi
 
 # Heart-rate suffix (задача 025): drawn only when the sensor is worn/fresh
 # (`hr_bpm` non-empty), so it silently disappears the moment the strap comes
-# off — no separate visibility toggle needed. A low-battery glyph (задача 026)
-# rides right after it, only once the level drops to/below $LOW_BATTERY_PCT —
-# no number in the widget itself, that's what `tm status` is for.
+# off — no separate visibility toggle needed. The whole `♥ NNN` token is
+# recoloured by `hr_zone` (задача 027) when Zone Hold is actively correcting;
+# empty `hr_zone` leaves it in the plain per-state `$fg`, unchanged from
+# задачи 025/026. A low-battery glyph (задача 026) rides right after it, only
+# once the level drops to/below $LOW_BATTERY_PCT — no number in the widget
+# itself, that's what `tm status` is for.
 if [[ -n "$hr_bpm" ]]; then
-  body+=$(printf '  %s %s' "$ICON_HEART" "$hr_bpm")
+  case "$hr_zone" in
+    below) heart_fg=$ZONE_BELOW_FG; heart_bold=1 ;;
+    above) heart_fg=$ZONE_ABOVE_FG; heart_bold=1 ;;
+    in)    heart_fg=$STEPS_FG;      heart_bold=1 ;;
+    *)     heart_fg=$fg;            heart_bold=0 ;;
+  esac
+  if (( heart_bold )); then
+    body+=$(printf '  #[fg=%s,bold]%s %s#[nobold,fg=%s]' "$heart_fg" "$ICON_HEART" "$hr_bpm" "$fg")
+  else
+    body+=$(printf '  #[fg=%s]%s %s#[fg=%s]' "$heart_fg" "$ICON_HEART" "$hr_bpm" "$fg")
+  fi
   if [[ -n "$hr_batt" ]] && (( hr_batt <= LOW_BATTERY_PCT )); then
     body+=$(printf ' #[fg=%s]%s#[fg=%s]' "$BATTERY_LOW_FG" "$ICON_BATTERY_LOW" "$fg")
   fi

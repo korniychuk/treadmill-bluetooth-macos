@@ -31,11 +31,11 @@ from one CLI command:
 tm widget
 ```
 
-- Prints **one TSV line, 10 tab-separated fields**, while the treadmill is
+- Prints **one TSV line, 11 tab-separated fields**, while the treadmill is
   connected and the daemon's heartbeat is fresh:
 
   ```
-  STATE  WORKOUT_COUNT  CUR_WALKING_S  CUR_STEPS  CUR_DISTANCE_M  DAY_WALKING_S  DAY_STEPS  DAY_DISTANCE_M  HR_BPM  HR_BATTERY_PCT
+  STATE  WORKOUT_COUNT  CUR_WALKING_S  CUR_STEPS  CUR_DISTANCE_M  DAY_WALKING_S  DAY_STEPS  DAY_DISTANCE_M  HR_BPM  HR_BATTERY_PCT  HR_ZONE
   ```
 
   - `STATE` ∈ `walking | paused | away | unknown`.
@@ -54,15 +54,20 @@ tm widget
     percentage; the reference script only turns it into a small low-battery
     glyph once it drops to/below its own `LOW_BATTERY_PCT` tunable (default
     20) — the exact number belongs to `tm status`, not the widget.
+  - `HR_ZONE` ∈ `below | in | above`, or **empty** unless Zone Hold (задача
+    027) is actively driving speed corrections in the `walking` state. The
+    reference script recolours the whole `♥ NNN` token by this value — empty
+    leaves it in the plain per-state colour, unchanged from задачи 025/026.
 
 - Prints **nothing** (exit 0) whenever the treadmill is off, the daemon is
   dead, or its heartbeat is stale — the unambiguous signal to hide the
   segment.
 
-See `docs/tasks/009-tmux-workout-widget.md`, `docs/tasks/025-heart-rate-polar-h10.md`
-and `docs/tasks/026-hr-battery-level.md` in this repo for the full contract
-history and design rationale. If you change the field count/order in
-`tm widget`, update this script's `IFS=$'\t' read -r ...` line to match.
+See `docs/tasks/009-tmux-workout-widget.md`, `docs/tasks/025-heart-rate-polar-h10.md`,
+`docs/tasks/026-hr-battery-level.md` and `docs/tasks/027-zone-hold-hr-adaptive-speed.md`
+in this repo for the full contract history and design rationale. If you change
+the field count/order in `tm widget`, update this script's
+`IFS=$'\t' read -r ...` line to match.
 
 ## Recipe A — Dracula tmux theme (custom plugin)
 

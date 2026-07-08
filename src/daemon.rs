@@ -79,6 +79,7 @@ use crate::power::{self, PowerEvent};
 use crate::presence::{self, PresenceState};
 use crate::scan;
 use crate::store::{DaemonStatus, Store};
+use crate::zone_hold;
 
 /// Delay before retrying discovery after a scan/connect failure, so a
 /// transient Bluetooth hiccup does not spin the CPU in a tight loop.
@@ -226,6 +227,19 @@ const HR_BATTERY_POLL_INTERVAL_LOW: Duration = Duration::from_secs(30 * 60);
 /// (in the tmux widget's own presentation logic) a low-battery glyph is shown.
 const HR_BATTERY_LOW_THRESHOLD_PCT: u8 = 20;
 
+/// Minimum gap between repeated Zone Hold safety-cap writes (задача 027) — the
+/// bpm condition is checked every telemetry sample (~1/s) for responsiveness,
+/// but the actual force-reduce/stop write is throttled so a sustained
+/// over-threshold HR does not hammer the Control Point every second. Shorter
+/// than the normal [`ZoneHoldConfig::correction_interval_seconds`] cadence
+/// (a safety condition must not wait the full closed-loop interval).
+const ZONE_HOLD_SAFETY_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// HRmax-percent above which, once already at `min_speed`, Zone Hold stops the
+/// belt outright instead of merely force-reducing (task doc §Safety: "ниже
+/// AHA-85% ... консервативно для unsupervised low-intensity").
+const ZONE_HOLD_HARD_STOP_PERCENT: f32 = 85.0;
+
 /// How often to re-read the HR sensor's battery level, given the last known
 /// level (`None` = never read yet, so due immediately). Pure/unit-tested —
 /// see module docs on why this is about avoiding pointless work, not battery
@@ -245,6 +259,9 @@ fn hr_battery_poll_interval(last_known_pct: Option<u8>) -> Duration {
 struct LiveConfig {
     goals: Vec<Goal>,
     auto_pause: Option<Duration>,
+    /// Zone Hold config (задача 027), reloaded on the same mtime watch as
+    /// `goals`/`auto_pause` — they share the one config file.
+    zone_hold: zone_hold::ZoneHoldConfig,
 }
 
 /// A live notification stream from an HR peripheral (matches the type
@@ -323,8 +340,13 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
     let mut live_config = LiveConfig {
         goals: goals::load_goals(),
         auto_pause: goals::load_auto_pause(),
+        zone_hold: zone_hold::load_zone_hold_config(),
     };
-    info!(goals = ?live_config.goals, auto_pause = ?live_config.auto_pause, "loaded config (goals + idle-belt auto-pause)");
+    info!(
+        goals = ?live_config.goals, auto_pause = ?live_config.auto_pause,
+        zone_hold_enabled = live_config.zone_hold.enabled,
+        "loaded config (goals + idle-belt auto-pause + zone hold)"
+    );
     let watchdog = Watchdog::new();
     watchdog.spawn_monitor();
     // Refreshes `daemon_status.updated_at` (and the watchdog) while idle, so
@@ -478,6 +500,14 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                         state.last_bpm = None;
                         state.last_bpm_ts = None;
                         state.hr_battery_pct = None;
+                        // Zone Hold's per-session phase dies with the session
+                        // (задача 027) — clear the mirrored snapshot too.
+                        state.zone_hold_active = false;
+                        state.zone_hold_phase = None;
+                        state.zone_hold_position = None;
+                        state.zone_hold_target_lo = None;
+                        state.zone_hold_target_hi = None;
+                        state.zone_hold_last_speed = None;
                         state.persist(&store, &watchdog)?;
 
                         scan::disconnect_best_effort(&peripheral).await;
@@ -563,6 +593,12 @@ async fn stream_with_presence(
     // this session (задача 016). Fresh per BLE session, so each physical
     // (re)start of the treadmill gets one attempt; reconnect/new session resets it.
     let mut default_speed_applied = false;
+    // Zone Hold (задача 027): per-session controller phase + correction
+    // timers. Fresh per BLE session, same reasoning as `default_speed_applied` —
+    // a reconnect starts from `Off` and re-engages on the next Walking entry.
+    let mut zh_phase = ZoneHoldPhase::Off;
+    let mut zh_last_correction_at: Option<Instant> = None;
+    let mut zh_last_safety_write_at: Option<Instant> = None;
     // Backstop poll for queued control commands during quiet stretches; the
     // primary check runs at the end of each telemetry sample below (задача 013).
     let mut command_tick = tokio::time::interval(CONTROL_POLL_INTERVAL);
@@ -751,6 +787,28 @@ async fn stream_with_presence(
                     // on any transition leaving Walking (Paused/AwayWhileRunning):
                     // the next credited step opens a fresh one, and read-time
                     // merge regroups by gap (задача 014). No DB write.
+
+                    // Zone Hold engage/freeze/grace (задача 027). Runs after the
+                    // existing default-speed/pre-pause restore above, on purpose:
+                    // on a Paused→Walking return the belt speed is already
+                    // restored by that code, so Zone Hold's grace window starts
+                    // from the *restored* speed, not the crawl (task doc §Сход с
+                    // ленты: "Zone Hold не дублирует restore — переиспользует его").
+                    let zh_resumed_kmh = data.speed_kmh.unwrap_or(0.0);
+                    let zh_default_kmh = default_speed::compute_default_speed(store, goals::load_workout_gap_minutes())
+                        .ok()
+                        .flatten()
+                        .map(|d| d.kmh)
+                        .unwrap_or(config.zone_hold.min_speed_kmh);
+                    zone_hold_on_transition(
+                        &mut zh_phase,
+                        prev_state,
+                        next_state,
+                        &config.zone_hold,
+                        zh_resumed_kmh,
+                        zh_default_kmh,
+                        Instant::now(),
+                    );
                 }
 
                 // Auto-pause an idle belt (задача 020). Checked every sample, not
@@ -787,6 +845,50 @@ async fn stream_with_presence(
                             }
                         }
                     }
+                }
+
+                // Zone Hold closed-loop correction (задача 027). Checked every
+                // sample like auto-pause above: ramp/hold/grace timers all need
+                // polling, not just transition edges. A lost/removed HR sensor
+                // (`!state.hr_connected`) feeds `None` bpm through, which the
+                // ramp phase ignores anyway and the hold phase treats as
+                // "nothing to correct on" — the freeze behaviour the task doc
+                // asks for, without a separate code path.
+                if zh_phase != ZoneHoldPhase::Off {
+                    match config.zone_hold.resolve_target_zone() {
+                        Some(resolved) => {
+                            let zh_bpm = state.hr_connected.then_some(state.last_bpm).flatten().map(|b| b as u16);
+                            zone_hold_tick(
+                                peripheral,
+                                &config.zone_hold,
+                                resolved,
+                                &mut zh_phase,
+                                data.speed_kmh.unwrap_or(0.0),
+                                zh_bpm,
+                                &mut zh_last_correction_at,
+                                &mut zh_last_safety_write_at,
+                                Instant::now(),
+                                state,
+                            )
+                            .await;
+                        }
+                        None => {
+                            // Config edited mid-session (e.g. age removed) —
+                            // nothing left to compute a target zone from.
+                            warn!("zone_hold: target zone no longer resolvable — disengaging");
+                            zh_phase = ZoneHoldPhase::Off;
+                            state.zone_hold_active = false;
+                            state.zone_hold_phase = Some("off".to_string());
+                            state.zone_hold_target_lo = None;
+                            state.zone_hold_target_hi = None;
+                            state.zone_hold_position = None;
+                        }
+                    }
+                } else if state.zone_hold_active {
+                    // Just disabled/disengaged — clear the stale snapshot.
+                    state.zone_hold_active = false;
+                    state.zone_hold_phase = Some("off".to_string());
+                    state.zone_hold_position = None;
                 }
 
                 // Credit this sample. `Utc::now()` matches the timestamp already
@@ -826,6 +928,16 @@ async fn stream_with_presence(
                     if reloaded_auto_pause != config.auto_pause {
                         info!(?reloaded_auto_pause, "auto-pause threshold changed on disk — reloaded without a daemon restart");
                         config.auto_pause = reloaded_auto_pause;
+                    }
+                    // Same mtime gate reloads the Zone Hold config (задача 027) —
+                    // an edit (e.g. `tm zone` writing new limits) takes effect
+                    // without a restart. The per-session phase (ramp/hold/frozen/
+                    // grace) is untouched here; it only reacts to presence
+                    // transitions and the next correction tick.
+                    let reloaded_zone_hold = zone_hold::load_zone_hold_config();
+                    if reloaded_zone_hold != config.zone_hold {
+                        info!(enabled = reloaded_zone_hold.enabled, "zone_hold config changed on disk — reloaded without a daemon restart");
+                        config.zone_hold = reloaded_zone_hold;
                     }
                     // Refresh the loaded-config snapshot + last-read time shown by
                     // `tm status` (задача 022): the file was actually re-read here.
@@ -1152,6 +1264,268 @@ async fn try_apply_default_speed(
     }
 }
 
+/// Zone Hold controller phase for the current session (задача 027) — mirrors
+/// the task doc's life-cycle: `Ramp` (linear warm-up, HR ignored) → `Hold`
+/// (closed-loop correction), with `Frozen`/`Grace` bracketing any excursion
+/// off the belt (task doc §Сход с ленты). `Off` covers both "disabled in
+/// config" and "config incomplete" (no resolvable target zone) — same
+/// no-op-degrade stance as a removed HR sensor (задача 025).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ZoneHoldPhase {
+    Off,
+    Ramp {
+        started_at: Instant,
+        start_speed_kmh: f32,
+        target_speed_kmh: f32,
+    },
+    Hold,
+    /// Presence left `Walking` — HR is fully ignored (task doc: a dropping
+    /// pulse while stepping away must never look like "let's speed up").
+    Frozen,
+    /// Just returned to `Walking` — no corrections until `until` elapses.
+    Grace {
+        until: Instant,
+    },
+}
+
+impl ZoneHoldPhase {
+    fn label(&self) -> &'static str {
+        match self {
+            ZoneHoldPhase::Off => "off",
+            ZoneHoldPhase::Ramp { .. } => "ramp",
+            ZoneHoldPhase::Hold => "hold",
+            ZoneHoldPhase::Frozen => "frozen",
+            ZoneHoldPhase::Grace { .. } => "grace",
+        }
+    }
+}
+
+/// Engage/freeze/grace Zone Hold on a presence transition (задача 027,
+/// §Жизненный цикл + §Сход с ленты). Pure decision over the phase enum — the
+/// actual speed corrections happen on the following telemetry ticks via
+/// [`zone_hold_tick`], keeping this transition step free of BLE.
+///
+/// `resumed_kmh` is the belt speed observed on this very sample (the ramp's
+/// starting point); `default_kmh` is the operator's computed cruising pace
+/// (задача 016) clamped into the configured range — the ramp's destination.
+fn zone_hold_on_transition(
+    phase: &mut ZoneHoldPhase,
+    prev_state: PresenceState,
+    next_state: PresenceState,
+    config: &zone_hold::ZoneHoldConfig,
+    resumed_kmh: f32,
+    default_kmh: f32,
+    now: Instant,
+) {
+    if !config.enabled || config.resolve_target_zone().is_none() {
+        *phase = ZoneHoldPhase::Off;
+        return;
+    }
+    match (prev_state, next_state) {
+        (PresenceState::Unknown, PresenceState::Walking) => {
+            let target = default_kmh.clamp(config.min_speed_kmh, config.max_speed_kmh);
+            *phase = ZoneHoldPhase::Ramp {
+                started_at: now,
+                start_speed_kmh: resumed_kmh,
+                target_speed_kmh: target,
+            };
+            info!(target, "zone hold: engaged, starting warm-up ramp");
+        }
+        (PresenceState::Paused, PresenceState::Walking)
+        | (PresenceState::AwayWhileRunning, PresenceState::Walking)
+            if *phase != ZoneHoldPhase::Off =>
+        {
+            let grace = Duration::from_secs(config.reentry_grace_seconds as u64);
+            *phase = ZoneHoldPhase::Grace { until: now + grace };
+            info!(
+                grace_s = config.reentry_grace_seconds,
+                "zone hold: returned to walking, grace period before corrections resume"
+            );
+        }
+        (PresenceState::Walking, PresenceState::Paused)
+        | (PresenceState::Walking, PresenceState::AwayWhileRunning)
+            if *phase != ZoneHoldPhase::Off =>
+        {
+            *phase = ZoneHoldPhase::Frozen;
+            info!("zone hold: left the belt — freezing (HR ignored until return)");
+        }
+        _ => {}
+    }
+}
+
+/// One telemetry-tick's worth of Zone Hold processing (задача 027): advances
+/// ramp/grace timers, runs the safety-cap check, and — when due — computes and
+/// applies one closed-loop correction. Called every treadmill sample while
+/// `phase != Off`; a disabled/unconfigured Zone Hold never reaches this (see
+/// the call site), so it costs nothing on the hot path.
+///
+/// All BLE writes reuse the same bounded [`restore_speed`]/
+/// [`SPEED_RESTORE_TIMEOUT`] path as the rest of the daemon (задачи 007/012) —
+/// a failed/timed-out write is logged and swallowed, never tears down the
+/// session.
+#[allow(clippy::too_many_arguments)]
+async fn zone_hold_tick(
+    peripheral: &Peripheral,
+    config: &zone_hold::ZoneHoldConfig,
+    resolved: zone_hold::ResolvedZone,
+    phase: &mut ZoneHoldPhase,
+    measured_speed_kmh: f32,
+    bpm: Option<u16>,
+    last_correction_at: &mut Option<Instant>,
+    last_safety_write_at: &mut Option<Instant>,
+    now: Instant,
+    state: &mut DaemonState,
+) {
+    let correction_interval = Duration::from_secs(config.correction_interval_seconds as u64);
+    let correction_due = |last: Option<Instant>| {
+        last.is_none_or(|t| now.saturating_duration_since(t) >= correction_interval)
+    };
+
+    match *phase {
+        ZoneHoldPhase::Off | ZoneHoldPhase::Frozen => {}
+        ZoneHoldPhase::Grace { until } => {
+            if now >= until {
+                *phase = ZoneHoldPhase::Hold;
+                info!("zone hold: grace period elapsed — resuming closed-loop correction");
+            }
+        }
+        ZoneHoldPhase::Ramp {
+            started_at,
+            start_speed_kmh,
+            target_speed_kmh,
+        } => {
+            let elapsed = now.saturating_duration_since(started_at);
+            let warmup = Duration::from_secs(config.warmup_minutes as u64 * 60);
+            if elapsed >= warmup {
+                *phase = ZoneHoldPhase::Hold;
+                info!("zone hold: warm-up ramp complete — starting closed-loop correction");
+            } else if correction_due(*last_correction_at) {
+                let target = zone_hold::warmup_target_speed(
+                    start_speed_kmh,
+                    target_speed_kmh,
+                    elapsed,
+                    warmup,
+                );
+                if (target - measured_speed_kmh).abs() > SPEED_RESTORE_EPSILON_KMH {
+                    apply_zone_hold_speed(peripheral, target).await;
+                }
+                *last_correction_at = Some(now);
+            }
+        }
+        ZoneHoldPhase::Hold => {
+            if let (Some(bpm), Some(safety_cap)) = (bpm, config.safety_cap_bpm())
+                && bpm > safety_cap
+            {
+                let cooling_down = last_safety_write_at
+                    .is_some_and(|t| now.saturating_duration_since(t) < ZONE_HOLD_SAFETY_COOLDOWN);
+                if !cooling_down {
+                    *last_safety_write_at = Some(now);
+                    let hard_stop = config
+                        .hrmax()
+                        .map(|hrmax| zone_hold::safety_cap_bpm(hrmax, ZONE_HOLD_HARD_STOP_PERCENT))
+                        .unwrap_or(u16::MAX);
+                    if measured_speed_kmh <= config.min_speed_kmh + SPEED_RESTORE_EPSILON_KMH
+                        && bpm > hard_stop
+                    {
+                        warn!(
+                            bpm,
+                            safety_cap,
+                            hard_stop,
+                            "zone hold: safety cap exceeded at min speed — stopping belt"
+                        );
+                        let _ = tokio::time::timeout(
+                            SPEED_RESTORE_TIMEOUT,
+                            execute_control_command(peripheral, ControlCommand::Stop),
+                        )
+                        .await;
+                    } else {
+                        let target = (measured_speed_kmh - config.max_step_kmh * 2.0)
+                            .max(config.min_speed_kmh);
+                        warn!(
+                            bpm,
+                            safety_cap,
+                            target,
+                            "zone hold: safety cap exceeded — force-reducing speed"
+                        );
+                        apply_zone_hold_speed(peripheral, target).await;
+                    }
+                }
+                zh_persist_snapshot(state, phase, &resolved, Some(bpm), measured_speed_kmh);
+                return;
+            }
+            if correction_due(*last_correction_at) {
+                if let Some(bpm) = bpm {
+                    let params = zone_hold::ControllerParams {
+                        tracking: config.tracking,
+                        zone_low_bpm: resolved.low_bpm,
+                        zone_high_bpm: resolved.high_bpm,
+                        deadband_bpm: config.deadband_bpm,
+                        max_step_kmh: config.max_step_kmh,
+                        min_speed_kmh: config.min_speed_kmh,
+                        max_speed_kmh: resolved.effective_max_speed_kmh,
+                    };
+                    if let Some(target) = zone_hold::next_speed(&params, measured_speed_kmh, bpm) {
+                        apply_zone_hold_speed(peripheral, target).await;
+                    }
+                }
+                // No bpm this tick (sensor stale/lost) — nothing to correct on;
+                // still stamp the interval so a reconnect doesn't immediately
+                // fire a correction from a now-outdated baseline.
+                *last_correction_at = Some(now);
+            }
+        }
+    }
+
+    zh_persist_snapshot(state, phase, &resolved, bpm, measured_speed_kmh);
+}
+
+/// Mirror the controller's current phase/target/position into the persisted
+/// `daemon_status` snapshot (задача 027) — same "daemon publishes what it just
+/// decided" pattern as the rest of [`DaemonState`]. `zone_hold_position` is
+/// only set while `Hold` is actually classifying a live bpm — everywhere else
+/// (ramp/frozen/grace/off) it is cleared, matching the task doc's widget
+/// contract ("красим только когда Zone Hold реально управляет").
+fn zh_persist_snapshot(
+    state: &mut DaemonState,
+    phase: &ZoneHoldPhase,
+    resolved: &zone_hold::ResolvedZone,
+    bpm: Option<u16>,
+    measured_speed_kmh: f32,
+) {
+    state.zone_hold_active = !matches!(phase, ZoneHoldPhase::Off);
+    state.zone_hold_phase = Some(phase.label().to_string());
+    state.zone_hold_target_lo = Some(resolved.low_bpm as i64);
+    state.zone_hold_target_hi = Some(resolved.high_bpm as i64);
+    state.zone_hold_last_speed = Some(measured_speed_kmh as f64);
+    state.zone_hold_position = match (phase, bpm) {
+        (ZoneHoldPhase::Hold, Some(bpm)) => Some(
+            zone_hold::classify_position(bpm, resolved.low_bpm, resolved.high_bpm)
+                .wire()
+                .to_string(),
+        ),
+        _ => None,
+    };
+}
+
+/// Apply one Zone Hold speed correction, reusing the bounded
+/// [`restore_speed`]/[`SPEED_RESTORE_TIMEOUT`] round-trip (задачи 007/012). A
+/// failed/timed-out write is logged, not propagated — the same "never tear
+/// down the session over a convenience write" rule as `try_restore_speed`/
+/// `try_apply_default_speed`.
+async fn apply_zone_hold_speed(peripheral: &Peripheral, target_kmh: f32) {
+    match tokio::time::timeout(SPEED_RESTORE_TIMEOUT, restore_speed(peripheral, target_kmh)).await {
+        Ok(Ok(())) => info!(target = target_kmh, "zone hold: applied speed correction"),
+        Ok(Err(err)) => {
+            warn!(%err, target = target_kmh, "zone hold: speed correction write failed")
+        }
+        Err(_) => warn!(
+            timeout_s = SPEED_RESTORE_TIMEOUT.as_secs(),
+            target = target_kmh,
+            "zone hold: speed correction timed out (possible CoreBluetooth hang)"
+        ),
+    }
+}
+
 /// After a step credit, fire a toast for each configured goal today's steps
 /// have newly reached and persist that it was celebrated, so a mid-day daemon
 /// restart never re-fires it (задача 011). A goal-check failure must not tear
@@ -1270,6 +1644,15 @@ struct DaemonState {
     /// HR sensor battery level, 0-100% (задача 026). `None` until read at
     /// least once this link.
     hr_battery_pct: Option<i64>,
+    /// Zone Hold snapshot (задача 027) — mirrors `ZoneHoldPhase`/the resolved
+    /// target zone so `tm status`/`tm widget` can read it without racing the
+    /// daemon for BLE. See `zh_persist_snapshot`.
+    zone_hold_active: bool,
+    zone_hold_target_lo: Option<i64>,
+    zone_hold_target_hi: Option<i64>,
+    zone_hold_last_speed: Option<f64>,
+    zone_hold_phase: Option<String>,
+    zone_hold_position: Option<String>,
 }
 
 impl DaemonState {
@@ -1288,6 +1671,12 @@ impl DaemonState {
             last_bpm: None,
             last_bpm_ts: None,
             hr_battery_pct: None,
+            zone_hold_active: false,
+            zone_hold_target_lo: None,
+            zone_hold_target_hi: None,
+            zone_hold_last_speed: None,
+            zone_hold_phase: None,
+            zone_hold_position: None,
         }
     }
 
@@ -1336,6 +1725,12 @@ impl DaemonState {
             last_bpm: self.last_bpm,
             last_bpm_ts: self.last_bpm_ts,
             hr_battery_pct: self.hr_battery_pct,
+            zone_hold_active: self.zone_hold_active,
+            zone_hold_target_lo: self.zone_hold_target_lo,
+            zone_hold_target_hi: self.zone_hold_target_hi,
+            zone_hold_last_speed: self.zone_hold_last_speed,
+            zone_hold_phase: self.zone_hold_phase.clone(),
+            zone_hold_position: self.zone_hold_position.clone(),
         })?;
         watchdog.touch();
         Ok(())

@@ -23,6 +23,23 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   shows the exact percentage; `tm widget` gains a raw `hr_battery_pct` field
   (10 fields total now) — the reference tmux script turns it into a small
   warning glyph only once it's low, no number in the status bar itself.
+- **Zone Hold** (задача 027): closed-loop mode that auto-adjusts belt speed
+  off live bpm (задача 025) to hold a target heart-rate zone (default Zone 2,
+  60-70% of Tanaka HRmax) during desk walking, instead of a fixed speed —
+  cardiac drift then naturally eases the speed down over a long session.
+  5-minute HR-blind warm-up ramp, then a `band` (hold the whole zone, default)
+  or `center` (hold the midpoint, more corrections) closed-loop corrector
+  every 20s, bounded ±0.3 km/h per step. Freezes on stepping off the belt and
+  runs a 45s no-acceleration grace window on return; force-reduces (and, at
+  min speed, stops the belt) above 80%/85% of HRmax as a safety cap. New `tm
+  zone` CLI (`on`/`off`/`setup`/`limits`/`target`/`mode`, no-arg = status) —
+  `on` runs an interactive onboarding prompt (age, optional resting HR) the
+  first time. `tm status` gains a Zone Hold line; `tm widget` gains an
+  `hr_zone` field (`below`/`in`/`above`/empty, 11 fields total now) — the
+  reference tmux script recolours the whole `♥ NNN` token by it (blue/burnt-
+  orange/near-black-bold) while Zone Hold is actively correcting. Off by
+  default; every surface degrades to no-op when disabled or the sensor isn't
+  worn.
 
 ## [0.2.1] — 2026-07-08
 

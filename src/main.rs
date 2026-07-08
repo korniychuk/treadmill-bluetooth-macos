@@ -21,6 +21,7 @@ mod recompute;
 mod scan;
 mod sniff;
 mod store;
+mod zone_hold;
 
 use std::io::IsTerminal;
 use std::time::{Duration, Instant};
@@ -133,6 +134,48 @@ enum Commands {
         /// Incline level (device-specific units, not percent).
         incline_level: u8,
     },
+    /// Zone Hold — HR-adaptive belt-speed control (задача 027): `on`/`off`,
+    /// `setup` (re-run onboarding), `limits`/`target`/`mode` to tune it, or no
+    /// sub-action to print current status. Read/write config only — no BLE,
+    /// same as `stats`/`status`; the daemon picks up config edits live
+    /// (задача 017's hot-reload).
+    Zone {
+        #[command(subcommand)]
+        action: Option<ZoneAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ZoneAction {
+    /// Enable Zone Hold. Runs the interactive onboarding prompt (age, optional
+    /// resting HR) the first time `age` isn't yet configured.
+    On,
+    /// Disable Zone Hold (master switch off) — no BLE, no corrections.
+    Off,
+    /// Re-run the interactive onboarding prompt, overwriting age/resting HR.
+    Setup,
+    /// Set the global speed limits: `tm zone limits <max> [<min>]`, or
+    /// `tm zone limits --min <min>` to update only the minimum.
+    Limits {
+        /// Max speed, km/h (first positional argument).
+        max: Option<f32>,
+        /// Min speed, km/h (second positional argument).
+        min: Option<f32>,
+        /// Set only the min speed (use when you don't want to touch max).
+        #[arg(long = "min")]
+        min_flag: Option<f32>,
+    },
+    /// Set the target zone number (1-based index into the configured zones).
+    Target {
+        /// Zone number, e.g. `2` for the default "Aerobic base".
+        zone: u8,
+    },
+    /// Set the targeting aggressiveness: `band` (hold the zone) or `center`
+    /// (hold the midpoint, more corrections).
+    Mode {
+        /// `band` or `center`.
+        tracking: String,
+    },
 }
 
 #[tokio::main]
@@ -162,6 +205,9 @@ async fn main() -> Result<()> {
     }
     if let Commands::DefaultSpeed = command {
         return run_default_speed();
+    }
+    if let Commands::Zone { action } = command {
+        return run_zone(action);
     }
     // Control commands route through the daemon's queue when it holds the BLE
     // link (two processes can't co-own the connection — задача 013), and only
@@ -206,6 +252,7 @@ async fn main() -> Result<()> {
         | Commands::Widget
         | Commands::NotifyTest
         | Commands::DefaultSpeed
+        | Commands::Zone { .. }
         | Commands::Start
         | Commands::Stop
         | Commands::Speed { .. } => {
@@ -358,6 +405,223 @@ fn run_default_speed() -> Result<()> {
             "no qualifying workout yet (need one with \u{2265}30m of credited walking) — \
              the belt would stay at its device default speed"
         ),
+    }
+    Ok(())
+}
+
+/// Dispatch a `tm zone` sub-action (задача 027). Read/write config + SQLite
+/// only — no BLE, same constraint as `status`/`widget`.
+fn run_zone(action: Option<ZoneAction>) -> Result<()> {
+    match action {
+        None => print_zone_status(),
+        Some(ZoneAction::On) => zone_on(),
+        Some(ZoneAction::Off) => set_zone_hold_key("enabled", "false".to_string()).map(|()| {
+            println!("Zone Hold disabled.");
+        }),
+        Some(ZoneAction::Setup) => zone_onboarding_prompt(),
+        Some(ZoneAction::Limits { max, min, min_flag }) => zone_limits(max, min.or(min_flag)),
+        Some(ZoneAction::Target { zone }) => set_zone_hold_key("target_zone", zone.to_string())
+            .map(|()| {
+                println!("Zone Hold target zone set to #{zone}.");
+            }),
+        Some(ZoneAction::Mode { tracking }) => zone_mode(&tracking),
+    }
+}
+
+/// `tm zone on`: enable the master switch, running the interactive onboarding
+/// prompt first if `age` isn't configured yet (задача 027, §Onboarding).
+fn zone_on() -> Result<()> {
+    if zone_hold::load_zone_hold_config().age.is_none() {
+        return zone_onboarding_prompt();
+    }
+    set_zone_hold_key("enabled", "true".to_string())?;
+    println!("Zone Hold enabled.");
+    Ok(())
+}
+
+/// Interactive age/resting-HR prompt (задача 027, §Onboarding) — writes
+/// `enabled = true` alongside whatever was entered, since the whole point of
+/// running this is to turn Zone Hold on. Used by both `tm zone on` (first run)
+/// and `tm zone setup` (reconfigure).
+fn zone_onboarding_prompt() -> Result<()> {
+    println!("Zone Hold setup");
+    let age = prompt_age()?;
+    let resting_hr = prompt_optional_resting_hr()?;
+
+    let mut updates = vec![("enabled", "true".to_string()), ("age", age.to_string())];
+    if let Some(resting_hr) = resting_hr {
+        updates.push(("resting_hr", resting_hr.to_string()));
+    }
+    let path = zone_hold_config_path()?;
+    zone_hold::upsert_zone_hold_keys(&path, &updates)?;
+
+    let hrmax = zone_hold::hrmax_tanaka(age);
+    println!("HRmax (Tanaka) \u{2248} {hrmax:.0} bpm.");
+    println!(
+        "Zone Hold enabled — target zone #{} (default: Aerobic base, 60-70% HRmax).",
+        zone_hold::DEFAULT_TARGET_ZONE
+    );
+    println!(
+        "Change the target zone with `tm zone target <n>`, tune limits with `tm zone limits`, \
+         or edit `[[zone_hold.zones]]` in config.toml directly for custom bounds."
+    );
+    Ok(())
+}
+
+fn prompt_age() -> Result<u32> {
+    use std::io::Write;
+    loop {
+        print!("Your age (for the HRmax estimate): ");
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("read age from stdin")?;
+        match line.trim().parse::<u32>() {
+            Ok(age) if (1..=120).contains(&age) => return Ok(age),
+            _ => println!("please enter a whole number between 1 and 120"),
+        }
+    }
+}
+
+/// `None` on an empty line (skip) or an implausible value — resting HR is
+/// optional, so a bad entry just falls back to skipping it rather than
+/// looping forever on an optional field.
+fn prompt_optional_resting_hr() -> Result<Option<u16>> {
+    use std::io::Write;
+    print!("Resting heart rate, bpm (optional — press Enter to skip): ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("read resting HR from stdin")?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match trimmed.parse::<u16>() {
+        Ok(hr) if (30..=120).contains(&hr) => Ok(Some(hr)),
+        _ => {
+            println!("not a plausible resting heart rate — skipping (hrmax method will be used)");
+            Ok(None)
+        }
+    }
+}
+
+/// `tm zone limits <max> [<min>]` / `tm zone limits --min <min>` (задача 027,
+/// §Min/max) — writes the *global* `max_speed`/`min_speed` keys; per-zone
+/// overrides stay a manual config edit.
+fn zone_limits(max: Option<f32>, min: Option<f32>) -> Result<()> {
+    if max.is_none() && min.is_none() {
+        bail!(
+            "specify at least a max speed, e.g. `tm zone limits 5` or `tm zone limits --min 2.5`"
+        );
+    }
+    let mut updates = Vec::new();
+    if let Some(max) = max {
+        updates.push(("max_speed", max.to_string()));
+    }
+    if let Some(min) = min {
+        updates.push(("min_speed", min.to_string()));
+    }
+    let path = zone_hold_config_path()?;
+    zone_hold::upsert_zone_hold_keys(&path, &updates)?;
+    println!(
+        "Zone Hold limits updated:{}{}",
+        max.map(|m| format!(" max {m} km/h")).unwrap_or_default(),
+        min.map(|m| format!(" min {m} km/h")).unwrap_or_default(),
+    );
+    Ok(())
+}
+
+/// `tm zone mode <band|center>` (задача 027, §Режимы).
+fn zone_mode(tracking: &str) -> Result<()> {
+    match tracking {
+        "band" | "center" => {
+            set_zone_hold_key("tracking", format!("\"{tracking}\""))?;
+            println!("Zone Hold tracking mode set to `{tracking}`.");
+            Ok(())
+        }
+        other => bail!("unknown tracking mode `{other}` — use `band` or `center`"),
+    }
+}
+
+/// Update a single `[zone_hold]` key in place, creating the config directory
+/// if this is the first write to it.
+fn set_zone_hold_key(key: &str, value: String) -> Result<()> {
+    let path = zone_hold_config_path()?;
+    zone_hold::upsert_zone_hold_keys(&path, &[(key, value)])
+}
+
+fn zone_hold_config_path() -> Result<std::path::PathBuf> {
+    let path = zone_hold::config_path().context(
+        "could not resolve the config path ($HOME unset) — set TREADMILL_CONFIG explicitly",
+    )?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    Ok(path)
+}
+
+/// `tm zone` (no sub-action): current config plus, when the daemon has a
+/// fresh snapshot, whether the controller is actively engaged right now
+/// (задача 027).
+fn print_zone_status() -> Result<()> {
+    let config = zone_hold::load_zone_hold_config();
+    println!("Zone Hold: {}", if config.enabled { "on" } else { "off" });
+    if !config.enabled {
+        println!("  enable with `tm zone on`");
+        return Ok(());
+    }
+
+    match config.age {
+        None => println!("  not configured yet — run `tm zone setup`"),
+        Some(age) => {
+            let method = match config.method {
+                zone_hold::Method::HrMax => "hrmax",
+                zone_hold::Method::Karvonen => "karvonen",
+            };
+            let tracking = match config.tracking {
+                zone_hold::Tracking::Band => "band",
+                zone_hold::Tracking::Center => "center",
+            };
+            println!("  age {age}, method {method}, tracking {tracking}");
+            match config.resolve_target_zone() {
+                Some(resolved) => println!(
+                    "  target zone #{}: {}-{} bpm \u{2022} speed {:.1}-{:.1} km/h",
+                    config.target_zone,
+                    resolved.low_bpm,
+                    resolved.high_bpm,
+                    config.min_speed_kmh,
+                    resolved.effective_max_speed_kmh,
+                ),
+                None => println!(
+                    "  target zone #{} not found among {} configured zones",
+                    config.target_zone,
+                    config.zones.len()
+                ),
+            }
+        }
+    }
+
+    let store = store::Store::open()?;
+    match store.daemon_status()? {
+        Some(status) if status.zone_hold_active => {
+            let phase = status.zone_hold_phase.as_deref().unwrap_or("?");
+            let range = match (status.zone_hold_target_lo, status.zone_hold_target_hi) {
+                (Some(lo), Some(hi)) => format!("{lo}-{hi} bpm"),
+                _ => "? bpm".to_string(),
+            };
+            let speed = status
+                .zone_hold_last_speed
+                .map(|s| format!("{s:.1} km/h"))
+                .unwrap_or_else(|| "?".to_string());
+            let position = status.zone_hold_position.as_deref().unwrap_or("\u{2014}");
+            println!(
+                "  active now: phase {phase}, {range}, last speed {speed}, position {position}"
+            );
+        }
+        _ => println!("  not currently engaged (not walking, sensor not worn, or daemon idle)"),
     }
     Ok(())
 }
@@ -582,6 +846,25 @@ fn run_status() -> Result<()> {
                 println!("heart rate: no sensor");
             }
 
+            // Zone Hold line (задача 027) — only printed once the mode is
+            // configured (age set), same "only show what's actually loaded"
+            // stance as the config line below.
+            let zh_config = zone_hold::load_zone_hold_config();
+            if zh_config.enabled {
+                if status.zone_hold_active {
+                    let phase = status.zone_hold_phase.as_deref().unwrap_or("?");
+                    let range = match (status.zone_hold_target_lo, status.zone_hold_target_hi) {
+                        (Some(lo), Some(hi)) => format!("{lo}-{hi} bpm"),
+                        _ => "? bpm".to_string(),
+                    };
+                    println!("zone hold: active, phase {phase}, target {range}");
+                } else {
+                    println!("zone hold: on (not currently engaged)");
+                }
+            } else {
+                println!("zone hold: off");
+            }
+
             let mode_desc = match status.power_mode.as_str() {
                 "ac_scanning" => "on AC power, actively scanning",
                 "battery_idle" => "on battery, idling (scanning paused to save power)",
@@ -669,9 +952,10 @@ fn run_status() -> Result<()> {
 /// treadmill is not on/connected (so the widget hides). Read-only, no BLE —
 /// mirrors `run_status`'s constraint. See docs/tasks/009.
 ///
-/// The line is tab-separated with 10 fields (задача 026 extension):
+/// The line is tab-separated with 11 fields (задача 027 extension):
 /// `state \t workout_count \t cur_walking_s \t cur_steps \t cur_distance_m \t
-/// day_walking_s \t day_steps \t day_distance_m \t hr_bpm \t hr_battery_pct`.
+/// day_walking_s \t day_steps \t day_distance_m \t hr_bpm \t hr_battery_pct \t
+/// hr_zone`.
 /// - `state` — `walking | away | paused | unknown`.
 /// - `workout_count` — number of TODAY's *merged* workouts (reflects the
 ///   configured `workout_gap_minutes`), so the widget can pick a single- vs
@@ -687,6 +971,10 @@ fn run_status() -> Result<()> {
 ///   **empty** when not (yet) read or no sensor connected. Always the raw
 ///   percentage — presentation (e.g. only showing a low-battery glyph below a
 ///   threshold) is the consumer's job, same split as everything else here.
+/// - `hr_zone` — `below | in | above` (задача 027), or **empty** unless Zone
+///   Hold is actually engaged (`zone_hold_active` + `Hold` phase) in the
+///   current `walking` state — see docs/tasks/027 §Индикация зоны. Empty is
+///   the signal for the consumer to colour the heart glyph neutrally.
 fn run_widget() -> Result<()> {
     let store = store::Store::open()?;
 
@@ -747,9 +1035,10 @@ fn run_widget() -> Result<()> {
         .hr_battery_pct
         .map(|pct| pct.to_string())
         .unwrap_or_default();
+    let hr_zone = widget_hr_zone_field(&status, state);
 
     println!(
-        "{state}\t{workout_count}\t{cur_walking_s}\t{cur_steps}\t{cur_distance_m}\t{day_walking_s}\t{day_steps}\t{day_distance_m}\t{hr_bpm}\t{hr_battery_pct}",
+        "{state}\t{workout_count}\t{cur_walking_s}\t{cur_steps}\t{cur_distance_m}\t{day_walking_s}\t{day_steps}\t{day_distance_m}\t{hr_bpm}\t{hr_battery_pct}\t{hr_zone}",
     );
     Ok(())
 }
@@ -774,6 +1063,19 @@ fn widget_hr_field(status: &store::DaemonStatus) -> String {
         }
         _ => String::new(),
     }
+}
+
+/// The widget's 11th field: `below | in | above`, or empty (задача 027). Per
+/// the task doc's operator decision (§Индикация зоны), the heart glyph is only
+/// coloured by zone while Zone Hold is *actually* driving corrections in the
+/// current `walking` state — everywhere else (paused/away/unknown, disabled,
+/// or a `ramp`/`frozen`/`grace` phase that isn't classifying live bpm yet)
+/// this stays empty and the consumer keeps the neutral colour.
+fn widget_hr_zone_field(status: &store::DaemonStatus, widget_state: &str) -> String {
+    if widget_state != "walking" || !status.zone_hold_active {
+        return String::new();
+    }
+    status.zone_hold_position.clone().unwrap_or_default()
 }
 
 /// Is the newest merged workout still the *current* (live) one at `now`? True
