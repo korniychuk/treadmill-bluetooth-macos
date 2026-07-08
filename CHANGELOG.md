@@ -6,6 +6,14 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- tmux widget: the day's total steps — the daily-goal metric — is now rendered
+  **bold** in a fixed near-black (`#181818`) that stays high-contrast on every
+  state background (emerald / yellow / orange / muted), so the most important
+  number is the visual anchor. Presentation-only change to the reference
+  `scripts/tmux/treadmill-widget.sh`; the binary is unchanged.
+
 ## [0.2.0] — 2026-07-07
 
 ### Added
