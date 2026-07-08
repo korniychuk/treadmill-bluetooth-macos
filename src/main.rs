@@ -165,11 +165,15 @@ enum ZoneAction {
         #[arg(long = "min")]
         min_flag: Option<f32>,
     },
-    /// Set the target zone number (1-based index into the configured zones).
+    /// Set the target zone: a 1-based number, an `id`, or a (sub)string of
+    /// the zone's name — see `tm zone list` for what's configured.
     Target {
-        /// Zone number, e.g. `2` for the default "Aerobic base".
-        zone: u8,
+        /// e.g. `2`, `aerobic-base`, or `aerobic`.
+        zone: String,
     },
+    /// List every configured zone with its id, bpm range, and effective max
+    /// speed — so `target` isn't a guessing game.
+    List,
     /// Set the targeting aggressiveness: `band` (hold the zone) or `center`
     /// (hold the midpoint, more corrections).
     Mode {
@@ -420,10 +424,8 @@ fn run_zone(action: Option<ZoneAction>) -> Result<()> {
         }),
         Some(ZoneAction::Setup) => zone_onboarding_prompt(),
         Some(ZoneAction::Limits { max, min, min_flag }) => zone_limits(max, min.or(min_flag)),
-        Some(ZoneAction::Target { zone }) => set_zone_hold_key("target_zone", zone.to_string())
-            .map(|()| {
-                println!("Zone Hold target zone set to #{zone}.");
-            }),
+        Some(ZoneAction::Target { zone }) => zone_target(&zone),
+        Some(ZoneAction::List) => zone_list(),
         Some(ZoneAction::Mode { tracking }) => zone_mode(&tracking),
     }
 }
@@ -462,8 +464,9 @@ fn zone_onboarding_prompt() -> Result<()> {
         zone_hold::DEFAULT_TARGET_ZONE
     );
     println!(
-        "Change the target zone with `tm zone target <n>`, tune limits with `tm zone limits`, \
-         or edit `[[zone_hold.zones]]` in config.toml directly for custom bounds."
+        "See all zones with `tm zone list`; change the target with \
+         `tm zone target <n|id|name>`, tune limits with `tm zone limits`, or edit \
+         `[[zone_hold.zones]]` in config.toml directly for custom bounds."
     );
     Ok(())
 }
@@ -534,6 +537,95 @@ fn zone_limits(max: Option<f32>, min: Option<f32>) -> Result<()> {
     Ok(())
 }
 
+/// `tm zone target <n|id|name-substring>` — resolves against the currently
+/// configured zones and persists the *canonical id* (not the raw input), so
+/// a fuzzy name match today still points at the right zone if `config.toml`
+/// is reordered later. Bare numbers keep the legacy numeric form, since that
+/// selector has no id to normalise to.
+fn zone_target(raw: &str) -> Result<()> {
+    let config = zone_hold::load_zone_hold_config();
+    let trimmed = raw.trim();
+    let selector = match trimmed.parse::<u8>() {
+        Ok(n) => zone_hold::ZoneSelector::Number(n),
+        Err(_) => zone_hold::ZoneSelector::Id(trimmed.to_string()),
+    };
+    let Some((number, zone)) = zone_hold::find_zone(&config.zones, &selector) else {
+        let known: Vec<String> = config
+            .zones
+            .iter()
+            .enumerate()
+            .map(|(i, z)| format!("#{} {} ({})", i + 1, z.id, z.name))
+            .collect();
+        bail!(
+            "no zone matches `{trimmed}` — configured zones: {}",
+            known.join(", ")
+        );
+    };
+    let value = match selector {
+        zone_hold::ZoneSelector::Number(n) => n.to_string(),
+        zone_hold::ZoneSelector::Id(_) => format!("\"{}\"", zone.id),
+    };
+    set_zone_hold_key("target_zone", value)?;
+    println!(
+        "Zone Hold target zone set to #{number} {} ({}).",
+        zone.id, zone.name
+    );
+    Ok(())
+}
+
+/// `tm zone list` — every configured zone with its id and bpm range, so
+/// `target` isn't a guessing game (задача 027 follow-up). Falls back to the
+/// raw percent/bpm bounds when `age` isn't configured yet (no HRmax to
+/// resolve percent zones against).
+fn zone_list() -> Result<()> {
+    let config = zone_hold::load_zone_hold_config();
+    let hrmax = config.hrmax();
+    let method_label = match config.method {
+        zone_hold::Method::HrMax => "hrmax",
+        zone_hold::Method::Karvonen => "karvonen",
+    };
+    if hrmax.is_none() {
+        println!(
+            "Configured zones (age not set — showing raw bounds, not bpm; run `tm zone setup`):"
+        );
+    } else {
+        println!("Configured zones ({method_label}):");
+    }
+    let target_number = zone_hold::find_zone(&config.zones, &config.target_zone).map(|(n, _)| n);
+    for (index, zone) in config.zones.iter().enumerate() {
+        let number = index + 1;
+        let marker = if target_number == Some(number) {
+            "*"
+        } else {
+            " "
+        };
+        let range = match hrmax {
+            Some(hrmax) => {
+                let (low, high) = zone_hold::resolve_zone_bpm(
+                    hrmax,
+                    config.resting_hr,
+                    config.method,
+                    zone.bounds,
+                );
+                format!("{low}-{high} bpm")
+            }
+            None => match zone.bounds {
+                zone_hold::ZoneBounds::Percent { min, max } => format!("{min:.0}-{max:.0}% HRmax"),
+                zone_hold::ZoneBounds::Absolute { min_bpm, max_bpm } => {
+                    format!("{min_bpm}-{max_bpm} bpm")
+                }
+            },
+        };
+        let max_speed = zone.max_speed_kmh.unwrap_or(config.max_speed_kmh);
+        println!(
+            "{marker} #{number} {:<14} id={:<16} {range:<16} max {max_speed:.1} km/h",
+            zone.name, zone.id,
+        );
+    }
+    println!("(* = current target; select with `tm zone target <id|name|number>`)");
+    Ok(())
+}
+
 /// `tm zone mode <band|center>` (задача 027, §Режимы).
 fn zone_mode(tracking: &str) -> Result<()> {
     match tracking {
@@ -588,16 +680,17 @@ fn print_zone_status() -> Result<()> {
             println!("  age {age}, method {method}, tracking {tracking}");
             match config.resolve_target_zone() {
                 Some(resolved) => println!(
-                    "  target zone #{}: {}-{} bpm \u{2022} speed {:.1}-{:.1} km/h",
-                    config.target_zone,
+                    "  target zone #{} {} ({}): {}-{} bpm \u{2022} speed {:.1}-{:.1} km/h",
+                    resolved.number,
+                    resolved.id,
+                    resolved.name,
                     resolved.low_bpm,
                     resolved.high_bpm,
                     config.min_speed_kmh,
                     resolved.effective_max_speed_kmh,
                 ),
                 None => println!(
-                    "  target zone #{} not found among {} configured zones",
-                    config.target_zone,
+                    "  target zone not found among {} configured zones — see `tm zone list`",
                     config.zones.len()
                 ),
             }

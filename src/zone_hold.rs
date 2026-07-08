@@ -71,11 +71,34 @@ pub enum ZoneBounds {
 /// One configured heart-rate zone.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ZoneDef {
+    /// Stable identifier used by `target_zone` and `tm zone target` — either
+    /// an explicit `id = "..."` in the config, or a slug derived from `name`
+    /// when absent. Unlike the 1-based position, this survives reordering or
+    /// inserting zones in `config.toml`.
+    pub id: String,
     pub name: String,
     pub bounds: ZoneBounds,
     /// Per-zone override of the global `max_speed_kmh` — `None` defers to it
     /// (task doc §Min/max: `effective max = zone.max_speed ?? global`).
     pub max_speed_kmh: Option<f32>,
+}
+
+/// Derive a stable `id` from a zone `name` when the config doesn't set one
+/// explicitly: lowercase, non-alphanumeric runs collapsed to a single `-`,
+/// no leading/trailing `-`. E.g. `"Aerobic base"` → `"aerobic-base"`.
+fn slugify(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut last_dash = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
 }
 
 /// The built-in 5-zone table (task doc §Физиология), used whenever the config
@@ -90,6 +113,7 @@ pub fn default_zones() -> Vec<ZoneDef> {
     ]
     .into_iter()
     .map(|(name, min, max)| ZoneDef {
+        id: slugify(name),
         name: name.to_string(),
         bounds: ZoneBounds::Percent { min, max },
         max_speed_kmh: None,
@@ -97,11 +121,57 @@ pub fn default_zones() -> Vec<ZoneDef> {
     .collect()
 }
 
-/// Resolved bpm zone target plus the effective max speed for it (per-zone
-/// override, falling back to the global cap) — everything the controller and
-/// the widget classifier need for one session.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Which zone `target_zone` points at: the legacy 1-based position, or a
+/// stable `id`/name lookup (task doc follow-up — named zones). A bare TOML
+/// integer parses as `Number`; a quoted string as `Id`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ZoneSelector {
+    Number(u8),
+    Id(String),
+}
+
+/// Find the zone a selector points at, plus its current 1-based position.
+/// `Id` matching tries, in order: exact `id` (case-insensitive), exact
+/// `name`, then `name` substring — so `"aerobic"` finds `"Aerobic base"`
+/// without requiring the exact id.
+pub fn find_zone<'a>(
+    zones: &'a [ZoneDef],
+    selector: &ZoneSelector,
+) -> Option<(usize, &'a ZoneDef)> {
+    match selector {
+        ZoneSelector::Number(n) => {
+            let index = n.checked_sub(1)? as usize;
+            zones.get(index).map(|z| (index + 1, z))
+        }
+        ZoneSelector::Id(raw) => {
+            let needle = raw.trim().to_lowercase();
+            if needle.is_empty() {
+                return None;
+            }
+            zones
+                .iter()
+                .position(|z| z.id.to_lowercase() == needle)
+                .or_else(|| zones.iter().position(|z| z.name.to_lowercase() == needle))
+                .or_else(|| {
+                    zones
+                        .iter()
+                        .position(|z| z.name.to_lowercase().contains(&needle))
+                })
+                .map(|index| (index + 1, &zones[index]))
+        }
+    }
+}
+
+/// Resolved bpm zone target plus identity and the effective max speed for it
+/// (per-zone override, falling back to the global cap) — everything the
+/// controller, `tm status`, and the widget classifier need for one session.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedZone {
+    /// 1-based position among the configured zones — display-only, not a
+    /// stable identity (that's `id`).
+    pub number: usize,
+    pub id: String,
+    pub name: String,
     pub low_bpm: u16,
     pub high_bpm: u16,
     pub effective_max_speed_kmh: f32,
@@ -116,7 +186,7 @@ pub struct ZoneHoldConfig {
     pub age: Option<u32>,
     pub resting_hr: Option<u16>,
     pub method: Method,
-    pub target_zone: u8,
+    pub target_zone: ZoneSelector,
     pub min_speed_kmh: f32,
     pub max_speed_kmh: f32,
     pub tracking: Tracking,
@@ -138,7 +208,7 @@ impl ZoneHoldConfig {
             age: None,
             resting_hr: None,
             method: Method::HrMax,
-            target_zone: DEFAULT_TARGET_ZONE,
+            target_zone: ZoneSelector::Number(DEFAULT_TARGET_ZONE),
             min_speed_kmh: DEFAULT_MIN_SPEED_KMH,
             max_speed_kmh: DEFAULT_MAX_SPEED_KMH,
             tracking: Tracking::Band,
@@ -161,14 +231,17 @@ impl ZoneHoldConfig {
     }
 
     /// Resolve `target_zone` to its bpm bounds and effective max speed for
-    /// this session, or `None` when the zone number doesn't exist or `age` is
-    /// unconfigured (nothing to compute HRmax from).
+    /// this session, or `None` when the selector doesn't match any configured
+    /// zone or `age` is unconfigured (nothing to compute HRmax from).
     pub fn resolve_target_zone(&self) -> Option<ResolvedZone> {
         let hrmax = self.hrmax()?;
-        let zone = zone_by_number(&self.zones, self.target_zone)?;
+        let (number, zone) = find_zone(&self.zones, &self.target_zone)?;
         let (low_bpm, high_bpm) =
             resolve_zone_bpm(hrmax, self.resting_hr, self.method, zone.bounds);
         Some(ResolvedZone {
+            number,
+            id: zone.id.clone(),
+            name: zone.name.clone(),
             low_bpm,
             high_bpm,
             effective_max_speed_kmh: zone.max_speed_kmh.unwrap_or(self.max_speed_kmh),
@@ -220,11 +293,6 @@ pub fn resolve_zone_bpm(
 /// the normal band/center correction (task doc §Safety).
 pub fn safety_cap_bpm(hrmax: f32, safety_cap_percent: f32) -> u16 {
     (hrmax * safety_cap_percent / 100.0).round() as u16
-}
-
-fn zone_by_number(zones: &[ZoneDef], number: u8) -> Option<&ZoneDef> {
-    let index = number.checked_sub(1)? as usize;
-    zones.get(index)
 }
 
 /// Where the current bpm sits relative to the target zone — the classification
@@ -403,12 +471,27 @@ fn parse_zone_hold_config(raw: &str) -> ZoneHoldConfig {
         }
     };
 
-    let target_zone = table
-        .get("target_zone")
-        .and_then(|v| v.as_integer())
-        .filter(|&n| n > 0 && n <= u8::MAX as i64)
-        .map(|n| n as u8)
-        .unwrap_or(defaults.target_zone);
+    let target_zone = match table.get("target_zone") {
+        None => defaults.target_zone.clone(),
+        Some(v) => {
+            if let Some(n) = v.as_integer() {
+                if n > 0 && n <= u8::MAX as i64 {
+                    ZoneSelector::Number(n as u8)
+                } else {
+                    warn!(
+                        value = n,
+                        "zone_hold.target_zone out of range — using default"
+                    );
+                    defaults.target_zone.clone()
+                }
+            } else if let Some(s) = v.as_str() {
+                ZoneSelector::Id(s.to_string())
+            } else {
+                warn!("zone_hold.target_zone neither a number nor a string — using default");
+                defaults.target_zone.clone()
+            }
+        }
+    };
 
     let min_speed_kmh = positive_float_or(table, "min_speed", defaults.min_speed_kmh);
     let max_speed_kmh = positive_float_or(table, "max_speed", defaults.max_speed_kmh);
@@ -470,6 +553,11 @@ fn parse_zone_hold_config(raw: &str) -> ZoneHoldConfig {
 
 fn parse_zone_def(value: &toml::Value) -> Option<ZoneDef> {
     let name = value.get("name")?.as_str()?.to_string();
+    let id = value
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| slugify(&name));
     let max_speed_kmh = value
         .get("max_speed")
         .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|n| n as f64)))
@@ -499,6 +587,7 @@ fn parse_zone_def(value: &toml::Value) -> Option<ZoneDef> {
     };
 
     Some(ZoneDef {
+        id,
         name,
         bounds,
         max_speed_kmh,
@@ -680,10 +769,48 @@ mod tests {
     fn resolve_target_zone_picks_the_configured_zone_by_number() {
         let mut config = ZoneHoldConfig::disabled_default();
         config.age = Some(30);
-        config.target_zone = 2;
+        config.target_zone = ZoneSelector::Number(2);
         let resolved = config.resolve_target_zone().expect("zone 2 exists");
         assert_eq!((resolved.low_bpm, resolved.high_bpm), (112, 131));
         assert_eq!(resolved.effective_max_speed_kmh, DEFAULT_MAX_SPEED_KMH);
+    }
+
+    #[test]
+    fn resolve_target_zone_by_exact_id() {
+        let mut config = ZoneHoldConfig::disabled_default();
+        config.age = Some(30);
+        config.target_zone = ZoneSelector::Id("aerobic-base".to_string());
+        let resolved = config.resolve_target_zone().expect("aerobic-base exists");
+        assert_eq!(resolved.number, 2);
+        assert_eq!(resolved.id, "aerobic-base");
+    }
+
+    #[test]
+    fn resolve_target_zone_by_id_is_case_insensitive_and_falls_back_to_name_substring() {
+        let mut config = ZoneHoldConfig::disabled_default();
+        config.age = Some(30);
+        config.target_zone = ZoneSelector::Id("AEROBIC".to_string());
+        let resolved = config
+            .resolve_target_zone()
+            .expect("substring match on name");
+        assert_eq!(resolved.id, "aerobic-base");
+    }
+
+    #[test]
+    fn resolve_target_zone_none_for_unknown_id() {
+        let mut config = ZoneHoldConfig::disabled_default();
+        config.age = Some(30);
+        config.target_zone = ZoneSelector::Id("nonexistent".to_string());
+        assert!(config.resolve_target_zone().is_none());
+    }
+
+    #[test]
+    fn default_zones_have_stable_slug_ids() {
+        let ids: Vec<String> = default_zones().into_iter().map(|z| z.id).collect();
+        assert_eq!(
+            ids,
+            vec!["recovery", "aerobic-base", "tempo", "threshold", "vo2max"]
+        );
     }
 
     #[test]
@@ -696,7 +823,7 @@ mod tests {
     fn resolve_target_zone_uses_per_zone_max_speed_override() {
         let mut config = ZoneHoldConfig::disabled_default();
         config.age = Some(30);
-        config.target_zone = 2;
+        config.target_zone = ZoneSelector::Number(2);
         config.zones[1].max_speed_kmh = Some(5.5);
         let resolved = config.resolve_target_zone().expect("zone 2 exists");
         assert_eq!(resolved.effective_max_speed_kmh, 5.5);
@@ -840,7 +967,7 @@ mod tests {
         assert_eq!(config.age, Some(34));
         assert_eq!(config.resting_hr, Some(65));
         assert_eq!(config.method, Method::Karvonen);
-        assert_eq!(config.target_zone, 3);
+        assert_eq!(config.target_zone, ZoneSelector::Number(3));
         assert_eq!(config.min_speed_kmh, 2.5);
         assert_eq!(config.max_speed_kmh, 5.0);
         assert_eq!(config.tracking, Tracking::Center);
@@ -882,7 +1009,42 @@ mod tests {
         let config = parse_zone_hold_config(raw);
         assert_eq!(config.zones.len(), 1);
         assert_eq!(config.zones[0].name, "Custom");
+        assert_eq!(
+            config.zones[0].id, "custom",
+            "id derived from name when absent"
+        );
         assert_eq!(config.zones[0].max_speed_kmh, Some(6.0));
+    }
+
+    #[test]
+    fn parse_zone_hold_config_custom_zone_explicit_id_overrides_slug() {
+        let raw = r#"
+            [zone_hold]
+            enabled = true
+            age = 30
+
+            [[zone_hold.zones]]
+            id = "recovery-walk"
+            name = "Recovery Walk"
+            min_percent = 55
+            max_percent = 65
+        "#;
+        let config = parse_zone_hold_config(raw);
+        assert_eq!(config.zones[0].id, "recovery-walk");
+    }
+
+    #[test]
+    fn parse_zone_hold_config_target_zone_accepts_a_string_id() {
+        let raw = r#"
+            [zone_hold]
+            enabled = true
+            age = 30
+            target_zone = "tempo"
+        "#;
+        let config = parse_zone_hold_config(raw);
+        assert_eq!(config.target_zone, ZoneSelector::Id("tempo".to_string()));
+        let resolved = config.resolve_target_zone().expect("tempo exists");
+        assert_eq!(resolved.id, "tempo");
     }
 
     #[test]

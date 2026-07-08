@@ -33,7 +33,7 @@ goals = [8000, 10000, 12000]
 # age = 30                 # for HRmax = 208 - 0.7*age (Tanaka formula)
 # resting_hr = 70          # optional; set it to unlock the karvonen method
 # method = "hrmax"         # "hrmax" (% of HRmax) | "karvonen" (% of heart-rate reserve)
-# target_zone = 2          # 1-based index into the zones below (2 = Aerobic base)
+# target_zone = 2          # 1-based index, OR a zone id/name string, e.g. "aerobic-base"
 # min_speed = 2.0          # km/h, hard floor
 # max_speed = 4.5          # km/h, global ceiling (a zone below can override it)
 # tracking = "band"        # "band" (hold the whole zone) | "center" (hold the midpoint)
@@ -47,8 +47,13 @@ goals = [8000, 10000, 12000]
 # Custom zones: any number, your own names/bounds. Give each EITHER a percent
 # range (interpreted per `method` above) OR an absolute bpm range (min_bpm/
 # max_bpm) for manual fine-tuning. Omitted entirely -> the built-in 5 zones
-# (Recovery/Aerobic base/Tempo/Threshold/VO2max).
+# (ids: recovery/aerobic-base/tempo/threshold/vo2max). `id` is optional -- it
+# defaults to a slug of `name` (e.g. "Aerobic base" -> "aerobic-base") and is
+# what `target_zone`/`tm zone target` match against; set it explicitly if you
+# want a shorter or more stable handle than the slugified name. Run
+# `tm zone list` to see everything currently configured, ids included.
 # [[zone_hold.zones]]
+# id = "aerobic-base"      # optional; defaults to a slug of `name`
 # name = "Aerobic base"
 # min_percent = 60
 # max_percent = 70
