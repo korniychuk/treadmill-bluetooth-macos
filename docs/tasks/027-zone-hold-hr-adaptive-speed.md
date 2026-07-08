@@ -375,11 +375,12 @@ Absent/битый ключ → дефолт (absent — тихо; невалид
   ramp, удержание зоны, поведение на сходе/возврате, safety-cap, потеря датчика.
 
 **M3 — CLI/UX:**
-- `tm zone on/off/setup/limits/target/list/mode` + onboarding-промпт; `tm status` строка.
+- `tm zone on/off/setup/limits/target/list/add/edit/remove/mode` + onboarding-промпт; `tm status` строка.
 - `tm widget` поле `HR_ZONE` + `treadmill-widget.sh` bold/italic-индикация зоны
   (below/in/above, без цвета); обновить контракт задачи 009.
 - Именованные/кастомные зоны: `ZoneDef.id`, `target_zone` принимает id/имя,
-  `tm zone list`.
+  `tm zone list`; интерактивные `tm zone add/edit/remove` поверх
+  `zone_hold::replace_zones` (перезаписывает `[[zone_hold.zones]]` целиком).
 - `config.example.toml`, доки, CHANGELOG.
 
 **Вне scope (YAGNI, отдельные задачи при надобности):** интервальный/surge-режим;
@@ -448,6 +449,18 @@ Absent/битый ключ → дефолт (absent — тихо; невалид
   канонический `id`, не сырой ввод — переименование/реордер зон в
   `config.toml` не ломает уже настроенный таргет. `tm zone list` печатает все
   зоны (id, bpm-диапазон, эффективный max_speed), с меткой текущего таргета.
+- **Редактирование зон — интерактивные промпты, не TUI:** `tm zone
+  add/edit/remove` переиспользуют паттерн онбординга (`prompt_age` и т.п.),
+  не полноценный TUI (ratatui и подобное) — лишняя зависимость и сложность
+  ради того же результата. `zone_hold::replace_zones` перезаписывает
+  `[[zone_hold.zones]]` целиком на каждое действие (у array-of-tables нет
+  стабильного якоря для точечного патча одного поля, в отличие от
+  `upsert_zone_hold_keys` для скалярных ключей `[zone_hold]`); `add`
+  материализует дефолтные 5 зон явно, если кастомных ещё не было — иначе
+  добавление одной зоны молча стёрло бы остальные (см. §parse_zone_hold_config:
+  непустой `zones` **заменяет** дефолты, не дополняет). `edit` не даёт менять
+  `id` (target_zone может на него ссылаться) — для переименования id: remove
+  + add. `remove` отказывает удалить последнюю зону.
 - **v1 — плоский hold Zone 2; интервалы отложены (YAGNI).**
 
 ## Открытые вопросы (подтвердить перед/во время реализации)

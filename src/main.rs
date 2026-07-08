@@ -174,6 +174,22 @@ enum ZoneAction {
     /// List every configured zone with its id, bpm range, and effective max
     /// speed — so `target` isn't a guessing game.
     List,
+    /// Interactively add a custom zone (name, id, bpm bounds, optional
+    /// per-zone max speed). Appending a custom zone keeps every zone already
+    /// configured — including the built-in 5, if none were customised yet.
+    Add,
+    /// Interactively edit an existing zone's name/bounds/max speed. The `id`
+    /// itself isn't editable here (it's what `target_zone` may point at) —
+    /// remove and re-add it to rename the id.
+    Edit {
+        /// e.g. `2`, `aerobic-base`, or `aerobic`.
+        zone: String,
+    },
+    /// Remove a configured zone. Refuses to remove the last remaining one.
+    Remove {
+        /// e.g. `2`, `aerobic-base`, or `aerobic`.
+        zone: String,
+    },
     /// Set the targeting aggressiveness: `band` (hold the zone) or `center`
     /// (hold the midpoint, more corrections).
     Mode {
@@ -426,6 +442,9 @@ fn run_zone(action: Option<ZoneAction>) -> Result<()> {
         Some(ZoneAction::Limits { max, min, min_flag }) => zone_limits(max, min.or(min_flag)),
         Some(ZoneAction::Target { zone }) => zone_target(&zone),
         Some(ZoneAction::List) => zone_list(),
+        Some(ZoneAction::Add) => zone_add(),
+        Some(ZoneAction::Edit { zone }) => zone_edit(&zone),
+        Some(ZoneAction::Remove { zone }) => zone_remove(&zone),
         Some(ZoneAction::Mode { tracking }) => zone_mode(&tracking),
     }
 }
@@ -544,11 +563,7 @@ fn zone_limits(max: Option<f32>, min: Option<f32>) -> Result<()> {
 /// selector has no id to normalise to.
 fn zone_target(raw: &str) -> Result<()> {
     let config = zone_hold::load_zone_hold_config();
-    let trimmed = raw.trim();
-    let selector = match trimmed.parse::<u8>() {
-        Ok(n) => zone_hold::ZoneSelector::Number(n),
-        Err(_) => zone_hold::ZoneSelector::Id(trimmed.to_string()),
-    };
+    let selector = parse_zone_selector(raw);
     let Some((number, zone)) = zone_hold::find_zone(&config.zones, &selector) else {
         let known: Vec<String> = config
             .zones
@@ -557,7 +572,8 @@ fn zone_target(raw: &str) -> Result<()> {
             .map(|(i, z)| format!("#{} {} ({})", i + 1, z.id, z.name))
             .collect();
         bail!(
-            "no zone matches `{trimmed}` — configured zones: {}",
+            "no zone matches `{}` — configured zones: {}",
+            raw.trim(),
             known.join(", ")
         );
     };
@@ -624,6 +640,319 @@ fn zone_list() -> Result<()> {
     }
     println!("(* = current target; select with `tm zone target <id|name|number>`)");
     Ok(())
+}
+
+/// `tm zone add` — interactively append a custom zone (задача 027 follow-up).
+/// `load_zone_hold_config` already materialises the built-in 5 zones when
+/// `config.toml` has none configured, so pushing onto `config.zones` and
+/// writing it back via `replace_zones` keeps every existing zone (custom or
+/// default) — it never silently drops down to just the new one.
+fn zone_add() -> Result<()> {
+    println!("Add a custom Zone Hold zone.");
+    let mut config = zone_hold::load_zone_hold_config();
+    let name = prompt_line("Name", None)?;
+    let default_id = zone_hold::slugify(&name);
+    let id = prompt_zone_id(&default_id, &config.zones, None)?;
+    let bounds = prompt_zone_bounds(None)?;
+    let max_speed_kmh = prompt_optional_max_speed(None)?;
+    config.zones.push(zone_hold::ZoneDef {
+        id: id.clone(),
+        name: name.clone(),
+        bounds,
+        max_speed_kmh,
+    });
+    let path = zone_hold_config_path()?;
+    zone_hold::replace_zones(&path, &config.zones)?;
+    println!(
+        "Added zone `{id}` ({name}). See it with `tm zone list`; select it with `tm zone target {id}`."
+    );
+    Ok(())
+}
+
+/// `tm zone edit <zone>` — interactively change an existing zone's
+/// name/bounds/max-speed override, keeping its `id` stable (it's what
+/// `target_zone` may already point at, so renaming it here would silently
+/// break that reference — remove + re-add is the explicit way to rename).
+fn zone_edit(raw: &str) -> Result<()> {
+    let mut config = zone_hold::load_zone_hold_config();
+    let selector = parse_zone_selector(raw);
+    let Some((index, zone)) = zone_hold::find_zone(&config.zones, &selector) else {
+        bail!("no zone matches `{}` — see `tm zone list`", raw.trim());
+    };
+    let index = index - 1;
+    println!(
+        "Editing zone `{}` ({}) — press Enter to keep the current value.",
+        zone.id, zone.name
+    );
+    let name = prompt_line("Name", Some(&zone.name))?;
+    let bounds = prompt_zone_bounds(Some(zone.bounds))?;
+    let max_speed_kmh = prompt_optional_max_speed(zone.max_speed_kmh)?;
+    let id = zone.id.clone();
+    config.zones[index] = zone_hold::ZoneDef {
+        id: id.clone(),
+        name,
+        bounds,
+        max_speed_kmh,
+    };
+    let path = zone_hold_config_path()?;
+    zone_hold::replace_zones(&path, &config.zones)?;
+    println!("Updated zone `{id}`.");
+    Ok(())
+}
+
+/// `tm zone remove <zone>` — refuses to drop the last remaining zone (Zone
+/// Hold needs at least one to resolve `target_zone` against).
+fn zone_remove(raw: &str) -> Result<()> {
+    let mut config = zone_hold::load_zone_hold_config();
+    if config.zones.len() <= 1 {
+        bail!("can't remove the last zone — Zone Hold needs at least one configured");
+    }
+    let selector = parse_zone_selector(raw);
+    let Some((_, zone)) = zone_hold::find_zone(&config.zones, &selector) else {
+        bail!("no zone matches `{}` — see `tm zone list`", raw.trim());
+    };
+    let removed_id = zone.id.clone();
+    let removed_name = zone.name.clone();
+    config.zones.retain(|z| z.id != removed_id);
+    let path = zone_hold_config_path()?;
+    zone_hold::replace_zones(&path, &config.zones)?;
+    println!("Removed zone `{removed_id}` ({removed_name}).");
+    if config.resolve_target_zone().is_none() {
+        println!(
+            "Note: the current target_zone no longer resolves — pick a new one with `tm zone target`."
+        );
+    }
+    Ok(())
+}
+
+/// A bare number parses as the legacy 1-based position; anything else is
+/// looked up as an id/name (задача 027 follow-up — shared by
+/// target/edit/remove so all three accept the same selector syntax).
+fn parse_zone_selector(raw: &str) -> zone_hold::ZoneSelector {
+    let trimmed = raw.trim();
+    match trimmed.parse::<u8>() {
+        Ok(n) => zone_hold::ZoneSelector::Number(n),
+        Err(_) => zone_hold::ZoneSelector::Id(trimmed.to_string()),
+    }
+}
+
+/// Prompt for a line of text. `default` is shown in `[brackets]` and kept on
+/// an empty line; with no default, an empty line reprompts.
+fn prompt_line(label: &str, default: Option<&str>) -> Result<String> {
+    use std::io::Write;
+    loop {
+        match default {
+            Some(d) => print!("{label} [{d}]: "),
+            None => print!("{label}: "),
+        }
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .with_context(|| format!("read {label} from stdin"))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if let Some(d) = default {
+                return Ok(d.to_string());
+            }
+            println!("{label} can't be empty");
+            continue;
+        }
+        return Ok(trimmed.to_string());
+    }
+}
+
+/// Prompt for a positive `f32`, keeping `default` (if any) on an empty line.
+fn prompt_f32(label: &str, default: Option<f32>) -> Result<f32> {
+    use std::io::Write;
+    loop {
+        match default {
+            Some(d) => print!("{label} [{d}]: "),
+            None => print!("{label}: "),
+        }
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .with_context(|| format!("read {label} from stdin"))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            && let Some(d) = default
+        {
+            return Ok(d);
+        }
+        if let Ok(n) = trimmed.parse::<f32>()
+            && n > 0.0
+        {
+            return Ok(n);
+        }
+        println!("please enter a positive number");
+    }
+}
+
+/// Prompt for a positive `u16` (bpm values), same default handling as
+/// [`prompt_f32`].
+fn prompt_u16(label: &str, default: Option<u16>) -> Result<u16> {
+    use std::io::Write;
+    loop {
+        match default {
+            Some(d) => print!("{label} [{d}]: "),
+            None => print!("{label}: "),
+        }
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .with_context(|| format!("read {label} from stdin"))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            && let Some(d) = default
+        {
+            return Ok(d);
+        }
+        if let Ok(n) = trimmed.parse::<u16>()
+            && n > 0
+        {
+            return Ok(n);
+        }
+        println!("please enter a positive whole number");
+    }
+}
+
+/// Prompt for a zone's bpm bounds — either a percent-of-HRmax/HRR range or an
+/// absolute bpm range. `default` pre-fills both the kind and the values when
+/// editing an existing zone; `None` (adding a new zone) asks for everything.
+fn prompt_zone_bounds(default: Option<zone_hold::ZoneBounds>) -> Result<zone_hold::ZoneBounds> {
+    use std::io::Write;
+    let default_kind = default.map(|b| match b {
+        zone_hold::ZoneBounds::Percent { .. } => "percent",
+        zone_hold::ZoneBounds::Absolute { .. } => "bpm",
+    });
+    loop {
+        match default_kind {
+            Some(k) => print!("Bounds — `percent` (of HRmax/HRR) or `bpm` (absolute) [{k}]: "),
+            None => print!("Bounds — `percent` (of HRmax/HRR) or `bpm` (absolute): "),
+        }
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("read bounds kind from stdin")?;
+        let raw = line.trim().to_lowercase();
+        let kind = if raw.is_empty() {
+            match default_kind {
+                Some(k) => k.to_string(),
+                None => {
+                    println!("please type `percent` or `bpm`");
+                    continue;
+                }
+            }
+        } else {
+            raw
+        };
+        match kind.as_str() {
+            "percent" | "%" => {
+                let (dmin, dmax) = match default {
+                    Some(zone_hold::ZoneBounds::Percent { min, max }) => (Some(min), Some(max)),
+                    _ => (None, None),
+                };
+                let min = prompt_f32("Min percent", dmin)?;
+                let max = prompt_f32("Max percent", dmax)?;
+                if min >= max {
+                    println!("min must be less than max");
+                    continue;
+                }
+                return Ok(zone_hold::ZoneBounds::Percent { min, max });
+            }
+            "bpm" => {
+                let (dmin, dmax) = match default {
+                    Some(zone_hold::ZoneBounds::Absolute { min_bpm, max_bpm }) => {
+                        (Some(min_bpm), Some(max_bpm))
+                    }
+                    _ => (None, None),
+                };
+                let min = prompt_u16("Min bpm", dmin)?;
+                let max = prompt_u16("Max bpm", dmax)?;
+                if min >= max {
+                    println!("min must be less than max");
+                    continue;
+                }
+                return Ok(zone_hold::ZoneBounds::Absolute {
+                    min_bpm: min,
+                    max_bpm: max,
+                });
+            }
+            other => println!("unrecognised `{other}` — type `percent` or `bpm`"),
+        }
+    }
+}
+
+/// Prompt for an optional per-zone max-speed override. Empty line keeps
+/// `default`; `none`/`-` explicitly clears it (only meaningful when editing);
+/// an implausible number keeps `default` rather than erroring out on a typo.
+fn prompt_optional_max_speed(default: Option<f32>) -> Result<Option<f32>> {
+    use std::io::Write;
+    match default {
+        Some(d) => print!("Per-zone max speed override, km/h (`none` to clear) [{d}]: "),
+        None => print!("Per-zone max speed override, km/h (optional — Enter to skip): "),
+    }
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("read max speed from stdin")?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(default);
+    }
+    if trimmed.eq_ignore_ascii_case("none") || trimmed == "-" {
+        return Ok(None);
+    }
+    match trimmed.parse::<f32>() {
+        Ok(n) if n > 0.0 => Ok(Some(n)),
+        _ => {
+            println!("not a plausible speed — keeping the previous value");
+            Ok(default)
+        }
+    }
+}
+
+/// Prompt for a zone `id`, defaulting to `default_id` (typically a slug of
+/// the name just entered) and rejecting a clash with any other configured
+/// zone. `editing` is the id already owned by the zone being edited (exempt
+/// from the clash check against itself) — `None` when adding a new zone.
+fn prompt_zone_id(
+    default_id: &str,
+    existing: &[zone_hold::ZoneDef],
+    editing: Option<&str>,
+) -> Result<String> {
+    use std::io::Write;
+    loop {
+        print!("Zone id [{default_id}]: ");
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("read zone id from stdin")?;
+        let trimmed = line.trim();
+        let id = if trimmed.is_empty() {
+            default_id.to_string()
+        } else {
+            trimmed.to_string()
+        };
+        if id.is_empty() {
+            println!("id can't be empty");
+            continue;
+        }
+        let clash = existing
+            .iter()
+            .any(|z| z.id.eq_ignore_ascii_case(&id) && Some(z.id.as_str()) != editing);
+        if clash {
+            println!("id `{id}` is already used by another zone — pick a different one");
+            continue;
+        }
+        return Ok(id);
+    }
 }
 
 /// `tm zone mode <band|center>` (задача 027, §Режимы).

@@ -32,12 +32,14 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every 20s, bounded ±0.3 km/h per step. Freezes on stepping off the belt and
   runs a 45s no-acceleration grace window on return; force-reduces (and, at
   min speed, stops the belt) above 80%/85% of HRmax as a safety cap. New `tm
-  zone` CLI (`on`/`off`/`setup`/`limits`/`target`/`list`/`mode`, no-arg =
-  status) — `on` runs an interactive onboarding prompt (age, optional resting
-  HR) the first time; `list` prints every configured zone (id, bpm range,
-  effective max speed). Zones can be custom-named: `target_zone` accepts a
-  1-based number, an explicit/derived zone `id`, or a name substring. `tm
-  status` gains a Zone Hold line; `tm widget` gains an `hr_zone` field
+  zone` CLI (`on`/`off`/`setup`/`limits`/`target`/`list`/`add`/`edit`/
+  `remove`/`mode`, no-arg = status) — `on` runs an interactive onboarding
+  prompt (age, optional resting HR) the first time; `list` prints every
+  configured zone (id, bpm range, effective max speed); `add`/`edit`/`remove`
+  interactively manage custom zones. Zones can be custom-named: `target_zone`
+  accepts a 1-based number, an explicit/derived zone `id`, or a name
+  substring. `tm status` gains a Zone Hold line; `tm widget` gains an
+  `hr_zone` field
   (`below`/`in`/`above`/empty, 11 fields total now) — the reference tmux
   script weights the whole `♥ NNN` token by it (plain/bold/bold-italic, no
   colour change) while Zone Hold is actively correcting. Off by default;

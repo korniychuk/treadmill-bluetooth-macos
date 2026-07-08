@@ -51,7 +51,9 @@ goals = [8000, 10000, 12000]
 # defaults to a slug of `name` (e.g. "Aerobic base" -> "aerobic-base") and is
 # what `target_zone`/`tm zone target` match against; set it explicitly if you
 # want a shorter or more stable handle than the slugified name. Run
-# `tm zone list` to see everything currently configured, ids included.
+# `tm zone list` to see everything currently configured, ids included, or use
+# `tm zone add`/`edit`/`remove` for an interactive prompt instead of hand-
+# editing this file.
 # [[zone_hold.zones]]
 # id = "aerobic-base"      # optional; defaults to a slug of `name`
 # name = "Aerobic base"

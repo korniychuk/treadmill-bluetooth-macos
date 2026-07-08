@@ -86,7 +86,7 @@ pub struct ZoneDef {
 /// Derive a stable `id` from a zone `name` when the config doesn't set one
 /// explicitly: lowercase, non-alphanumeric runs collapsed to a single `-`,
 /// no leading/trailing `-`. E.g. `"Aerobic base"` → `"aerobic-base"`.
-fn slugify(name: &str) -> String {
+pub fn slugify(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut last_dash = false;
     for c in name.chars() {
@@ -689,6 +689,71 @@ pub fn upsert_zone_hold_keys(path: &Path, updates: &[(&str, String)]) -> anyhow:
     Ok(())
 }
 
+/// Escape `"` and `\` for a TOML basic string — the zone `id`/`name` values
+/// [`replace_zones`] writes are operator-typed free text, not guaranteed
+/// TOML-safe as-is.
+fn escape_toml_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Rewrite every `[[zone_hold.zones]]` block wholesale from `zones` — used by
+/// `tm zone add/edit/remove` (задача 027 follow-up). Unlike
+/// [`upsert_zone_hold_keys`]'s targeted key patch, this always regenerates
+/// the whole zones section: an array-of-tables has no stable per-field
+/// anchor to patch in place, and zones are edited as a unit (one CLI action
+/// touches one zone, but the *file* always reflects the full current list).
+/// The rest of the file (scalar `[zone_hold]` keys, comments, `goals` etc.)
+/// is left untouched.
+pub fn replace_zones(path: &Path, zones: &[ZoneDef]) -> anyhow::Result<()> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
+
+    // Strip every existing zone block: the `[[zone_hold.zones]]` header
+    // through the line before the next top-level `[...]` header (or EOF).
+    // Repeated because consecutive zone blocks each start a fresh header.
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == "[[zone_hold.zones]]" {
+            let mut end = i + 1;
+            while end < lines.len() && !lines[end].trim_start().starts_with('[') {
+                end += 1;
+            }
+            lines.drain(i..end);
+        } else {
+            i += 1;
+        }
+    }
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if !lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    for zone in zones {
+        lines.push("[[zone_hold.zones]]".to_string());
+        lines.push(format!("id = \"{}\"", escape_toml_string(&zone.id)));
+        lines.push(format!("name = \"{}\"", escape_toml_string(&zone.name)));
+        match zone.bounds {
+            ZoneBounds::Percent { min, max } => {
+                lines.push(format!("min_percent = {min}"));
+                lines.push(format!("max_percent = {max}"));
+            }
+            ZoneBounds::Absolute { min_bpm, max_bpm } => {
+                lines.push(format!("min_bpm = {min_bpm}"));
+                lines.push(format!("max_bpm = {max_bpm}"));
+            }
+        }
+        if let Some(max_speed) = zone.max_speed_kmh {
+            lines.push(format!("max_speed = {max_speed}"));
+        }
+        lines.push(String::new());
+    }
+
+    std::fs::write(path, lines.join("\n"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1092,6 +1157,59 @@ mod tests {
         let updated = std::fs::read_to_string(&path).unwrap();
         assert_eq!(updated.matches("age =").count(), 1);
         assert!(updated.contains("age = 40"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn replace_zones_round_trips_through_parse() {
+        let dir = std::env::temp_dir().join(format!("tm-zh-test-rz-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "goals = [8000]\n\n[zone_hold]\nenabled = true\nage = 34\n",
+        )
+        .unwrap();
+
+        let zones = vec![
+            ZoneDef {
+                id: "easy".to_string(),
+                name: "Easy".to_string(),
+                bounds: ZoneBounds::Percent {
+                    min: 50.0,
+                    max: 60.0,
+                },
+                max_speed_kmh: None,
+            },
+            ZoneDef {
+                id: "hard".to_string(),
+                name: "Hard \"quoted\"".to_string(),
+                bounds: ZoneBounds::Absolute {
+                    min_bpm: 140,
+                    max_bpm: 160,
+                },
+                max_speed_kmh: Some(5.0),
+            },
+        ];
+        replace_zones(&path, &zones).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("goals = [8000]"));
+        assert!(written.contains("enabled = true"));
+        assert_eq!(written.matches("[[zone_hold.zones]]").count(), 2);
+
+        let config = parse_zone_hold_config(&written);
+        assert_eq!(config.zones.len(), 2);
+        assert_eq!(config.zones[0].id, "easy");
+        assert_eq!(config.zones[1].name, "Hard \"quoted\"");
+        assert_eq!(config.zones[1].max_speed_kmh, Some(5.0));
+
+        // Replacing again must not leave the old blocks behind (regression:
+        // the previous zones section, not just appended-to).
+        replace_zones(&path, &zones[..1]).unwrap();
+        let updated = parse_zone_hold_config(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(updated.zones.len(), 1);
 
         std::fs::remove_file(&path).ok();
     }
