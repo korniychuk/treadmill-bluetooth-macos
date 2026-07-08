@@ -19,6 +19,10 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
 - `src/main.rs` — точка входа и CLI (`scan` | `connect` | `daemon` | `stats` | ...).
 - `src/scan.rs` — обнаружение адаптера, скан, подключение, подписка на нотификации.
 - `src/ftms.rs` — константы Fitness Machine Service (`0x1826`) и парсинг Treadmill Data (`0x2ACD`).
+- `src/hr.rs` — константы Heart Rate Service (`0x180D`) и парсинг Heart Rate
+  Measurement (`0x2A37`, задача 025): u8/u16 bpm, sensor-contact флаги, RR-интервалы
+  (задел под HRV, пока не используется). `bpm==0` (потеря контакта у H10) — DEBUG,
+  не ошибка, кадр отбрасывается.
 - `src/control.rs` — FTMS Control Point (start/stop/speed).
 - `src/control_command.rs` — `ControlCommand` тип (`start`/`stop`/`speed:<kmh>`),
   парс/формат и staleness-проверка для очереди команд (задача 013).
@@ -61,6 +65,14 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
   bounded Control-Point round-trip), лента гаснет своим встроенным shutoff'ом;
   чистое решение `auto_pause_due`, одна попытка на away-spell + ретрай через
   cooldown при сбое.
+  Пульс (задача 025): второй, независимый BLE-линк (HR-датчик, напр. Polar
+  H10). Коннект/реконнект — best-effort на **отдельной spawned-таске**
+  (`spawn_hr_connect_attempt`), чтобы скан (до 15с, нормальный исход когда
+  датчик не надет) не блокировал телеметрию дорожки; результат приходит через
+  `mpsc`-канал. Живой стрим `0x2A37` — отдельная ветка в том же `select!`,
+  свой bounded timeout (10с) — пропажа датчика не роняет цикл дорожки.
+  Сэмплы пишутся в `hr_samples`, снапшот (`hr_connected`+`last_bpm`+`last_bpm_ts`)
+  — в `daemon_status` вместе с остальным heartbeat'ом.
 - `src/power.rs` — детекция AC-питания (`pmset -g batt`); на батарее и без
   подключённой дорожки демон не сканирует, чтобы не сажать аккумулятор.
 - `src/notify.rs` — нативные macOS-уведомления (`mac-notification-sys`,
@@ -73,6 +85,11 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
   `load_auto_pause()` — порог авто-паузы простаивающей ленты из того же файла
   (задача 020, дефолт 5 мин, `0` — выключено), `None` = выключено.
 - `src/logger.rs` — сырой JSONL-лог телеметрии (source-of-truth параллельно с SQLite).
+- `src/store.rs` (доп., задача 025) — `hr_samples` (индекс по `ts_ms`, не по
+  `session_id` — агрегаты джойнят по временному окну тренировки/дня) +
+  `hr_summary_for(from, to)`: `♥ avg/max` = trimmed-mean (переиспользует
+  `default_speed::trimmed_mean_speed`) / p95 (устойчив к единичному спайку).
+  `None` при < 10 сэмплов в окне.
 
 ## Протокол
 
@@ -85,6 +102,8 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
 - `0x2ACD` — Treadmill Data (notify)
 - `0x2AD9` — Fitness Machine Control Point (write/indicate) — задел под управление
 - `0x2ADA` — Fitness Machine Status (notify)
+- `0x180D` — Heart Rate Service (задача 025, напр. Polar H10)
+- `0x2A37` — Heart Rate Measurement (notify)
 
 ## Команды
 
@@ -96,6 +115,7 @@ cargo run -- stats     # статистика за сегодня; `stats --all`
 cargo run -- widget    # компактный TSV текущей тренировки для status-bar виджета; пусто если дорожка off (см. docs/tasks/009)
 cargo run -- recompute-segments  # пересобрать activity_segments из raw_samples (без BLE, идемпотентно; docs/tasks/015)
 cargo run -- default-speed  # показать расчётную дефолтную скорость на старте тренировки (без BLE; docs/tasks/016)
+cargo run -- hr        # диагностика: подключиться к HR-датчику и печатать live bpm (docs/tasks/025)
 cargo run -- --help    # полный список команд
 cargo test             # юнит-тесты
 cargo clippy           # линт

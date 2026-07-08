@@ -6,6 +6,19 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Heart-rate support via a chest-strap BLE sensor (e.g. Polar H10, задача
+  025): the daemon holds a second, independent BLE link and records
+  continuous bpm samples alongside steps. `tm stats` shows a compact `♥
+  avg/max` summary per day/workout (trimmed-mean average, p95 peak); `tm
+  widget` gains a 9th field for the live bpm (empty unless a sensor is worn
+  and fresh) — see the updated tmux widget contract in `scripts/tmux/README.md`;
+  `tm status` shows whether a sensor is connected. `tm hr` is a new
+  diagnostic command (bring-up/troubleshooting only). No sensor worn is the
+  normal case throughout — every surface degrades silently (empty/omitted),
+  never an error.
+
 ## [0.2.1] — 2026-07-08
 
 ### Changed

@@ -26,7 +26,9 @@ use chrono::{DateTime, Duration, Local, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::control_command::ControlCommand;
+use crate::default_speed::trimmed_mean_speed;
 use crate::ftms::TreadmillData;
+use crate::hr::HrMeasurement;
 
 /// Rows in `control_commands` older than this are pruned on every enqueue, so
 /// the queue can never grow unbounded. Far larger than the CLI's ~8s poll and
@@ -109,6 +111,16 @@ pub struct DaemonStatus {
     pub config_goals: Option<String>,
     pub config_auto_pause_secs: Option<i64>,
     pub config_loaded_at: Option<String>,
+    /// Heart-rate snapshot (задача 025), same pattern as the treadmill's own
+    /// `connected`: the daemon upserts these on every HR sample/heartbeat so a
+    /// separate `stats`/`widget`/`status` invocation can show "is the strap on
+    /// right now" without racing the daemon for the BLE adapter. `last_bpm_ts`
+    /// is a Unix millis timestamp (not RFC3339, unlike the other timestamp
+    /// fields here) so freshness is a plain integer subtraction, matching
+    /// `hr_samples.ts_ms`.
+    pub hr_connected: bool,
+    pub last_bpm: Option<i64>,
+    pub last_bpm_ts: Option<i64>,
 }
 
 /// Per-sample deltas against the persisted device baseline. Not yet a
@@ -133,6 +145,23 @@ pub struct RawSample {
     pub distance_m: Option<u32>,
     pub elapsed_s: Option<u16>,
     pub steps: Option<u32>,
+}
+
+/// Below this many `hr_samples` in a window, [`Store::hr_summary_for`] returns
+/// `None` rather than a summary computed from too little data to be meaningful.
+const MIN_HR_SAMPLES_FOR_SUMMARY: usize = 10;
+
+/// Trim fraction for the heart-rate average — mirrors
+/// `default_speed::TRIM_FRACTION` (15% off each end of the sorted samples).
+const HR_TRIM_FRACTION: f32 = 0.15;
+
+/// Compact heart-rate summary over a time window (задача 025): `avg_bpm` is
+/// the trimmed mean (drops brief contact-loss/noise artifacts), `max_bpm` is
+/// the p95 (a "peak effort" figure, robust against a single spike).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HrSummary {
+    pub avg_bpm: i64,
+    pub max_bpm: i64,
 }
 
 /// `control_commands.status` values. Kept as short string literals (not an
@@ -216,6 +245,15 @@ impl Store {
                     raw_frame BLOB NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_raw_samples_session ON raw_samples(session_id);
+                CREATE TABLE IF NOT EXISTS hr_samples (
+                    id         INTEGER PRIMARY KEY,
+                    session_id INTEGER REFERENCES sessions(id),
+                    ts_ms      INTEGER NOT NULL,
+                    bpm        INTEGER NOT NULL,
+                    rr_ms      BLOB,
+                    raw_frame  BLOB NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_hr_samples_ts ON hr_samples(ts_ms);
                 CREATE TABLE IF NOT EXISTS status_events (
                     id INTEGER PRIMARY KEY,
                     session_id INTEGER NOT NULL REFERENCES sessions(id),
@@ -271,6 +309,14 @@ impl Store {
             "ALTER TABLE daemon_status ADD COLUMN config_auto_pause_secs INTEGER",
         )?;
         self.add_column_if_missing("ALTER TABLE daemon_status ADD COLUMN config_loaded_at TEXT")?;
+
+        // Heart-rate snapshot columns (задача 025). `hr_connected` defaults to 0
+        // (not connected) so a pre-025 row reads as "no sensor" rather than NULL.
+        self.add_column_if_missing(
+            "ALTER TABLE daemon_status ADD COLUMN hr_connected INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_column_if_missing("ALTER TABLE daemon_status ADD COLUMN last_bpm INTEGER")?;
+        self.add_column_if_missing("ALTER TABLE daemon_status ADD COLUMN last_bpm_ts INTEGER")?;
         Ok(())
     }
 
@@ -503,6 +549,77 @@ impl Store {
             )
             .context("insert raw_samples row")?;
         Ok(())
+    }
+
+    /// Persist one decoded Heart Rate Measurement (`0x2A37`) sample (задача
+    /// 025). `rr_ms` is left `NULL` for now — the column is a deliberate
+    /// forward-looking slot for a future HRV feature, not decoded/stored yet.
+    pub fn insert_hr_sample(
+        &self,
+        session_id: i64,
+        ts_ms: i64,
+        sample: &HrMeasurement,
+        raw_frame: &[u8],
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO hr_samples (session_id, ts_ms, bpm, rr_ms, raw_frame)
+                 VALUES (?1, ?2, ?3, NULL, ?4)",
+                params![session_id, ts_ms, sample.bpm as i64, raw_frame],
+            )
+            .context("insert hr_samples row")?;
+        Ok(())
+    }
+
+    /// Compact heart-rate summary over a wall-clock window `[from_rfc3339,
+    /// to_rfc3339]` — a trimmed-mean average and a p95 peak (задача 025), the
+    /// same statistical shape `default_speed::trimmed_mean_speed` already uses
+    /// for belt-speed cruising estimates: trimming kills the strap's own
+    /// artifacts (brief contact-loss spikes, warm-up noise) without a manual
+    /// floor. Returns `None` when fewer than [`MIN_HR_SAMPLES_FOR_SUMMARY`]
+    /// samples fall in the window — too little to summarize meaningfully
+    /// (e.g. a workout with no HR sensor worn, or a very short one).
+    pub fn hr_summary_for(
+        &self,
+        from_rfc3339: &str,
+        to_rfc3339: &str,
+    ) -> Result<Option<HrSummary>> {
+        let start_ms = DateTime::parse_from_rfc3339(from_rfc3339)
+            .context("parse hr window start")?
+            .timestamp_millis();
+        let end_ms = DateTime::parse_from_rfc3339(to_rfc3339)
+            .context("parse hr window end")?
+            .timestamp_millis();
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT bpm FROM hr_samples
+                 WHERE ts_ms BETWEEN ?1 AND ?2 AND bpm > 0
+                 ORDER BY bpm ASC",
+            )
+            .context("prepare hr_summary_for query")?;
+        let bpms: Vec<f32> = stmt
+            .query_map(params![start_ms, end_ms], |row| {
+                let bpm: i64 = row.get(0)?;
+                Ok(bpm as f32)
+            })
+            .context("run hr_summary_for query")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect hr_summary_for rows")?;
+
+        if bpms.len() < MIN_HR_SAMPLES_FOR_SUMMARY {
+            return Ok(None);
+        }
+
+        // `bpms` is already sorted ascending (the query's `ORDER BY bpm`), so
+        // the trim + percentile below need no re-sort.
+        let trimmed = trimmed_mean_speed(&bpms, 0.0, HR_TRIM_FRACTION)
+            .expect("non-empty bpms always yields a trimmed mean");
+        Ok(Some(HrSummary {
+            avg_bpm: trimmed.mean_kmh.round() as i64,
+            max_bpm: percentile_95(&bpms).round() as i64,
+        }))
     }
 
     /// Persist one Fitness Machine Status (`0x2ADA`) event verbatim.
@@ -763,8 +880,9 @@ impl Store {
                 "INSERT INTO daemon_status
                     (id, connected, presence_state, last_connected_at, last_disconnected_at,
                      power_mode, power_mode_since, updated_at,
-                     config_goals, config_auto_pause_secs, config_loaded_at)
-                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                     config_goals, config_auto_pause_secs, config_loaded_at,
+                     hr_connected, last_bpm, last_bpm_ts)
+                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(id) DO UPDATE SET
                     connected = excluded.connected,
                     presence_state = excluded.presence_state,
@@ -775,7 +893,10 @@ impl Store {
                     updated_at = excluded.updated_at,
                     config_goals = excluded.config_goals,
                     config_auto_pause_secs = excluded.config_auto_pause_secs,
-                    config_loaded_at = excluded.config_loaded_at",
+                    config_loaded_at = excluded.config_loaded_at,
+                    hr_connected = excluded.hr_connected,
+                    last_bpm = excluded.last_bpm,
+                    last_bpm_ts = excluded.last_bpm_ts",
                 params![
                     status.connected,
                     status.presence_state,
@@ -787,6 +908,9 @@ impl Store {
                     status.config_goals,
                     status.config_auto_pause_secs,
                     status.config_loaded_at,
+                    status.hr_connected,
+                    status.last_bpm,
+                    status.last_bpm_ts,
                 ],
             )
             .context("upsert daemon_status")?;
@@ -800,7 +924,8 @@ impl Store {
             .query_row(
                 "SELECT connected, presence_state, last_connected_at, last_disconnected_at,
                         power_mode, power_mode_since, updated_at,
-                        config_goals, config_auto_pause_secs, config_loaded_at
+                        config_goals, config_auto_pause_secs, config_loaded_at,
+                        hr_connected, last_bpm, last_bpm_ts
                  FROM daemon_status WHERE id = 0",
                 [],
                 |row| {
@@ -815,6 +940,9 @@ impl Store {
                         config_goals: row.get(7)?,
                         config_auto_pause_secs: row.get(8)?,
                         config_loaded_at: row.get(9)?,
+                        hr_connected: row.get(10)?,
+                        last_bpm: row.get(11)?,
+                        last_bpm_ts: row.get(12)?,
                     })
                 },
             )
@@ -1064,6 +1192,16 @@ fn delta_since(new: i64, last: Option<i64>) -> i64 {
         Some(_) => new,
         None => 0,
     }
+}
+
+/// The 95th percentile of an ascending-sorted slice — a "peak effort" bpm
+/// figure robust against a single sensor spike, unlike a raw maximum. Nearest-
+/// rank method, clamped to the last index. Panics on an empty slice (callers
+/// only reach this after checking [`MIN_HR_SAMPLES_FOR_SUMMARY`]).
+fn percentile_95(sorted_ascending: &[f32]) -> f32 {
+    let n = sorted_ascending.len();
+    let idx = (((n - 1) as f32) * 0.95).round() as usize;
+    sorted_ascending[idx.min(n - 1)]
 }
 
 fn db_path() -> Result<PathBuf> {
@@ -1374,6 +1512,9 @@ mod tests {
             config_goals: Some("8500,10750,13000".to_string()),
             config_auto_pause_secs: Some(300),
             config_loaded_at: Some("2026-07-05T09:59:00+00:00".to_string()),
+            hr_connected: true,
+            last_bpm: Some(118),
+            last_bpm_ts: Some(1_720_000_000_000),
         };
         store.upsert_daemon_status(&status).unwrap();
 
@@ -1387,6 +1528,9 @@ mod tests {
             read_back.config_loaded_at.as_deref(),
             Some("2026-07-05T09:59:00+00:00")
         );
+        assert!(read_back.hr_connected);
+        assert_eq!(read_back.last_bpm, Some(118));
+        assert_eq!(read_back.last_bpm_ts, Some(1_720_000_000_000));
 
         // Second upsert overwrites in place — still exactly one row (id=0).
         let status2 = DaemonStatus {
@@ -1522,6 +1666,74 @@ mod tests {
             .unwrap()
             .expect("good command surfaces");
         assert_eq!(pending.id, good);
+    }
+
+    fn insert_hr(store: &Store, session_id: i64, ts_ms: i64, bpm: u16) {
+        let m = HrMeasurement {
+            bpm,
+            contact: None,
+            rr_ms: vec![],
+        };
+        store.insert_hr_sample(session_id, ts_ms, &m, &[0]).unwrap();
+    }
+
+    #[test]
+    fn hr_summary_none_below_minimum_samples() {
+        let store = memory_store();
+        store.start_session().unwrap();
+        for i in 0..5 {
+            insert_hr(&store, 1, i * 1000, 120);
+        }
+        assert_eq!(
+            store
+                .hr_summary_for("2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn hr_summary_trims_and_computes_p95() {
+        let store = memory_store();
+        store.start_session().unwrap();
+        let base = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        // 85 steady 120s, 5 low outliers, 10 high outliers (>5% of the set, so
+        // p95 actually lands inside that tail) — trim should erase both tails
+        // from the average, while p95 still reflects a real peak.
+        for i in 0..5 {
+            insert_hr(&store, 1, base + i * 1000, 60);
+        }
+        for i in 5..90 {
+            insert_hr(&store, 1, base + i * 1000, 120);
+        }
+        for i in 90..100 {
+            insert_hr(&store, 1, base + i * 1000, 170);
+        }
+
+        let summary = store
+            .hr_summary_for("2026-01-01T00:00:00Z", "2026-01-01T00:05:00Z")
+            .unwrap()
+            .expect("enough samples for a summary");
+        assert_eq!(summary.avg_bpm, 120, "trim erases both outlier tails");
+        assert_eq!(summary.max_bpm, 170, "p95 reflects the high outliers");
+    }
+
+    #[test]
+    fn hr_summary_ignores_samples_outside_the_window() {
+        let store = memory_store();
+        store.start_session().unwrap();
+        for i in 0..20 {
+            insert_hr(&store, 1, i * 1000, 100);
+        }
+        // Window entirely before any sample.
+        assert_eq!(
+            store
+                .hr_summary_for("2020-01-01T00:00:00Z", "2020-01-01T01:00:00Z")
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

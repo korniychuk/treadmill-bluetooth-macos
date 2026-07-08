@@ -12,6 +12,7 @@ mod discover;
 mod fitshow;
 mod ftms;
 mod goals;
+mod hr;
 mod logger;
 mod notify;
 mod power;
@@ -24,10 +25,12 @@ mod store;
 use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use btleplug::api::Peripheral as _;
 use btleplug::platform::Adapter;
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use clap::{Parser, Subcommand};
+use futures::StreamExt;
 use tokio::signal;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -74,17 +77,23 @@ enum Commands {
     RecomputeSegments,
     /// Emit a compact, machine-readable snapshot for a status-bar widget
     /// (tmux/Dracula). Prints one TSV line `state\tworkout_count\tcur_walking_s\t
-    /// cur_steps\tcur_distance_m\tday_walking_s\tday_steps\tday_distance_m` while
-    /// the treadmill is connected and the daemon heartbeat is fresh, or nothing
-    /// at all otherwise (so the widget hides). `cur_*` is the current workout,
-    /// `day_*` today's calendar totals; both are presence-filtered walking (no
-    /// step-away/pause). Like `status`, never opens the BLE adapter. See
+    /// cur_steps\tcur_distance_m\tday_walking_s\tday_steps\tday_distance_m\thr_bpm`
+    /// while the treadmill is connected and the daemon heartbeat is fresh, or
+    /// nothing at all otherwise (so the widget hides). `cur_*` is the current
+    /// workout, `day_*` today's calendar totals; both are presence-filtered
+    /// walking (no step-away/pause). `hr_bpm` is empty unless a heart-rate
+    /// sensor is worn and its reading is fresh (задача 025). Like `status`,
+    /// never opens the BLE adapter. See
     /// docs/tasks/009 and 014.
     Widget,
     /// Print the computed default belt speed the daemon would apply at the next
     /// workout start — the trimmed-mean cruising pace of your most recent ≥30min
     /// workout (задача 016). Read-only, no BLE.
     DefaultSpeed,
+    /// Diagnostic: connect to a heart-rate sensor (e.g. Polar H10) and print
+    /// live bpm to stdout until Ctrl-C. No production use — `stats`/`widget`/
+    /// `status` surface heart rate from the daemon instead (see docs/tasks/025).
+    Hr,
     /// Start the belt via the FTMS Control Point.
     Start,
     /// Stop the belt via the FTMS Control Point.
@@ -170,6 +179,7 @@ async fn main() -> Result<()> {
     match command {
         Commands::Scan => scan::scan_and_list(&adapter).await?,
         Commands::Connect => run_connect(&adapter).await?,
+        Commands::Hr => run_hr(&adapter).await?,
         Commands::Daemon => run_daemon(&adapter).await?,
         Commands::Incline { percent } => run_command(&adapter, Command::Incline(percent)).await?,
         Commands::Discover => run_discover(&adapter).await?,
@@ -214,6 +224,37 @@ async fn run_connect(adapter: &Adapter) -> Result<()> {
         _ = signal::ctrl_c() => info!("interrupted — disconnecting"),
     }
 
+    Ok(())
+}
+
+/// Diagnostic: connect to an HR sensor and print live bpm until Ctrl-C
+/// (задача 025). Opens BLE directly — fine even while the daemon is running,
+/// since the H10 offers two simultaneous connection slots.
+async fn run_hr(adapter: &Adapter) -> Result<()> {
+    let peripheral = scan::connect_hr(adapter).await?;
+    if !scan::subscribe_hr(&peripheral).await {
+        bail!("Heart Rate Measurement characteristic (0x2A37) not found on this device");
+    }
+    let mut notifications = peripheral
+        .notifications()
+        .await
+        .context("open HR notification stream")?;
+
+    tokio::select! {
+        _ = async {
+            while let Some(notification) = notifications.next().await {
+                if notification.uuid != hr::HEART_RATE_MEASUREMENT {
+                    continue;
+                }
+                if let Some(m) = hr::parse_hr_measurement(&notification.value) {
+                    println!("{} bpm", m.bpm);
+                }
+            }
+        } => {}
+        _ = signal::ctrl_c() => info!("interrupted — disconnecting"),
+    }
+
+    scan::disconnect_best_effort(&peripheral).await;
     Ok(())
 }
 
@@ -337,8 +378,11 @@ fn print_day(store: &store::Store, day: &store::DailyStats, gap_minutes: i64) ->
     // day-level raw would have to sum workout spans, but `daily_stats` can
     // credit activity that never landed under this day's workouts (see the
     // midnight edge case in `store`), so that sum would silently understate.
+    let hr = day_hr_summary(store, &day.date)
+        .map(fmt_hr_summary)
+        .unwrap_or_default();
     println!(
-        "{}: {} steps, {:.2} km, {} walking",
+        "{}: {} steps, {:.2} km, {} walking{hr}",
         day.date,
         day.steps,
         day.distance_m as f64 / 1000.0,
@@ -373,10 +417,16 @@ fn print_workout_line(store: &store::Store, num: usize, workout: &store::Workout
         raw_time.is_some_and(|t| t > workout.walking_time_s),
         &fmt_duration(raw_time.unwrap_or(0)),
     );
+    let hr = store
+        .hr_summary_for(&workout.started_at, &workout.ended_at)
+        .ok()
+        .flatten()
+        .map(fmt_hr_summary)
+        .unwrap_or_default();
     // `num` is the workout's 1-based position within its day, not `workout.id`
     // (which is its first segment's id — not sequential after задача 014/015).
     println!(
-        "  #{num}  {} \u{2192} {}   {} steps, {:.2} km{dist_hint}, {}{time_hint}{marker}",
+        "  #{num}  {} \u{2192} {}   {} steps, {:.2} km{dist_hint}, {}{time_hint}{hr}{marker}",
         format_local_time(&workout.started_at),
         format_local_time(&workout.ended_at),
         workout.steps,
@@ -385,6 +435,40 @@ fn print_workout_line(store: &store::Store, num: usize, workout: &store::Workout
         dist_hint = dist_hint,
         time_hint = time_hint,
     );
+}
+
+/// `♥ avg/max` suffix for a heart-rate summary (задача 025), agreed with the
+/// operator as the default: trimmed-mean average, p95 as a spike-robust peak.
+/// A leading three spaces separates it from the preceding field like the other
+/// space-joined segments on these lines.
+fn fmt_hr_summary(hr: store::HrSummary) -> String {
+    format!("   \u{2665} {}/{}", hr.avg_bpm, hr.max_bpm)
+}
+
+/// Heart-rate summary for a whole calendar day (local time), or `None` when
+/// the date can't be parsed or too few `hr_samples` fall in the window —
+/// omitted from the day header rather than shown as a misleading zero.
+fn day_hr_summary(store: &store::Store, date: &str) -> Option<store::HrSummary> {
+    let (start, end) = day_bounds_rfc3339(date)?;
+    store.hr_summary_for(&start, &end).ok().flatten()
+}
+
+/// `[local midnight, next local midnight)` for a `YYYY-MM-DD` date, as RFC3339
+/// UTC bounds for `hr_summary_for`. `None` on an unparseable date or a
+/// (practically impossible) nonexistent local midnight.
+fn day_bounds_rfc3339(date: &str) -> Option<(String, String)> {
+    let naive = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    let midnight = naive.and_hms_opt(0, 0, 0)?;
+    let start_local = match Local.from_local_datetime(&midnight) {
+        chrono::LocalResult::Single(dt) => dt,
+        chrono::LocalResult::Ambiguous(dt, _) => dt,
+        chrono::LocalResult::None => return None,
+    };
+    let end_local = start_local + chrono::Duration::days(1);
+    Some((
+        start_local.with_timezone(&Utc).to_rfc3339(),
+        end_local.with_timezone(&Utc).to_rfc3339(),
+    ))
 }
 
 /// Raw (pre-filter) distance (meters) and time (seconds) for a workout, or
@@ -471,6 +555,18 @@ fn run_status() -> Result<()> {
                     .map(describe_timestamp)
                     .unwrap_or_else(|| "never connected".to_string());
                 println!("treadmill: not connected (last seen {ago})");
+            }
+
+            // Heart-rate line (задача 025) — mirrors the freshness gate the
+            // widget uses ([`widget_hr_field`]) so `status` never shows a
+            // frozen bpm from a sensor that's actually been removed.
+            if status.hr_connected && !widget_hr_field(status).is_empty() {
+                println!(
+                    "heart rate: sensor connected, {} bpm",
+                    status.last_bpm.unwrap_or(0)
+                );
+            } else {
+                println!("heart rate: no sensor");
             }
 
             let mode_desc = match status.power_mode.as_str() {
@@ -560,9 +656,9 @@ fn run_status() -> Result<()> {
 /// treadmill is not on/connected (so the widget hides). Read-only, no BLE —
 /// mirrors `run_status`'s constraint. See docs/tasks/009.
 ///
-/// The line is tab-separated with 8 fields (задача 014 extension):
+/// The line is tab-separated with 9 fields (задача 025 extension):
 /// `state \t workout_count \t cur_walking_s \t cur_steps \t cur_distance_m \t
-/// day_walking_s \t day_steps \t day_distance_m`.
+/// day_walking_s \t day_steps \t day_distance_m \t hr_bpm`.
 /// - `state` — `walking | away | paused | unknown`.
 /// - `workout_count` — number of TODAY's *merged* workouts (reflects the
 ///   configured `workout_gap_minutes`), so the widget can pick a single- vs
@@ -570,6 +666,10 @@ fn run_status() -> Result<()> {
 /// - `cur_*` — the current (latest) workout's aggregates (sum of its segments).
 /// - `day_*` — today's `daily_stats` totals (credited walking only, so already
 ///   free of step-away/pauses). `cur_* ≤ day_*` by construction.
+/// - `hr_bpm` — live bpm from `daemon_status`, or **empty** when no sensor is
+///   worn or its reading has gone stale (same freshness gate as the rest of
+///   this snapshot). The field is always present (stable field count); an
+///   empty value is the signal to hide the heart glyph.
 fn run_widget() -> Result<()> {
     let store = store::Store::open()?;
 
@@ -625,10 +725,34 @@ fn run_widget() -> Result<()> {
     let day_steps: i64 = workouts.iter().map(|w| w.steps).sum();
     let day_distance_m: i64 = workouts.iter().map(|w| w.distance_m).sum();
 
+    let hr_bpm = widget_hr_field(&status);
+
     println!(
-        "{state}\t{workout_count}\t{cur_walking_s}\t{cur_steps}\t{cur_distance_m}\t{day_walking_s}\t{day_steps}\t{day_distance_m}",
+        "{state}\t{workout_count}\t{cur_walking_s}\t{cur_steps}\t{cur_distance_m}\t{day_walking_s}\t{day_steps}\t{day_distance_m}\t{hr_bpm}",
     );
     Ok(())
+}
+
+/// The widget's 9th field: live bpm as a plain string, or empty when the
+/// sensor isn't worn or its last reading is stale (задача 025) — same
+/// freshness threshold as the rest of the daemon heartbeat
+/// ([`WATCHDOG_STALE_THRESHOLD_S`]), so a hung daemon can't leave a frozen bpm
+/// showing forever.
+fn widget_hr_field(status: &store::DaemonStatus) -> String {
+    if !status.hr_connected {
+        return String::new();
+    }
+    match (status.last_bpm, status.last_bpm_ts) {
+        (Some(bpm), Some(ts_ms)) => {
+            let age_s = (Utc::now().timestamp_millis() - ts_ms) / 1000;
+            if age_s <= WATCHDOG_STALE_THRESHOLD_S {
+                bpm.to_string()
+            } else {
+                String::new()
+            }
+        }
+        _ => String::new(),
+    }
 }
 
 /// Is the newest merged workout still the *current* (live) one at `now`? True

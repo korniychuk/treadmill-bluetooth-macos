@@ -14,6 +14,7 @@ use tokio::time::{sleep, timeout};
 use tracing::{info, warn};
 
 use crate::ftms;
+use crate::hr;
 use crate::logger::WorkoutLogger;
 
 /// How long to scan before giving up on finding a treadmill.
@@ -191,6 +192,81 @@ async fn is_treadmill(peripheral: &Peripheral) -> bool {
         .flatten()
         .map(|p| p.services.contains(&ftms::FITNESS_MACHINE_SERVICE))
         .unwrap_or(false)
+}
+
+/// Find and connect to the first peripheral advertising the Heart Rate
+/// Service (`0x180D`) — e.g. a Polar H10 chest strap (задача 025). A separate
+/// scan pass from [`connect_treadmill`]: CoreBluetooth filters advertisements
+/// by service UUID, so the two device classes can't share one filtered scan.
+pub async fn connect_hr(adapter: &Adapter) -> Result<Peripheral> {
+    adapter
+        .start_scan(ScanFilter {
+            services: vec![hr::HEART_RATE_SERVICE],
+        })
+        .await
+        .context("start filtered HR BLE scan")?;
+
+    let deadline = tokio::time::Instant::now() + SCAN_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        for peripheral in adapter.peripherals().await.context("list peripherals")? {
+            if is_hr_sensor(&peripheral).await {
+                info!(id = %peripheral.id(), "connecting to HR sensor");
+                timeout(CONNECT_TIMEOUT, peripheral.connect())
+                    .await
+                    .context("connect timed out (possible CoreBluetooth hang)")?
+                    .context("connect")?;
+                timeout(CONNECT_TIMEOUT, peripheral.discover_services())
+                    .await
+                    .context("discover services timed out (possible CoreBluetooth hang)")?
+                    .context("discover services")?;
+                return Ok(peripheral);
+            }
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    bail!("no HR sensor found within {:?}", SCAN_TIMEOUT)
+}
+
+async fn is_hr_sensor(peripheral: &Peripheral) -> bool {
+    peripheral
+        .properties()
+        .await
+        .ok()
+        .flatten()
+        .map(|p| p.services.contains(&hr::HEART_RATE_SERVICE))
+        .unwrap_or(false)
+}
+
+/// Subscribe to Heart Rate Measurement (`0x2A37`) notifications on an already
+/// connected HR peripheral. Best-effort: not every device is guaranteed to
+/// expose the characteristic (though a Polar H10 always does), and a wearer
+/// not having the strap on is a normal, expected outcome — so this returns
+/// `false` (logged WARN) rather than an error.
+pub async fn subscribe_hr(peripheral: &Peripheral) -> bool {
+    let Some(characteristic) = peripheral
+        .characteristics()
+        .into_iter()
+        .find(|c| c.uuid == hr::HEART_RATE_MEASUREMENT)
+    else {
+        warn!("Heart Rate Measurement characteristic (0x2A37) not found — no pulse this session");
+        return false;
+    };
+
+    match timeout(CONNECT_TIMEOUT, peripheral.subscribe(&characteristic)).await {
+        Ok(Ok(())) => {
+            info!("subscribed to Heart Rate Measurement notifications");
+            true
+        }
+        Ok(Err(err)) => {
+            warn!(%err, "failed to subscribe to Heart Rate Measurement");
+            false
+        }
+        Err(_) => {
+            warn!("subscribe to Heart Rate Measurement timed out (possible CoreBluetooth hang)");
+            false
+        }
+    }
 }
 
 /// Subscribe to Treadmill Data (`0x2ACD`) notifications on an already

@@ -55,12 +55,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use std::pin::Pin;
+
 use anyhow::{Result, anyhow};
-use btleplug::api::Peripheral as _;
+use btleplug::api::{Peripheral as _, ValueNotification};
 use btleplug::platform::{Adapter, Peripheral};
 use chrono::{DateTime, Local, Utc};
-use futures::StreamExt;
-use tokio::sync::mpsc::UnboundedReceiver;
+use futures::{Stream, StreamExt};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -70,6 +72,7 @@ use crate::control_command::{self, ControlCommand};
 use crate::default_speed;
 use crate::ftms;
 use crate::goals::{self, Goal};
+use crate::hr;
 use crate::logger::WorkoutLogger;
 use crate::notify;
 use crate::power::{self, PowerEvent};
@@ -187,6 +190,18 @@ const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
 /// spell. A *successful* pause is one-shot per spell (no cooldown needed).
 const AUTO_PAUSE_RETRY_COOLDOWN: Duration = Duration::from_secs(15);
 
+/// How long to wait for the next Heart Rate Measurement notification before
+/// treating the strap as removed/lost (задача 025). A worn H10 sends samples
+/// ~1/s, same cadence as the treadmill's own telemetry; generous margin above
+/// jitter while still catching a removed strap quickly.
+const HR_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the daemon retries finding/connecting an HR sensor while one
+/// isn't currently linked (no strap worn, or the last link was lost). Coarser
+/// than the treadmill's own reconnect: an HR sensor absence is the common case
+/// (not everyone wears the strap every walk), so this must not spam scans.
+const HR_RECONNECT_INTERVAL: Duration = Duration::from_secs(30);
+
 /// The two hot-reloadable config values, bundled so they thread through the
 /// session loop as one `&mut`: they share a lifecycle — loaded together in
 /// [`run`], reloaded together on the `config.json` mtime watch, and snapshotted
@@ -195,6 +210,61 @@ const AUTO_PAUSE_RETRY_COOLDOWN: Duration = Duration::from_secs(15);
 struct LiveConfig {
     goals: Vec<Goal>,
     auto_pause: Option<Duration>,
+}
+
+/// A live notification stream from an HR peripheral (matches the type
+/// `btleplug::api::Peripheral::notifications` returns).
+type HrNotificationStream = Pin<Box<dyn Stream<Item = ValueNotification> + Send>>;
+
+/// Result of one background HR connect attempt (задача 025), sent back over a
+/// channel so scanning (up to [`scan::SCAN_TIMEOUT`] when no strap is worn —
+/// the common case) never blocks the main treadmill telemetry loop.
+enum HrConnectOutcome {
+    Connected(Peripheral, HrNotificationStream),
+    NotFound,
+}
+
+/// Scan for, connect to, and subscribe an HR sensor (Polar H10) on a spawned
+/// task, reporting the outcome back over `tx`. Best-effort throughout: no
+/// strap worn is the normal case, not an error — every failure path here logs
+/// and reports [`HrConnectOutcome::NotFound`] rather than propagating, so a
+/// missing/lost sensor can never affect the treadmill session.
+fn spawn_hr_connect_attempt(adapter: Adapter, tx: UnboundedSender<HrConnectOutcome>) {
+    tokio::spawn(async move {
+        let outcome = match scan::connect_hr(&adapter).await {
+            Ok(peripheral) => {
+                if !scan::subscribe_hr(&peripheral).await {
+                    scan::disconnect_best_effort(&peripheral).await;
+                    HrConnectOutcome::NotFound
+                } else {
+                    match tokio::time::timeout(scan::CONNECT_TIMEOUT, peripheral.notifications())
+                        .await
+                    {
+                        Ok(Ok(stream)) => HrConnectOutcome::Connected(peripheral, stream),
+                        Ok(Err(err)) => {
+                            warn!(%err, "failed to open HR notification stream");
+                            scan::disconnect_best_effort(&peripheral).await;
+                            HrConnectOutcome::NotFound
+                        }
+                        Err(_) => {
+                            warn!(
+                                "opening HR notification stream timed out (possible CoreBluetooth hang)"
+                            );
+                            scan::disconnect_best_effort(&peripheral).await;
+                            HrConnectOutcome::NotFound
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                info!(%err, "no HR sensor found this attempt — will retry");
+                HrConnectOutcome::NotFound
+            }
+        };
+        // The receiver only drops when the session ends; a send failure there
+        // is a harmless race with teardown, nothing to recover.
+        let _ = tx.send(outcome);
+    });
 }
 
 /// Run the daemon forever: scan → connect → stream with presence tracking →
@@ -334,6 +404,7 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                         state.persist(&store, &watchdog)?;
 
                         if let Err(err) = stream_with_presence(
+                            adapter,
                             &peripheral,
                             &mut power_events,
                             &mut store,
@@ -359,6 +430,11 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                         state.connected = false;
                         state.presence_state = None;
                         state.last_disconnected_at = Some(Utc::now().to_rfc3339());
+                        // The HR link (if any) was torn down inside
+                        // `stream_with_presence` along with the session — задача 025.
+                        state.hr_connected = false;
+                        state.last_bpm = None;
+                        state.last_bpm_ts = None;
                         state.persist(&store, &watchdog)?;
 
                         scan::disconnect_best_effort(&peripheral).await;
@@ -380,7 +456,12 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
 /// see `run()`), `WillSleep` is just logged/persisted (BLE will drop on its
 /// own if the connection doesn't survive sleep), and `WillPowerOff`
 /// best-effort closes the session before the process may be killed.
+// `adapter` (added for задача 025's background HR reconnect) pushes this past
+// clippy's default 7-argument threshold; splitting these into a struct would
+// just move the same state around without reducing it.
+#[allow(clippy::too_many_arguments)]
 async fn stream_with_presence(
+    adapter: &Adapter,
     peripheral: &Peripheral,
     power_events: &mut UnboundedReceiver<PowerEvent>,
     store: &mut Store,
@@ -448,6 +529,19 @@ async fn stream_with_presence(
     let mut config_tick = tokio::time::interval(CONFIG_RELOAD_INTERVAL);
     let mut goals_mtime: Option<std::time::SystemTime> = None;
 
+    // Heart-rate sensor (задача 025), best-effort throughout: the daemon is the
+    // sole owner of both BLE links (treadmill + HR), but a missing/lost strap
+    // must never affect the treadmill session. Connect attempts run on a
+    // spawned task (see `spawn_hr_connect_attempt`) so scanning up to
+    // `SCAN_TIMEOUT` — the normal outcome when no strap is worn — never blocks
+    // this loop's telemetry handling.
+    let (hr_tx, mut hr_rx) = tokio::sync::mpsc::unbounded_channel::<HrConnectOutcome>();
+    let mut hr_peripheral: Option<Peripheral> = None;
+    let mut hr_notifications: Option<HrNotificationStream> = None;
+    let mut hr_connect_in_flight = true;
+    spawn_hr_connect_attempt(adapter.clone(), hr_tx.clone());
+    let mut hr_reconnect_tick = tokio::time::interval(HR_RECONNECT_INTERVAL);
+
     loop {
         tokio::select! {
             biased;
@@ -470,6 +564,9 @@ async fn stream_with_presence(
                         warn!("system will power off — closing active session best-effort before the process may be killed");
                         logger.finish();
                         store.end_session()?;
+                        if let Some(p) = hr_peripheral.take() {
+                            scan::disconnect_best_effort(&p).await;
+                        }
                         // Return directly (rather than `break`) so the normal
                         // "stream ended" path below — which logs an `error!`
                         // for what would otherwise look like an unexpected
@@ -685,11 +782,75 @@ async fn stream_with_presence(
                     state.persist(store, watchdog)?;
                 }
             }
+            // A background connect attempt finished (задача 025). `NotFound`
+            // is the routine case (no strap worn) — just let the reconnect
+            // tick below try again later.
+            outcome = hr_rx.recv() => {
+                hr_connect_in_flight = false;
+                match outcome {
+                    Some(HrConnectOutcome::Connected(peripheral, stream)) => {
+                        info!("HR sensor connected and streaming");
+                        state.hr_connected = true;
+                        hr_notifications = Some(stream);
+                        hr_peripheral = Some(peripheral);
+                        state.persist(store, watchdog)?;
+                    }
+                    Some(HrConnectOutcome::NotFound) => {}
+                    None => {
+                        warn!("HR connect-attempt channel closed unexpectedly — no more HR reconnect attempts this session");
+                    }
+                }
+            }
+            // Live HR telemetry, mirroring the treadmill's own bounded-timeout
+            // disconnect detection. Guarded so this branch is only polled while
+            // a stream is actually open.
+            hr_result = tokio::time::timeout(HR_NOTIFICATION_TIMEOUT, hr_notifications.as_mut().unwrap().next()), if hr_notifications.is_some() => {
+                match hr_result {
+                    Ok(Some(notification)) if notification.uuid == hr::HEART_RATE_MEASUREMENT => {
+                        if let Some(m) = hr::parse_hr_measurement(&notification.value) {
+                            let ts_ms = Utc::now().timestamp_millis();
+                            store.insert_hr_sample(session_id, ts_ms, &m, &notification.value)?;
+                            state.hr_connected = true;
+                            state.last_bpm = Some(m.bpm as i64);
+                            state.last_bpm_ts = Some(ts_ms);
+                            state.persist(store, watchdog)?;
+                        }
+                    }
+                    Ok(Some(_)) => {} // notification for a characteristic we don't track
+                    Ok(None) => {
+                        warn!("HR notification stream ended — sensor likely removed");
+                        hr_notifications = None;
+                        state.hr_connected = false;
+                        state.persist(store, watchdog)?;
+                        if let Some(p) = hr_peripheral.take() {
+                            scan::disconnect_best_effort(&p).await;
+                        }
+                    }
+                    Err(_) => {
+                        warn!(timeout_s = HR_NOTIFICATION_TIMEOUT.as_secs(), "no HR telemetry received — treating sensor as removed");
+                        hr_notifications = None;
+                        state.hr_connected = false;
+                        state.persist(store, watchdog)?;
+                        if let Some(p) = hr_peripheral.take() {
+                            scan::disconnect_best_effort(&p).await;
+                        }
+                    }
+                }
+            }
+            // No HR link right now (never found, or just lost) — retry
+            // periodically rather than hammering CoreBluetooth.
+            _ = hr_reconnect_tick.tick(), if hr_notifications.is_none() && !hr_connect_in_flight => {
+                hr_connect_in_flight = true;
+                spawn_hr_connect_attempt(adapter.clone(), hr_tx.clone());
+            }
         }
     }
 
     logger.finish();
     store.end_session()?;
+    if let Some(p) = hr_peripheral.take() {
+        scan::disconnect_best_effort(&p).await;
+    }
     error!("notification stream ended (device disconnected?)");
     Ok(())
 }
@@ -1006,6 +1167,12 @@ struct DaemonState {
     config_goals: Option<String>,
     config_auto_pause_secs: Option<i64>,
     config_loaded_at: Option<String>,
+    // Heart-rate snapshot (задача 025) — same reasoning as the rest of this
+    // struct: mirrors what the daemon just observed so `tm status`/`widget`/
+    // `stats` can read it without racing the daemon for BLE.
+    hr_connected: bool,
+    last_bpm: Option<i64>,
+    last_bpm_ts: Option<i64>,
 }
 
 impl DaemonState {
@@ -1020,6 +1187,9 @@ impl DaemonState {
             config_goals: None,
             config_auto_pause_secs: None,
             config_loaded_at: None,
+            hr_connected: false,
+            last_bpm: None,
+            last_bpm_ts: None,
         }
     }
 
@@ -1064,6 +1234,9 @@ impl DaemonState {
             config_goals: self.config_goals.clone(),
             config_auto_pause_secs: self.config_auto_pause_secs,
             config_loaded_at: self.config_loaded_at.clone(),
+            hr_connected: self.hr_connected,
+            last_bpm: self.last_bpm,
+            last_bpm_ts: self.last_bpm_ts,
         })?;
         watchdog.touch();
         Ok(())

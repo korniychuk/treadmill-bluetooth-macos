@@ -3,16 +3,18 @@
 # Treadmill workout widget for a tmux status bar.
 #
 # Reference implementation: renders the state/metrics of `tm widget` (see
-# treadmill-bluetooth-macos docs/tasks/009) as a colour-coded powerline pill.
-# Presentation only — the data + visibility contract lives in the treadmill
-# CLI, which prints one 8-field TSV line while the treadmill is connected and
-# the daemon heartbeat is fresh, or nothing otherwise:
+# treadmill-bluetooth-macos docs/tasks/009 and 025) as a colour-coded
+# powerline pill. Presentation only — the data + visibility contract lives in
+# the treadmill CLI, which prints one 9-field TSV line while the treadmill is
+# connected and the daemon heartbeat is fresh, or nothing otherwise:
 #   state, workout_count, cur_walking_s, cur_steps, cur_distance_m,
-#   day_walking_s, day_steps, day_distance_m
+#   day_walking_s, day_steps, day_distance_m, hr_bpm
 # (cur_* = current/latest workout today, day_* = today's totals across all
 # workouts). cur_* are all zero when there is no LIVE workout (connected but
 # idle — the last workout ended longer ago than the merge gap); the body
-# below then falls back to showing day_* alone.
+# below then falls back to showing day_* alone. `hr_bpm` is empty unless a
+# heart-rate sensor (e.g. Polar H10) is worn and its reading is fresh —
+# the heart glyph is drawn only then.
 #
 # HIDE-WHEN-OFF: when `tm widget` prints nothing (or fails), this script
 # exits 0 with no output. Whether that actually hides the segment in your
@@ -89,6 +91,11 @@ DIM_DARK='#4c566a'; DIM_UNKNOWN='#aeb6c8'
 # workout / idle mode, or the after-slash day total in multi-workout mode.
 STEPS_FG='#181818'
 
+# Heart-rate glyph (nf-md-heart-pulse, U+F05F8), drawn only while a sensor is
+# worn and fresh (задача 025). Colour matches the current state's foreground
+# (set below) rather than a fixed red, so it never clashes with the pill.
+ICON_HEART=$(printf '\xf3\xb0\x97\xb8')  # nf-md-heart_pulse U+F05F8
+
 # --- Helpers -------------------------------------------------------------------
 
 # Seconds -> `M:SS`, or `H:MM:SS` past an hour.
@@ -118,15 +125,19 @@ fmt_dist() {
 line="$("$TM" widget 2>/dev/null || true)"
 [[ -n "$line" ]] || exit 0
 
-# `tm widget` emits 8 tab-separated fields (see treadmill repo docs/tasks/009):
-# state, workout_count today, then the CURRENT workout's (walking_s, steps,
-# distance_m), then TODAY's totals (walking_s, steps, distance_m).
-IFS=$'\t' read -r state wcount cur_s cur_steps cur_dist day_s day_steps day_dist <<<"$line"
+# `tm widget` emits 9 tab-separated fields (see treadmill repo docs/tasks/009,
+# 025): state, workout_count today, then the CURRENT workout's (walking_s,
+# steps, distance_m), then TODAY's totals (walking_s, steps, distance_m),
+# then hr_bpm (empty unless a sensor is worn and fresh).
+IFS=$'\t' read -r state wcount cur_s cur_steps cur_dist day_s day_steps day_dist hr_bpm <<<"$line"
 
 # Defend against a malformed line: any missing/non-numeric numeric field -> hide.
 for n in "$wcount" "$cur_s" "$cur_steps" "$cur_dist" "$day_s" "$day_steps" "$day_dist"; do
   [[ "$n" =~ ^[0-9]+$ ]] || exit 0
 done
+# hr_bpm is allowed to be empty (no sensor/stale reading); if present it must
+# be numeric — a malformed value there hides just the heart, not the segment.
+[[ -z "$hr_bpm" || "$hr_bpm" =~ ^[0-9]+$ ]] || hr_bpm=''
 
 case "$state" in
   walking) icon=$ICON_WALKING; bg=$BG_WALKING; fg=$FG_WALKING; dim=$DIM_DARK ;;
@@ -161,6 +172,13 @@ elif (( wcount >= 2 )); then
 else
   body=$(printf '%s  #[fg=%s,bold]%s#[nobold,fg=%s]  %s' \
     "$(fmt_time "$cur_s")" "$STEPS_FG" "$cur_steps" "$fg" "$(fmt_dist "$cur_dist")")
+fi
+
+# Heart-rate suffix (задача 025): drawn only when the sensor is worn/fresh
+# (`hr_bpm` non-empty), so it silently disappears the moment the strap comes
+# off — no separate visibility toggle needed.
+if [[ -n "$hr_bpm" ]]; then
+  body+=$(printf '  %s %s' "$ICON_HEART" "$hr_bpm")
 fi
 
 # Paint the pill: leading powerline arrow (pill colour on $BAR_BG, skipped if
