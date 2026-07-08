@@ -931,13 +931,34 @@ async fn stream_with_presence(
                     }
                     // Same mtime gate reloads the Zone Hold config (задача 027) —
                     // an edit (e.g. `tm zone` writing new limits) takes effect
-                    // without a restart. The per-session phase (ramp/hold/frozen/
-                    // grace) is untouched here; it only reacts to presence
-                    // transitions and the next correction tick.
+                    // without a restart.
                     let reloaded_zone_hold = zone_hold::load_zone_hold_config();
                     if reloaded_zone_hold != config.zone_hold {
                         info!(enabled = reloaded_zone_hold.enabled, "zone_hold config changed on disk — reloaded without a daemon restart");
                         config.zone_hold = reloaded_zone_hold;
+                    }
+                    // `tm zone on` is routinely run mid-session (as here), not
+                    // only before a walk starts. Without this, the phase stays
+                    // `Off` until the next presence transition — which on a
+                    // long session may never come — leaving "on (not currently
+                    // engaged)" stuck for the rest of the workout. Engage the
+                    // same way a fresh Unknown→Walking transition would.
+                    if zh_phase == ZoneHoldPhase::Off && accumulator.state() == PresenceState::Walking {
+                        let zh_resumed_kmh = last_walking_speed.unwrap_or(config.zone_hold.min_speed_kmh);
+                        let zh_default_kmh = default_speed::compute_default_speed(store, goals::load_workout_gap_minutes())
+                            .ok()
+                            .flatten()
+                            .map(|d| d.kmh)
+                            .unwrap_or(config.zone_hold.min_speed_kmh);
+                        zone_hold_on_transition(
+                            &mut zh_phase,
+                            PresenceState::Unknown,
+                            PresenceState::Walking,
+                            &config.zone_hold,
+                            zh_resumed_kmh,
+                            zh_default_kmh,
+                            Instant::now(),
+                        );
                     }
                     // Refresh the loaded-config snapshot + last-read time shown by
                     // `tm status` (задача 022): the file was actually re-read here.
