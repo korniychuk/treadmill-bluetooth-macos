@@ -6,6 +6,8 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-09
+
 ### Added
 
 - Heart-rate support via a chest-strap BLE sensor (e.g. Polar H10, задача
