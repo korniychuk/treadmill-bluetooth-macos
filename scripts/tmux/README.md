@@ -56,8 +56,9 @@ tm widget
     20) — the exact number belongs to `tm status`, not the widget.
   - `HR_ZONE` ∈ `below | in | above`, or **empty** unless Zone Hold (задача
     027) is actively driving speed corrections in the `walking` state. The
-    reference script recolours the whole `♥ NNN` token by this value — empty
-    leaves it in the plain per-state colour, unchanged from задачи 025/026.
+    reference script weights the whole `♥ NNN` token by this value — bold in
+    `in`, bold+italic in `above`, plain in `below`/empty; colour is never
+    touched (stays the plain per-state colour, unchanged from задачи 025/026).
 
 - Prints **nothing** (exit 0) whenever the treadmill is off, the daemon is
   dead, or its heartbeat is stale — the unambiguous signal to hide the

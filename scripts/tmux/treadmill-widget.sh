@@ -20,8 +20,9 @@
 # the exact percentage is a `tm status` detail, not a widget detail. `hr_zone`
 # (задача 027) is `below`/`in`/`above`/empty — Zone Hold's classification of
 # the current bpm against the target zone, populated only while Zone Hold is
-# actually driving corrections in the `walking` state; this script colours
-# the whole `♥ NNN` token by it (see §Zone Hold colour below).
+# actually driving corrections in the `walking` state; this script weights
+# the whole `♥ NNN` token by it — bold/italic, not colour (see §Zone Hold
+# weight below).
 #
 # HIDE-WHEN-OFF: when `tm widget` prints nothing (or fails), this script
 # exits 0 with no output. Whether that actually hides the segment in your
@@ -113,23 +114,15 @@ LOW_BATTERY_PCT=20
 ICON_BATTERY_LOW=$(printf '\xf3\xb0\x82\x83')  # nf-md-battery_alert U+F0083
 BATTERY_LOW_FG='#ff5555'  # Dracula red
 
-# Zone Hold colour (задача 027): the WHOLE `♥ NNN` token (glyph + number, not
-# just the glyph — the number is the bigger visual mass) is recoloured by
-# `hr_zone` while Zone Hold is actively correcting. `walking`'s pill is always
-# emerald (`$BG_WALKING`), so these are chosen for contrast against that one
-# background specifically, per the operator's colour decision:
-#   below zone (belt about to speed up)  -> deep/saturated blue
-#   above zone (belt about to slow down) -> burnt/dark orange, distinct from
-#                                            the lighter `$BG_AWAY` orange
-#   in zone (locked on target)           -> NOT green (would vanish into the
-#                                            emerald pill) — reuse $STEPS_FG
-#                                            bold instead: the pill itself
-#                                            already signals "ok", the dark
-#                                            bold heart reads as "on target"
-# Empty `hr_zone` (Zone Hold off/not engaged) draws the heart in the plain
-# per-state `$fg`, i.e. unchanged from задача 025/026 — see the fallback below.
-ZONE_BELOW_FG='#2563eb'  # deep blue
-ZONE_ABOVE_FG='#c2410c'  # burnt/dark orange (vs $BG_AWAY's lighter '#ffb86c')
+# Zone Hold weight (задача 027): the WHOLE `♥ NNN` token (glyph + number) is
+# weighted by `hr_zone` while Zone Hold is actively correcting — deliberately
+# NOT colour: a per-zone colour never read as "nice" against the state pills
+# (tried blue/orange, operator veto — everything here is black/$fg, matching
+# every other label). Below the zone stays plain (nothing to flag — the belt
+# is about to speed up, routine); in the zone is bold (on target); above the
+# zone is bold *and* italic (extra emphasis — the belt is about to slow
+# down). Empty `hr_zone` (Zone Hold off/not engaged) draws the heart plain,
+# same as задача 025/026 before Zone Hold existed.
 
 # --- Helpers -------------------------------------------------------------------
 
@@ -219,22 +212,21 @@ fi
 # Heart-rate suffix (задача 025): drawn only when the sensor is worn/fresh
 # (`hr_bpm` non-empty), so it silently disappears the moment the strap comes
 # off — no separate visibility toggle needed. The whole `♥ NNN` token is
-# recoloured by `hr_zone` (задача 027) when Zone Hold is actively correcting;
-# empty `hr_zone` leaves it in the plain per-state `$fg`, unchanged from
-# задачи 025/026. A low-battery glyph (задача 026) rides right after it, only
-# once the level drops to/below $LOW_BATTERY_PCT — no number in the widget
-# itself, that's what `tm status` is for.
+# weighted (bold/italic, never colour — see the tunables above) by `hr_zone`
+# (задача 027) when Zone Hold is actively correcting; empty `hr_zone` leaves
+# it plain, unchanged from задачи 025/026. A low-battery glyph (задача 026)
+# rides right after it, only once the level drops to/below $LOW_BATTERY_PCT —
+# no number in the widget itself, that's what `tm status` is for.
 if [[ -n "$hr_bpm" ]]; then
   case "$hr_zone" in
-    below) heart_fg=$ZONE_BELOW_FG; heart_bold=1 ;;
-    above) heart_fg=$ZONE_ABOVE_FG; heart_bold=1 ;;
-    in)    heart_fg=$STEPS_FG;      heart_bold=1 ;;
-    *)     heart_fg=$fg;            heart_bold=0 ;;
+    in)    heart_style='bold' ;;
+    above) heart_style='bold,italics' ;;
+    *)     heart_style='' ;;
   esac
-  if (( heart_bold )); then
-    body+=$(printf '  #[fg=%s,bold]%s %s#[nobold,fg=%s]' "$heart_fg" "$ICON_HEART" "$hr_bpm" "$fg")
+  if [[ -n "$heart_style" ]]; then
+    body+=$(printf '  #[%s]%s %s#[nobold,noitalics]' "$heart_style" "$ICON_HEART" "$hr_bpm")
   else
-    body+=$(printf '  #[fg=%s]%s %s#[fg=%s]' "$heart_fg" "$ICON_HEART" "$hr_bpm" "$fg")
+    body+=$(printf '  %s %s' "$ICON_HEART" "$hr_bpm")
   fi
   if [[ -n "$hr_batt" ]] && (( hr_batt <= LOW_BATTERY_PCT )); then
     body+=$(printf ' #[fg=%s]%s#[fg=%s]' "$BATTERY_LOW_FG" "$ICON_BATTERY_LOW" "$fg")
