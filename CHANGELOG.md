@@ -39,10 +39,10 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   interactively manage custom zones. Zones can be custom-named: `target_zone`
   accepts a 1-based number, an explicit/derived zone `id`, or a name
   substring. `tm status` gains a Zone Hold line; `tm widget` gains an
-  `hr_zone` field
-  (`below`/`in`/`above`/empty, 11 fields total now) — the reference tmux
-  script weights the whole `♥ NNN` token by it (plain/bold/bold-italic, no
-  colour change) while Zone Hold is actively correcting. Off by default;
+  `hr_zone` field (`below`/`in`/`above`/empty, 11 fields total now) — the
+  reference tmux script weights the whole `♥ NNN` token by it
+  (plain/bold/bold-italic, no colour change) while Zone Hold is actively
+  correcting. Off by default;
   every surface degrades to no-op when disabled or the sensor isn't worn.
 
 ## [0.2.1] — 2026-07-08
