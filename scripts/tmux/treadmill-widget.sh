@@ -82,6 +82,13 @@ BG_UNKNOWN='#6272a4'; FG_UNKNOWN='#f8f8f2'  # comment / light
 # variant for the dark "unknown" pill.
 DIM_DARK='#4c566a'; DIM_UNKNOWN='#aeb6c8'
 
+# Day-steps emphasis. The day's total steps is the single most important metric
+# (it tracks the daily goal), so it's rendered BOLD in a fixed near-black that
+# stays high-contrast on every state background (emerald/yellow/orange/muted).
+# Sampled from the design mockup. Applied to the lone steps number in single-
+# workout / idle mode, or the after-slash day total in multi-workout mode.
+STEPS_FG='#181818'
+
 # --- Helpers -------------------------------------------------------------------
 
 # Seconds -> `M:SS`, or `H:MM:SS` past an hour.
@@ -144,14 +151,16 @@ esac
 # Distinct suffixes (`:` in time, `km`/`m` on distance, bare steps) disambiguate
 # the three values with no labels.
 if [[ "$state" != walking ]] && (( cur_s == 0 && cur_steps == 0 && cur_dist == 0 )); then
-  body=$(printf '%s  %s  %s' "$(fmt_time "$day_s")" "$day_steps" "$(fmt_dist "$day_dist")")
+  body=$(printf '%s  #[fg=%s,bold]%s#[nobold,fg=%s]  %s' \
+    "$(fmt_time "$day_s")" "$STEPS_FG" "$day_steps" "$fg" "$(fmt_dist "$day_dist")")
 elif (( wcount >= 2 )); then
-  body=$(printf '%s#[fg=%s]/%s#[fg=%s]  %s#[fg=%s]/%s#[fg=%s]  %s#[fg=%s]/%s' \
+  body=$(printf '%s#[fg=%s]/%s#[fg=%s]  %s#[fg=%s]/#[fg=%s,bold]%s#[nobold,fg=%s]  %s#[fg=%s]/%s' \
     "$(fmt_time "$cur_s")"    "$dim" "$(fmt_time "$day_s")"    "$fg" \
-    "$cur_steps"              "$dim" "$day_steps"              "$fg" \
+    "$cur_steps"              "$dim" "$STEPS_FG" "$day_steps"  "$fg" \
     "$(fmt_dist "$cur_dist")" "$dim" "$(fmt_dist "$day_dist")")
 else
-  body=$(printf '%s  %s  %s' "$(fmt_time "$cur_s")" "$cur_steps" "$(fmt_dist "$cur_dist")")
+  body=$(printf '%s  #[fg=%s,bold]%s#[nobold,fg=%s]  %s' \
+    "$(fmt_time "$cur_s")" "$STEPS_FG" "$cur_steps" "$fg" "$(fmt_dist "$cur_dist")")
 fi
 
 # Paint the pill: leading powerline arrow (pill colour on $BAR_BG, skipped if
