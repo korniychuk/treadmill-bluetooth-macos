@@ -14,6 +14,17 @@ pub const HEART_RATE_SERVICE: Uuid = Uuid::from_u128(0x0000180d_0000_1000_8000_0
 /// Heart Rate Measurement characteristic — `0x2A37` (notify).
 pub const HEART_RATE_MEASUREMENT: Uuid = Uuid::from_u128(0x00002a37_0000_1000_8000_00805f9b34fb);
 
+/// Battery Service — `0x180F` (задача 026). Kept for documentation/future use
+/// (e.g. scoping a service-filtered scan) — `scan::read_hr_battery` looks up
+/// the characteristic directly, without checking its parent service.
+#[allow(dead_code)]
+pub const BATTERY_SERVICE: Uuid = Uuid::from_u128(0x0000180f_0000_1000_8000_00805f9b34fb);
+
+/// Battery Level characteristic — `0x2A19` (read; Polar devices don't push
+/// notify updates, so this must be re-read periodically rather than
+/// subscribed once).
+pub const BATTERY_LEVEL: Uuid = Uuid::from_u128(0x00002a19_0000_1000_8000_00805f9b34fb);
+
 /// Flag bits of the Heart Rate Measurement packet (Bluetooth SIG GATT spec).
 mod flags {
     /// Bit 0: `0` = bpm is UINT8, `1` = bpm is UINT16.

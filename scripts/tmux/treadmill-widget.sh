@@ -3,18 +3,21 @@
 # Treadmill workout widget for a tmux status bar.
 #
 # Reference implementation: renders the state/metrics of `tm widget` (see
-# treadmill-bluetooth-macos docs/tasks/009 and 025) as a colour-coded
+# treadmill-bluetooth-macos docs/tasks/009, 025 and 026) as a colour-coded
 # powerline pill. Presentation only — the data + visibility contract lives in
-# the treadmill CLI, which prints one 9-field TSV line while the treadmill is
+# the treadmill CLI, which prints one 10-field TSV line while the treadmill is
 # connected and the daemon heartbeat is fresh, or nothing otherwise:
 #   state, workout_count, cur_walking_s, cur_steps, cur_distance_m,
-#   day_walking_s, day_steps, day_distance_m, hr_bpm
+#   day_walking_s, day_steps, day_distance_m, hr_bpm, hr_battery_pct
 # (cur_* = current/latest workout today, day_* = today's totals across all
 # workouts). cur_* are all zero when there is no LIVE workout (connected but
 # idle — the last workout ended longer ago than the merge gap); the body
 # below then falls back to showing day_* alone. `hr_bpm` is empty unless a
-# heart-rate sensor (e.g. Polar H10) is worn and its reading is fresh —
-# the heart glyph is drawn only then.
+# heart-rate sensor (e.g. Polar H10) is worn and its reading is fresh — the
+# heart glyph is drawn only then. `hr_battery_pct` is the sensor's last-read
+# battery level (raw number, may be empty); this script only turns it into a
+# small low-battery warning glyph once it drops to/below $LOW_BATTERY_PCT —
+# the exact percentage is a `tm status` detail, not a widget detail.
 #
 # HIDE-WHEN-OFF: when `tm widget` prints nothing (or fails), this script
 # exits 0 with no output. Whether that actually hides the segment in your
@@ -91,10 +94,20 @@ DIM_DARK='#4c566a'; DIM_UNKNOWN='#aeb6c8'
 # workout / idle mode, or the after-slash day total in multi-workout mode.
 STEPS_FG='#181818'
 
-# Heart-rate glyph (nf-md-heart-pulse, U+F05F8), drawn only while a sensor is
+# Heart-rate glyph (nf-md-heart_pulse, U+F05F6), drawn only while a sensor is
 # worn and fresh (задача 025). Colour matches the current state's foreground
 # (set below) rather than a fixed red, so it never clashes with the pill.
-ICON_HEART=$(printf '\xf3\xb0\x97\xb8')  # nf-md-heart_pulse U+F05F8
+ICON_HEART=$(printf '\xf3\xb0\x97\xb6')  # nf-md-heart_pulse U+F05F6
+
+# Low-battery glyph (nf-md-battery_alert, U+F0083, задача 026) + threshold —
+# shown only once the HR sensor's battery drops to/below this percentage, in a
+# fixed warning red (not theme-dependent, so it stays eye-catching regardless
+# of the current pill colour). Codepoints looked up from the official Nerd
+# Fonts glyphnames.json (authoritative source); not yet visually re-confirmed
+# in a terminal — swap the glyph if your font is missing it.
+LOW_BATTERY_PCT=20
+ICON_BATTERY_LOW=$(printf '\xf3\xb0\x82\x83')  # nf-md-battery_alert U+F0083
+BATTERY_LOW_FG='#ff5555'  # Dracula red
 
 # --- Helpers -------------------------------------------------------------------
 
@@ -125,19 +138,22 @@ fmt_dist() {
 line="$("$TM" widget 2>/dev/null || true)"
 [[ -n "$line" ]] || exit 0
 
-# `tm widget` emits 9 tab-separated fields (see treadmill repo docs/tasks/009,
-# 025): state, workout_count today, then the CURRENT workout's (walking_s,
+# `tm widget` emits 10 tab-separated fields (see treadmill repo docs/tasks/009,
+# 025, 026): state, workout_count today, then the CURRENT workout's (walking_s,
 # steps, distance_m), then TODAY's totals (walking_s, steps, distance_m),
-# then hr_bpm (empty unless a sensor is worn and fresh).
-IFS=$'\t' read -r state wcount cur_s cur_steps cur_dist day_s day_steps day_dist hr_bpm <<<"$line"
+# then hr_bpm (empty unless a sensor is worn and fresh), then hr_battery_pct
+# (empty unless read at least once).
+IFS=$'\t' read -r state wcount cur_s cur_steps cur_dist day_s day_steps day_dist hr_bpm hr_batt <<<"$line"
 
 # Defend against a malformed line: any missing/non-numeric numeric field -> hide.
 for n in "$wcount" "$cur_s" "$cur_steps" "$cur_dist" "$day_s" "$day_steps" "$day_dist"; do
   [[ "$n" =~ ^[0-9]+$ ]] || exit 0
 done
-# hr_bpm is allowed to be empty (no sensor/stale reading); if present it must
-# be numeric — a malformed value there hides just the heart, not the segment.
+# hr_bpm/hr_batt are allowed to be empty (no sensor/stale/unread); if present
+# they must be numeric — a malformed value there hides just that detail, not
+# the whole segment.
 [[ -z "$hr_bpm" || "$hr_bpm" =~ ^[0-9]+$ ]] || hr_bpm=''
+[[ -z "$hr_batt" || "$hr_batt" =~ ^[0-9]+$ ]] || hr_batt=''
 
 case "$state" in
   walking) icon=$ICON_WALKING; bg=$BG_WALKING; fg=$FG_WALKING; dim=$DIM_DARK ;;
@@ -176,9 +192,14 @@ fi
 
 # Heart-rate suffix (задача 025): drawn only when the sensor is worn/fresh
 # (`hr_bpm` non-empty), so it silently disappears the moment the strap comes
-# off — no separate visibility toggle needed.
+# off — no separate visibility toggle needed. A low-battery glyph (задача 026)
+# rides right after it, only once the level drops to/below $LOW_BATTERY_PCT —
+# no number in the widget itself, that's what `tm status` is for.
 if [[ -n "$hr_bpm" ]]; then
   body+=$(printf '  %s %s' "$ICON_HEART" "$hr_bpm")
+  if [[ -n "$hr_batt" ]] && (( hr_batt <= LOW_BATTERY_PCT )); then
+    body+=$(printf ' #[fg=%s]%s#[fg=%s]' "$BATTERY_LOW_FG" "$ICON_BATTERY_LOW" "$fg")
+  fi
 fi
 
 # Paint the pill: leading powerline arrow (pill colour on $BAR_BG, skipped if

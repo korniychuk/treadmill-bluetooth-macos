@@ -77,12 +77,14 @@ enum Commands {
     RecomputeSegments,
     /// Emit a compact, machine-readable snapshot for a status-bar widget
     /// (tmux/Dracula). Prints one TSV line `state\tworkout_count\tcur_walking_s\t
-    /// cur_steps\tcur_distance_m\tday_walking_s\tday_steps\tday_distance_m\thr_bpm`
-    /// while the treadmill is connected and the daemon heartbeat is fresh, or
-    /// nothing at all otherwise (so the widget hides). `cur_*` is the current
-    /// workout, `day_*` today's calendar totals; both are presence-filtered
-    /// walking (no step-away/pause). `hr_bpm` is empty unless a heart-rate
-    /// sensor is worn and its reading is fresh (задача 025). Like `status`,
+    /// cur_steps\tcur_distance_m\tday_walking_s\tday_steps\tday_distance_m\t
+    /// hr_bpm\thr_battery_pct` while the treadmill is connected and the daemon
+    /// heartbeat is fresh, or nothing at all otherwise (so the widget hides).
+    /// `cur_*` is the current workout, `day_*` today's calendar totals; both
+    /// are presence-filtered walking (no step-away/pause). `hr_bpm` is empty
+    /// unless a heart-rate sensor is worn and its reading is fresh (задача
+    /// 025); `hr_battery_pct` is the sensor's last-read battery level, empty
+    /// if unknown (задача 026). Like `status`,
     /// never opens the BLE adapter. See
     /// docs/tasks/009 and 014.
     Widget,
@@ -235,6 +237,11 @@ async fn run_hr(adapter: &Adapter) -> Result<()> {
     if !scan::subscribe_hr(&peripheral).await {
         bail!("Heart Rate Measurement characteristic (0x2A37) not found on this device");
     }
+    match scan::read_hr_battery(&peripheral).await {
+        Some(pct) => println!("battery: {pct}%"),
+        None => println!("battery: unknown (read failed — see logs)"),
+    }
+
     let mut notifications = peripheral
         .notifications()
         .await
@@ -559,10 +566,16 @@ fn run_status() -> Result<()> {
 
             // Heart-rate line (задача 025) — mirrors the freshness gate the
             // widget uses ([`widget_hr_field`]) so `status` never shows a
-            // frozen bpm from a sensor that's actually been removed.
+            // frozen bpm from a sensor that's actually been removed. Battery
+            // (задача 026) is appended when known — it's read independently
+            // of bpm freshness, so it can be present even right after connect.
             if status.hr_connected && !widget_hr_field(status).is_empty() {
+                let battery = status
+                    .hr_battery_pct
+                    .map(|pct| format!(", battery {pct}%"))
+                    .unwrap_or_default();
                 println!(
-                    "heart rate: sensor connected, {} bpm",
+                    "heart rate: sensor connected, {} bpm{battery}",
                     status.last_bpm.unwrap_or(0)
                 );
             } else {
@@ -656,9 +669,9 @@ fn run_status() -> Result<()> {
 /// treadmill is not on/connected (so the widget hides). Read-only, no BLE —
 /// mirrors `run_status`'s constraint. See docs/tasks/009.
 ///
-/// The line is tab-separated with 9 fields (задача 025 extension):
+/// The line is tab-separated with 10 fields (задача 026 extension):
 /// `state \t workout_count \t cur_walking_s \t cur_steps \t cur_distance_m \t
-/// day_walking_s \t day_steps \t day_distance_m \t hr_bpm`.
+/// day_walking_s \t day_steps \t day_distance_m \t hr_bpm \t hr_battery_pct`.
 /// - `state` — `walking | away | paused | unknown`.
 /// - `workout_count` — number of TODAY's *merged* workouts (reflects the
 ///   configured `workout_gap_minutes`), so the widget can pick a single- vs
@@ -670,6 +683,10 @@ fn run_status() -> Result<()> {
 ///   worn or its reading has gone stale (same freshness gate as the rest of
 ///   this snapshot). The field is always present (stable field count); an
 ///   empty value is the signal to hide the heart glyph.
+/// - `hr_battery_pct` — the sensor's last-read battery level (задача 026), or
+///   **empty** when not (yet) read or no sensor connected. Always the raw
+///   percentage — presentation (e.g. only showing a low-battery glyph below a
+///   threshold) is the consumer's job, same split as everything else here.
 fn run_widget() -> Result<()> {
     let store = store::Store::open()?;
 
@@ -726,9 +743,13 @@ fn run_widget() -> Result<()> {
     let day_distance_m: i64 = workouts.iter().map(|w| w.distance_m).sum();
 
     let hr_bpm = widget_hr_field(&status);
+    let hr_battery_pct = status
+        .hr_battery_pct
+        .map(|pct| pct.to_string())
+        .unwrap_or_default();
 
     println!(
-        "{state}\t{workout_count}\t{cur_walking_s}\t{cur_steps}\t{cur_distance_m}\t{day_walking_s}\t{day_steps}\t{day_distance_m}\t{hr_bpm}",
+        "{state}\t{workout_count}\t{cur_walking_s}\t{cur_steps}\t{cur_distance_m}\t{day_walking_s}\t{day_steps}\t{day_distance_m}\t{hr_bpm}\t{hr_battery_pct}",
     );
     Ok(())
 }

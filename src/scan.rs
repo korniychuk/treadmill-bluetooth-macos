@@ -269,6 +269,37 @@ pub async fn subscribe_hr(peripheral: &Peripheral) -> bool {
     }
 }
 
+/// Read the HR sensor's battery level (0-100%) via the standard Battery
+/// Service (`0x180F`/`0x2A19`, задача 026). Best-effort: `None` (logged WARN)
+/// when the characteristic is missing, the read fails, or it times out — a
+/// missing battery reading must never affect the HR link itself. Polar
+/// devices only support Read (no continuous notify) here, so callers must
+/// re-invoke this periodically rather than subscribe once.
+pub async fn read_hr_battery(peripheral: &Peripheral) -> Option<u8> {
+    let characteristic = peripheral
+        .characteristics()
+        .into_iter()
+        .find(|c| c.uuid == hr::BATTERY_LEVEL)?;
+
+    match timeout(CONNECT_TIMEOUT, peripheral.read(&characteristic)).await {
+        Ok(Ok(bytes)) => match bytes.first().copied() {
+            Some(pct) => Some(pct),
+            None => {
+                warn!("HR battery level read returned an empty payload");
+                None
+            }
+        },
+        Ok(Err(err)) => {
+            warn!(%err, "failed to read HR battery level");
+            None
+        }
+        Err(_) => {
+            warn!("read HR battery level timed out (possible CoreBluetooth hang)");
+            None
+        }
+    }
+}
+
 /// Subscribe to Treadmill Data (`0x2ACD`) notifications on an already
 /// connected peripheral. Shared by the interactive `connect` stream and the
 /// presence-aware daemon loop.

@@ -22,7 +22,8 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
 - `src/hr.rs` — константы Heart Rate Service (`0x180D`) и парсинг Heart Rate
   Measurement (`0x2A37`, задача 025): u8/u16 bpm, sensor-contact флаги, RR-интервалы
   (задел под HRV, пока не используется). `bpm==0` (потеря контакта у H10) — DEBUG,
-  не ошибка, кадр отбрасывается.
+  не ошибка, кадр отбрасывается. Плюс Battery Service (`0x180F`/`0x2A19`,
+  задача 026) — только Read (Polar не шлёт notify по заряду).
 - `src/control.rs` — FTMS Control Point (start/stop/speed).
 - `src/control_command.rs` — `ControlCommand` тип (`start`/`stop`/`speed:<kmh>`),
   парс/формат и staleness-проверка для очереди команд (задача 013).
@@ -73,6 +74,12 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
   свой bounded timeout (10с) — пропажа датчика не роняет цикл дорожки.
   Сэмплы пишутся в `hr_samples`, снапшот (`hr_connected`+`last_bpm`+`last_bpm_ts`)
   — в `daemon_status` вместе с остальным heartbeat'ом.
+  Заряд батареи датчика (задача 026): читается один раз сразу при коннекте
+  (в том же spawned-таске) + адаптивно перечитывается — раз в 60 мин, раз в
+  30 мин при заряде ≤20% (`hr_battery_poll_interval`, чистая функция). Опрос
+  не про экономию батареи H10 (single-byte read ничтожен на фоне её ~400ч
+  ресурса) — просто чтобы не делать бесполезную работу. Сбрасывается при
+  потере HR-линка вместе с остальным HR-состоянием.
 - `src/power.rs` — детекция AC-питания (`pmset -g batt`); на батарее и без
   подключённой дорожки демон не сканирует, чтобы не сажать аккумулятор.
 - `src/notify.rs` — нативные macOS-уведомления (`mac-notification-sys`,
@@ -89,7 +96,8 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
   `session_id` — агрегаты джойнят по временному окну тренировки/дня) +
   `hr_summary_for(from, to)`: `♥ avg/max` = trimmed-mean (переиспользует
   `default_speed::trimmed_mean_speed`) / p95 (устойчив к единичному спайку).
-  `None` при < 10 сэмплов в окне.
+  `None` при < 10 сэмплов в окне. Плюс `hr_battery_pct` в `daemon_status`
+  (задача 026, `Option<i64>`, ALTER-колонка).
 
 ## Протокол
 
@@ -104,6 +112,8 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
 - `0x2ADA` — Fitness Machine Status (notify)
 - `0x180D` — Heart Rate Service (задача 025, напр. Polar H10)
 - `0x2A37` — Heart Rate Measurement (notify)
+- `0x180F` — Battery Service (задача 026)
+- `0x2A19` — Battery Level (read)
 
 ## Команды
 
@@ -115,7 +125,7 @@ cargo run -- stats     # статистика за сегодня; `stats --all`
 cargo run -- widget    # компактный TSV текущей тренировки для status-bar виджета; пусто если дорожка off (см. docs/tasks/009)
 cargo run -- recompute-segments  # пересобрать activity_segments из raw_samples (без BLE, идемпотентно; docs/tasks/015)
 cargo run -- default-speed  # показать расчётную дефолтную скорость на старте тренировки (без BLE; docs/tasks/016)
-cargo run -- hr        # диагностика: подключиться к HR-датчику и печатать live bpm (docs/tasks/025)
+cargo run -- hr        # диагностика: подключиться к HR-датчику, печатать заряд + live bpm (docs/tasks/025,026)
 cargo run -- --help    # полный список команд
 cargo test             # юнит-тесты
 cargo clippy           # линт

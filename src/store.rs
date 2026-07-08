@@ -121,6 +121,10 @@ pub struct DaemonStatus {
     pub hr_connected: bool,
     pub last_bpm: Option<i64>,
     pub last_bpm_ts: Option<i64>,
+    /// HR sensor battery level, 0-100% (задача 026). `None` until the daemon
+    /// has read it at least once this link (Polar devices only support Read,
+    /// not notify, for this value — see `scan::read_hr_battery`).
+    pub hr_battery_pct: Option<i64>,
 }
 
 /// Per-sample deltas against the persisted device baseline. Not yet a
@@ -317,6 +321,7 @@ impl Store {
         )?;
         self.add_column_if_missing("ALTER TABLE daemon_status ADD COLUMN last_bpm INTEGER")?;
         self.add_column_if_missing("ALTER TABLE daemon_status ADD COLUMN last_bpm_ts INTEGER")?;
+        self.add_column_if_missing("ALTER TABLE daemon_status ADD COLUMN hr_battery_pct INTEGER")?;
         Ok(())
     }
 
@@ -881,8 +886,8 @@ impl Store {
                     (id, connected, presence_state, last_connected_at, last_disconnected_at,
                      power_mode, power_mode_since, updated_at,
                      config_goals, config_auto_pause_secs, config_loaded_at,
-                     hr_connected, last_bpm, last_bpm_ts)
-                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                     hr_connected, last_bpm, last_bpm_ts, hr_battery_pct)
+                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                  ON CONFLICT(id) DO UPDATE SET
                     connected = excluded.connected,
                     presence_state = excluded.presence_state,
@@ -896,7 +901,8 @@ impl Store {
                     config_loaded_at = excluded.config_loaded_at,
                     hr_connected = excluded.hr_connected,
                     last_bpm = excluded.last_bpm,
-                    last_bpm_ts = excluded.last_bpm_ts",
+                    last_bpm_ts = excluded.last_bpm_ts,
+                    hr_battery_pct = excluded.hr_battery_pct",
                 params![
                     status.connected,
                     status.presence_state,
@@ -911,6 +917,7 @@ impl Store {
                     status.hr_connected,
                     status.last_bpm,
                     status.last_bpm_ts,
+                    status.hr_battery_pct,
                 ],
             )
             .context("upsert daemon_status")?;
@@ -925,7 +932,7 @@ impl Store {
                 "SELECT connected, presence_state, last_connected_at, last_disconnected_at,
                         power_mode, power_mode_since, updated_at,
                         config_goals, config_auto_pause_secs, config_loaded_at,
-                        hr_connected, last_bpm, last_bpm_ts
+                        hr_connected, last_bpm, last_bpm_ts, hr_battery_pct
                  FROM daemon_status WHERE id = 0",
                 [],
                 |row| {
@@ -943,6 +950,7 @@ impl Store {
                         hr_connected: row.get(10)?,
                         last_bpm: row.get(11)?,
                         last_bpm_ts: row.get(12)?,
+                        hr_battery_pct: row.get(13)?,
                     })
                 },
             )
@@ -1515,6 +1523,7 @@ mod tests {
             hr_connected: true,
             last_bpm: Some(118),
             last_bpm_ts: Some(1_720_000_000_000),
+            hr_battery_pct: Some(42),
         };
         store.upsert_daemon_status(&status).unwrap();
 
@@ -1531,6 +1540,7 @@ mod tests {
         assert!(read_back.hr_connected);
         assert_eq!(read_back.last_bpm, Some(118));
         assert_eq!(read_back.last_bpm_ts, Some(1_720_000_000_000));
+        assert_eq!(read_back.hr_battery_pct, Some(42));
 
         // Second upsert overwrites in place — still exactly one row (id=0).
         let status2 = DaemonStatus {

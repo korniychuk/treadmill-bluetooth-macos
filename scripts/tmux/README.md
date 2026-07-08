@@ -31,11 +31,11 @@ from one CLI command:
 tm widget
 ```
 
-- Prints **one TSV line, 9 tab-separated fields**, while the treadmill is
+- Prints **one TSV line, 10 tab-separated fields**, while the treadmill is
   connected and the daemon's heartbeat is fresh:
 
   ```
-  STATE  WORKOUT_COUNT  CUR_WALKING_S  CUR_STEPS  CUR_DISTANCE_M  DAY_WALKING_S  DAY_STEPS  DAY_DISTANCE_M  HR_BPM
+  STATE  WORKOUT_COUNT  CUR_WALKING_S  CUR_STEPS  CUR_DISTANCE_M  DAY_WALKING_S  DAY_STEPS  DAY_DISTANCE_M  HR_BPM  HR_BATTERY_PCT
   ```
 
   - `STATE` ∈ `walking | paused | away | unknown`.
@@ -46,18 +46,23 @@ tm widget
     construction.
   - `HR_BPM` — live bpm from a worn heart-rate sensor (e.g. Polar H10), or
     **empty** when no sensor is worn or its last reading has gone stale (same
-    freshness gate as the rest of this line). Always present as a field (9
-    fields either way) — emptiness is the signal to hide the heart glyph, not
-    to hide the whole segment.
+    freshness gate as the rest of this line). Always present as a field —
+    emptiness is the signal to hide the heart glyph, not to hide the whole
+    segment.
+  - `HR_BATTERY_PCT` — the sensor's last-read battery level (0-100), or
+    **empty** if not yet read or no sensor connected. Always the raw
+    percentage; the reference script only turns it into a small low-battery
+    glyph once it drops to/below its own `LOW_BATTERY_PCT` tunable (default
+    20) — the exact number belongs to `tm status`, not the widget.
 
 - Prints **nothing** (exit 0) whenever the treadmill is off, the daemon is
   dead, or its heartbeat is stale — the unambiguous signal to hide the
   segment.
 
-See `docs/tasks/009-tmux-workout-widget.md` and `docs/tasks/025-heart-rate-polar-h10.md`
-in this repo for the full contract history and design rationale. If you
-change the field count/order in `tm widget`, update this script's
-`IFS=$'\t' read -r ...` line to match.
+See `docs/tasks/009-tmux-workout-widget.md`, `docs/tasks/025-heart-rate-polar-h10.md`
+and `docs/tasks/026-hr-battery-level.md` in this repo for the full contract
+history and design rationale. If you change the field count/order in
+`tm widget`, update this script's `IFS=$'\t' read -r ...` line to match.
 
 ## Recipe A — Dracula tmux theme (custom plugin)
 

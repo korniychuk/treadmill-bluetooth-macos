@@ -202,6 +202,41 @@ const HR_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(10);
 /// (not everyone wears the strap every walk), so this must not spam scans.
 const HR_RECONNECT_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How often to check whether it's time to re-read the HR sensor's battery
+/// level (задача 026) — a cheap in-memory elapsed-time check, same pattern as
+/// `CONFIG_RELOAD_INTERVAL`'s mtime check. The actual re-read cadence is
+/// [`hr_battery_poll_interval`]; this just bounds how promptly a newly-crossed
+/// threshold is noticed.
+const HR_BATTERY_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Default re-read cadence for the HR sensor's battery level. Deliberately
+/// coarse: the percentage barely moves hour to hour, and (unlike e.g. the
+/// treadmill's own telemetry) re-reading more often would not meaningfully
+/// extend the sensor's battery life either — a single-byte GATT read is
+/// negligible next to the H10's ~400h battery budget. This is purely about
+/// not doing pointless work, not about conserving the sensor.
+const HR_BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Tighter re-read cadence once the last known level is at/below
+/// [`HR_BATTERY_LOW_THRESHOLD_PCT`] — so a "getting low" warning doesn't sit
+/// stale for a whole hour while the strap approaches empty.
+const HR_BATTERY_POLL_INTERVAL_LOW: Duration = Duration::from_secs(30 * 60);
+
+/// Battery level at/below which [`HR_BATTERY_POLL_INTERVAL_LOW`] applies, and
+/// (in the tmux widget's own presentation logic) a low-battery glyph is shown.
+const HR_BATTERY_LOW_THRESHOLD_PCT: u8 = 20;
+
+/// How often to re-read the HR sensor's battery level, given the last known
+/// level (`None` = never read yet, so due immediately). Pure/unit-tested —
+/// see module docs on why this is about avoiding pointless work, not battery
+/// conservation.
+fn hr_battery_poll_interval(last_known_pct: Option<u8>) -> Duration {
+    match last_known_pct {
+        Some(pct) if pct <= HR_BATTERY_LOW_THRESHOLD_PCT => HR_BATTERY_POLL_INTERVAL_LOW,
+        _ => HR_BATTERY_POLL_INTERVAL,
+    }
+}
+
 /// The two hot-reloadable config values, bundled so they thread through the
 /// session loop as one `&mut`: they share a lifecycle — loaded together in
 /// [`run`], reloaded together on the `config.json` mtime watch, and snapshotted
@@ -220,7 +255,11 @@ type HrNotificationStream = Pin<Box<dyn Stream<Item = ValueNotification> + Send>
 /// channel so scanning (up to [`scan::SCAN_TIMEOUT`] when no strap is worn —
 /// the common case) never blocks the main treadmill telemetry loop.
 enum HrConnectOutcome {
-    Connected(Peripheral, HrNotificationStream),
+    /// The initial battery reading (задача 026), taken right after subscribe
+    /// while the spawned task is already there — `None` if the read failed
+    /// (logged inside `scan::read_hr_battery`), not a reason to abort the
+    /// connection itself.
+    Connected(Peripheral, HrNotificationStream, Option<u8>),
     NotFound,
 }
 
@@ -240,7 +279,10 @@ fn spawn_hr_connect_attempt(adapter: Adapter, tx: UnboundedSender<HrConnectOutco
                     match tokio::time::timeout(scan::CONNECT_TIMEOUT, peripheral.notifications())
                         .await
                     {
-                        Ok(Ok(stream)) => HrConnectOutcome::Connected(peripheral, stream),
+                        Ok(Ok(stream)) => {
+                            let battery_pct = scan::read_hr_battery(&peripheral).await;
+                            HrConnectOutcome::Connected(peripheral, stream, battery_pct)
+                        }
                         Ok(Err(err)) => {
                             warn!(%err, "failed to open HR notification stream");
                             scan::disconnect_best_effort(&peripheral).await;
@@ -435,6 +477,7 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                         state.hr_connected = false;
                         state.last_bpm = None;
                         state.last_bpm_ts = None;
+                        state.hr_battery_pct = None;
                         state.persist(&store, &watchdog)?;
 
                         scan::disconnect_best_effort(&peripheral).await;
@@ -541,6 +584,14 @@ async fn stream_with_presence(
     let mut hr_connect_in_flight = true;
     spawn_hr_connect_attempt(adapter.clone(), hr_tx.clone());
     let mut hr_reconnect_tick = tokio::time::interval(HR_RECONNECT_INTERVAL);
+    // Battery level (задача 026): last known percentage + when it was read,
+    // so the adaptive re-read cadence (`hr_battery_poll_interval`) can decide
+    // whether a fresh read is due. Reset alongside the rest of the HR state
+    // whenever the link is lost — a stale percentage from a removed strap
+    // must not linger in `daemon_status`.
+    let mut hr_battery_pct: Option<u8> = None;
+    let mut hr_battery_last_read: Option<Instant> = None;
+    let mut hr_battery_check_tick = tokio::time::interval(HR_BATTERY_CHECK_INTERVAL);
 
     loop {
         tokio::select! {
@@ -788,11 +839,14 @@ async fn stream_with_presence(
             outcome = hr_rx.recv() => {
                 hr_connect_in_flight = false;
                 match outcome {
-                    Some(HrConnectOutcome::Connected(peripheral, stream)) => {
-                        info!("HR sensor connected and streaming");
+                    Some(HrConnectOutcome::Connected(peripheral, stream, battery_pct)) => {
+                        info!(?battery_pct, "HR sensor connected and streaming");
                         state.hr_connected = true;
                         hr_notifications = Some(stream);
                         hr_peripheral = Some(peripheral);
+                        hr_battery_pct = battery_pct;
+                        hr_battery_last_read = Some(Instant::now());
+                        state.hr_battery_pct = battery_pct.map(|p| p as i64);
                         state.persist(store, watchdog)?;
                     }
                     Some(HrConnectOutcome::NotFound) => {}
@@ -821,6 +875,9 @@ async fn stream_with_presence(
                         warn!("HR notification stream ended — sensor likely removed");
                         hr_notifications = None;
                         state.hr_connected = false;
+                        hr_battery_pct = None;
+                        hr_battery_last_read = None;
+                        state.hr_battery_pct = None;
                         state.persist(store, watchdog)?;
                         if let Some(p) = hr_peripheral.take() {
                             scan::disconnect_best_effort(&p).await;
@@ -830,6 +887,9 @@ async fn stream_with_presence(
                         warn!(timeout_s = HR_NOTIFICATION_TIMEOUT.as_secs(), "no HR telemetry received — treating sensor as removed");
                         hr_notifications = None;
                         state.hr_connected = false;
+                        hr_battery_pct = None;
+                        hr_battery_last_read = None;
+                        state.hr_battery_pct = None;
                         state.persist(store, watchdog)?;
                         if let Some(p) = hr_peripheral.take() {
                             scan::disconnect_best_effort(&p).await;
@@ -842,6 +902,29 @@ async fn stream_with_presence(
             _ = hr_reconnect_tick.tick(), if hr_notifications.is_none() && !hr_connect_in_flight => {
                 hr_connect_in_flight = true;
                 spawn_hr_connect_attempt(adapter.clone(), hr_tx.clone());
+            }
+            // Battery re-read (задача 026): a cheap tick that only acts once
+            // the adaptive interval has actually elapsed. Bounded inline read
+            // (like the treadmill's own Control Point writes) — fine to block
+            // this loop briefly given how rarely it's due (≥30 min).
+            _ = hr_battery_check_tick.tick(), if hr_peripheral.is_some() => {
+                let due = hr_battery_last_read
+                    .is_none_or(|since| since.elapsed() >= hr_battery_poll_interval(hr_battery_pct));
+                if due {
+                    let peripheral = hr_peripheral.as_ref().expect("guarded by hr_peripheral.is_some()");
+                    let read = scan::read_hr_battery(peripheral).await;
+                    hr_battery_last_read = Some(Instant::now());
+                    if read.is_some() {
+                        info!(battery_pct = ?read, "re-read HR sensor battery level");
+                        hr_battery_pct = read;
+                        state.hr_battery_pct = read.map(|p| p as i64);
+                        state.persist(store, watchdog)?;
+                    }
+                    // A failed read keeps the last known percentage (better a
+                    // slightly stale value than flashing to unknown), but still
+                    // stamps `hr_battery_last_read` so a persistently failing
+                    // sensor doesn't get hammered every tick.
+                }
             }
         }
     }
@@ -1173,6 +1256,9 @@ struct DaemonState {
     hr_connected: bool,
     last_bpm: Option<i64>,
     last_bpm_ts: Option<i64>,
+    /// HR sensor battery level, 0-100% (задача 026). `None` until read at
+    /// least once this link.
+    hr_battery_pct: Option<i64>,
 }
 
 impl DaemonState {
@@ -1190,6 +1276,7 @@ impl DaemonState {
             hr_connected: false,
             last_bpm: None,
             last_bpm_ts: None,
+            hr_battery_pct: None,
         }
     }
 
@@ -1237,6 +1324,7 @@ impl DaemonState {
             hr_connected: self.hr_connected,
             last_bpm: self.last_bpm,
             last_bpm_ts: self.last_bpm_ts,
+            hr_battery_pct: self.hr_battery_pct,
         })?;
         watchdog.touch();
         Ok(())
@@ -1551,5 +1639,30 @@ mod tests {
         state.set_power_mode(false);
         assert_eq!(state.power_mode, "battery_idle");
         assert!(state.power_mode_since >= since_before);
+    }
+
+    #[test]
+    fn hr_battery_poll_interval_is_generous_when_unknown_or_healthy() {
+        assert_eq!(hr_battery_poll_interval(None), HR_BATTERY_POLL_INTERVAL);
+        assert_eq!(
+            hr_battery_poll_interval(Some(100)),
+            HR_BATTERY_POLL_INTERVAL
+        );
+        assert_eq!(
+            hr_battery_poll_interval(Some(HR_BATTERY_LOW_THRESHOLD_PCT + 1)),
+            HR_BATTERY_POLL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn hr_battery_poll_interval_tightens_at_and_below_the_low_threshold() {
+        assert_eq!(
+            hr_battery_poll_interval(Some(HR_BATTERY_LOW_THRESHOLD_PCT)),
+            HR_BATTERY_POLL_INTERVAL_LOW
+        );
+        assert_eq!(
+            hr_battery_poll_interval(Some(0)),
+            HR_BATTERY_POLL_INTERVAL_LOW
+        );
     }
 }

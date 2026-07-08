@@ -12,12 +12,17 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   025): the daemon holds a second, independent BLE link and records
   continuous bpm samples alongside steps. `tm stats` shows a compact `♥
   avg/max` summary per day/workout (trimmed-mean average, p95 peak); `tm
-  widget` gains a 9th field for the live bpm (empty unless a sensor is worn
+  widget` gains a field for the live bpm (empty unless a sensor is worn
   and fresh) — see the updated tmux widget contract in `scripts/tmux/README.md`;
   `tm status` shows whether a sensor is connected. `tm hr` is a new
   diagnostic command (bring-up/troubleshooting only). No sensor worn is the
   normal case throughout — every surface degrades silently (empty/omitted),
   never an error.
+- HR sensor battery level (задача 026): read on connect and re-read
+  adaptively (every 60 min, or every 30 min once at/below 20%). `tm status`
+  shows the exact percentage; `tm widget` gains a raw `hr_battery_pct` field
+  (10 fields total now) — the reference tmux script turns it into a small
+  warning glyph only once it's low, no number in the status bar itself.
 
 ## [0.2.1] — 2026-07-08
 

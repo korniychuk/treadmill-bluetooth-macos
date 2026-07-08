@@ -29,7 +29,8 @@ and can drive the treadmill (start / stop / target speed). 🏃💨
 - 📊 **Daily stats** — steps / distance / walking-time, restart-safe.
 - ❤️ **Heart rate** — pair a chest-strap BLE sensor (e.g. Polar H10) and get a
   compact `♥ avg/max` summary alongside your steps, plus a live bpm in the
-  widget. Optional — everything degrades silently when no sensor is worn.
+  widget and a sensor-battery check (`tm status`, low-battery glyph in the
+  widget). Optional — everything degrades silently when no sensor is worn.
 - 🎯 **Step-goal milestones** — up to 3 daily goals with native macOS toasts.
 - 🎛️ **Control** — start / stop / set target speed on a live link.
 - 🖥️ **tmux status-bar widget** — see the current workout in your status line
@@ -120,7 +121,7 @@ tm daemon             # run the background loop (normally launched by launchd)
 tm stats              # today's stats;  tm stats --all  → every day
 tm status             # daemon / connection / presence snapshot
 tm widget             # compact TSV of the current workout (for status bars)
-tm hr                 # diagnostic: connect to a heart-rate sensor, print live bpm
+tm hr                 # diagnostic: connect to a heart-rate sensor, print battery + live bpm
 tm speed <kmh>        # set target speed on the live link
 tm start | tm stop    # start / stop the belt
 tm recompute-segments # rebuild workout segments from raw samples (no BLE)
