@@ -856,9 +856,20 @@ async fn stream_with_presence(
                 }
             }
             // Live HR telemetry, mirroring the treadmill's own bounded-timeout
-            // disconnect detection. Guarded so this branch is only polled while
-            // a stream is actually open.
-            hr_result = tokio::time::timeout(HR_NOTIFICATION_TIMEOUT, hr_notifications.as_mut().unwrap().next()), if hr_notifications.is_some() => {
+            // disconnect detection. `tokio::select!` re-constructs every
+            // branch's future on each pass regardless of an `if` precondition
+            // (only *polling* is gated by it) — an `.unwrap()` in the future
+            // expression itself would panic the instant `hr_notifications` is
+            // `None`, which is exactly what happened live on the first real
+            // treadmill connect. So the `None` case is handled inside the
+            // async block via a future that never resolves, instead of
+            // relying on a precondition to protect an unwrap.
+            hr_result = async {
+                match hr_notifications.as_mut() {
+                    Some(stream) => tokio::time::timeout(HR_NOTIFICATION_TIMEOUT, stream.next()).await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 match hr_result {
                     Ok(Some(notification)) if notification.uuid == hr::HEART_RATE_MEASUREMENT => {
                         if let Some(m) = hr::parse_hr_measurement(&notification.value) {
