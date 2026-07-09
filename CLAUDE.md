@@ -228,6 +228,22 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
   обычным цветом состояния, `kmh` — приглушённым, как день-тотал у
   остальных метрик.
 
+## Liveness matrix (инвариант, задачи 031/035/038)
+
+Не смешивать эти «живости» — каждый сигнал кормит свой контур:
+
+| Сигнал | Что значит | Кормит |
+|---|---|---|
+| Event-loop progress | `persist()` / любой arm | `Watchdog::touch` (hang → exit) |
+| Treadmill telemetry | decoded `0x2ACD` | `connected`, `touch_telemetry`, widget speed |
+| HR BLE link | stream open | reconnect / battery |
+| HR body contact | meaningful bpm | `hr_samples`, widget ♥, zone bpm input |
+| Config intent | `enabled` flags | phase machines (zone, auto-pause) |
+
+Правила: absolute `sleep_until` для silence в `select!` (не relative `timeout`);
+`hr_connected=false` ⇒ `last_bpm=None`; Zone Hold bpm только если sample fresh
+(≤15s). Диагностика: `tm doctor`.
+
 ## Протокол
 
 Большинство дорожек отдают стандартный GATT-профиль **FTMS** (Fitness Machine Service, `0x1826`).
@@ -251,6 +267,8 @@ cargo run             # = scan: перечислить BLE-устройства 
 cargo run -- connect  # подключиться к первой FTMS-дорожке и стримить данные
 cargo run -- daemon    # фоновый режим: авто-коннект + presence + toast (для интерактивной проверки)
 cargo run -- stats     # статистика за сегодня; `stats --all` — за все дни
+cargo run -- status    # состояние демона/дорожки/HR/zone (read-only, без BLE)
+cargo run -- doctor    # матрица живости для диагностики (задача 038; без BLE)
 cargo run -- widget    # компактный TSV текущей тренировки для status-bar виджета; пусто если дорожка off (см. docs/tasks/009)
 cargo run -- recompute-segments  # пересобрать activity_segments из raw_samples (без BLE, идемпотентно; docs/tasks/015)
 cargo run -- recompute-hr        # вычистить hr_samples, записанные со снятого датчика (без BLE, --dry-run; docs/tasks/034)

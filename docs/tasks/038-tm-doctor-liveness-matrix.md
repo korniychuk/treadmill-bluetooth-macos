@@ -1,6 +1,6 @@
 # 038 — `tm doctor`: матрица живости одним CLI-вызовом
 
-> **Статус: open**  
+> **Статус: done**  
 > **Источник:** [research/003](../research/003-reliability-architecture-review.md) §3.10.10, Phase 0.4  
 > **Класс:** observability / MTTR  
 > **Приоритет:** high (дешёвый, режет время диагностики *следующего* инцидента)
@@ -91,11 +91,11 @@ control / streaming (best-effort)
 
 ## Acceptance
 
-- [ ] `tm doctor` works with daemon down, daemon up+connected, HR worn, HR off, zone on/off mismatch
-- [ ] No BLE adapter open
-- [ ] Documents ages for last belt speed sample and last HR sample
-- [ ] Flags `enabled` vs `zone_hold_phase` / `zone_hold_active` mismatch
-- [ ] Mentioned in `CLAUDE.md` CLI list + research 003 links this task
+- [x] `tm doctor` works with daemon down, daemon up+connected, HR worn, HR off, zone on/off mismatch
+- [x] No BLE adapter open
+- [x] Documents ages for last belt speed sample and last HR sample
+- [x] Flags `enabled` vs `zone_hold_phase` / `zone_hold_active` mismatch
+- [x] Mentioned in `CLAUDE.md` CLI list + research 003 links this task
 - [ ] Smoke: run during a real walk and after treadmill power-off — output matches reality
 
 ## Затронутые файлы

@@ -73,6 +73,10 @@ enum Commands {
     /// never opens the BLE adapter itself, so it cannot contend with a
     /// running daemon for it (see docs/tasks/006, задача B).
     Status,
+    /// Liveness matrix for diagnosis (задача 038): process/heartbeat, belt
+    /// telemetry age, HR link/contact inference, zone config vs phase. Read-only,
+    /// no BLE — same contract as `status`/`widget`.
+    Doctor,
     /// Rebuild `activity_segments` from `raw_samples` by replaying the live
     /// presence + credit engine over history (задача 015). One-off, no BLE;
     /// idempotent; leaves `daily_stats`/`raw_samples`/`workouts` untouched.
@@ -241,6 +245,9 @@ async fn main() -> Result<()> {
     if let Commands::Status = command {
         return run_status();
     }
+    if let Commands::Doctor = command {
+        return run_doctor();
+    }
     if let Commands::RecomputeSegments = command {
         return recompute::run();
     }
@@ -301,6 +308,7 @@ async fn main() -> Result<()> {
         }
         Commands::Stats { .. }
         | Commands::Status
+        | Commands::Doctor
         | Commands::RecomputeSegments
         | Commands::RecomputeHr { .. }
         | Commands::Widget
@@ -1280,6 +1288,170 @@ const WATCHDOG_STALE_THRESHOLD_S: i64 = daemon::WATCHDOG_STALE_THRESHOLD.as_secs
 /// one missed cycle and nothing more.
 const HR_STALE_THRESHOLD_S: i64 = 15;
 
+/// Liveness matrix for one-shot diagnosis (задача 038). Read-only: SQLite +
+/// config + launchctl — never opens BLE.
+fn run_doctor() -> Result<()> {
+    let store = store::Store::open()?;
+    let status = store.daemon_status()?;
+    let daemon_alive = daemon_process_alive();
+    let zone_enabled = zone_hold::load_zone_hold_config().enabled;
+    let now_ms = Utc::now().timestamp_millis();
+    let report = format_doctor_report(
+        daemon_alive,
+        status.as_ref(),
+        zone_enabled,
+        now_ms,
+        WATCHDOG_STALE_THRESHOLD_S,
+        HR_STALE_THRESHOLD_S,
+    );
+    print!("{report}");
+    Ok(())
+}
+
+/// Pure doctor text (задача 038). Ages use wall-clock `now_ms` (Unix millis)
+/// so unit tests inject a fixed clock. WARN lines are prefixed `WARN:` for grepping.
+fn format_doctor_report(
+    daemon_alive: bool,
+    status: Option<&store::DaemonStatus>,
+    zone_config_enabled: bool,
+    now_ms: i64,
+    watchdog_stale_s: i64,
+    hr_stale_s: i64,
+) -> String {
+    let mut out = String::new();
+    out.push_str("daemon\n");
+    out.push_str(&format!(
+        "  process:          {}\n",
+        if daemon_alive { "alive" } else { "dead" }
+    ));
+    match status {
+        None => {
+            out.push_str("  heartbeat age:    n/a (never recorded)\n");
+            out.push_str("  power:            n/a\n");
+            out.push_str("\ntreadmill liveness\n");
+            out.push_str("  connected flag:   n/a\n");
+            out.push_str("  last 0x2ACD age:  n/a\n");
+            out.push_str("  presence:         n/a\n");
+            out.push_str("\nhr liveness\n");
+            out.push_str("  hr_connected:     n/a\n");
+            out.push_str("  last HR frame age:n/a\n");
+            out.push_str("  last bpm:         n/a\n");
+            out.push_str("  battery:          n/a\n");
+            out.push_str("  contact (inferred): n/a\n");
+            out.push_str("\nzone hold\n");
+            out.push_str(&format!(
+                "  config enabled:   {}\n",
+                zone_config_enabled
+            ));
+            out.push_str("  phase snapshot:   n/a\n");
+            out.push_str("  active flag:      n/a\n");
+            out.push_str("\nlegend: loop=process+heartbeat · treadmill=connected+last_speed_ts · hr=hr_connected+last_bpm_ts · config=enabled vs phase\n");
+            return out;
+        }
+        Some(s) => {
+            let hb_age = age_secs_rfc3339(&s.updated_at, now_ms);
+            match hb_age {
+                Some(age) => {
+                    out.push_str(&format!("  heartbeat age:    {age}s (updated_at)\n"));
+                    if daemon_alive && age > watchdog_stale_s {
+                        out.push_str(&format!(
+                            "  WARN: heartbeat older than {watchdog_stale_s}s while process alive — possible hang\n"
+                        ));
+                    }
+                }
+                None => out.push_str("  heartbeat age:    n/a (unparseable updated_at)\n"),
+            }
+            out.push_str(&format!("  power:            {}\n", s.power_mode));
+
+            out.push_str("\ntreadmill liveness\n");
+            out.push_str(&format!("  connected flag:   {}\n", s.connected));
+            match (s.last_speed_ts, s.last_speed_kmh) {
+                (Some(ts), _) => {
+                    let age = (now_ms - ts) / 1000;
+                    out.push_str(&format!("  last 0x2ACD age:  {age}s (from last_speed_ts)\n"));
+                    if s.connected && age > hr_stale_s * 2 {
+                        // 2× sample freshness: belt telem ~1/s; long silence while
+                        // `connected` is the 031-class symptom.
+                        out.push_str(
+                            "  WARN: connected=true but last belt sample is stale — possible stuck connected\n",
+                        );
+                    }
+                }
+                (None, _) => out.push_str("  last 0x2ACD age:  n/a\n"),
+            }
+            out.push_str(&format!(
+                "  presence:         {}\n",
+                s.presence_state.as_deref().unwrap_or("n/a")
+            ));
+
+            out.push_str("\nhr liveness\n");
+            out.push_str(&format!("  hr_connected:     {}\n", s.hr_connected));
+            let hr_age = s.last_bpm_ts.map(|ts| (now_ms - ts) / 1000);
+            match hr_age {
+                Some(age) => out.push_str(&format!("  last HR frame age:{age}s (last_bpm_ts)\n")),
+                None => out.push_str("  last HR frame age:n/a\n"),
+            }
+            match s.last_bpm {
+                Some(b) => out.push_str(&format!("  last bpm:         {b}\n")),
+                None => out.push_str("  last bpm:         n/a\n"),
+            }
+            match s.hr_battery_pct {
+                Some(p) => out.push_str(&format!("  battery:          {p}%\n")),
+                None => out.push_str("  battery:          n/a\n"),
+            }
+            let contact = match (s.hr_connected, hr_age) {
+                (true, Some(age)) if age <= hr_stale_s => "live",
+                (true, Some(_)) => "stale",
+                (true, None) => "stale",
+                (false, _) => "no-link",
+            };
+            out.push_str(&format!("  contact (inferred): {contact}\n"));
+            if s.hr_connected {
+                if let Some(age) = hr_age
+                    && age > hr_stale_s
+                {
+                    out.push_str(
+                        "  WARN: hr_connected=true but last bpm is stale — link may be silent\n",
+                    );
+                }
+            }
+
+            out.push_str("\nzone hold\n");
+            out.push_str(&format!("  config enabled:   {zone_config_enabled}\n"));
+            let phase = s.zone_hold_phase.as_deref().unwrap_or("n/a");
+            out.push_str(&format!("  phase snapshot:   {phase}\n"));
+            out.push_str(&format!("  active flag:      {}\n", s.zone_hold_active));
+            let phase_off = phase == "off" || phase == "n/a";
+            if !zone_config_enabled && (s.zone_hold_active || !phase_off) {
+                out.push_str(
+                    "  WARN: config enabled=false but phase/active still engaged (032-class)\n",
+                );
+            }
+            if zone_config_enabled
+                && phase_off
+                && s.presence_state.as_deref() == Some("Walking")
+                && !s.zone_hold_active
+            {
+                out.push_str(
+                    "  note: enabled=true, walking, phase off — controller not engaged yet\n",
+                );
+            }
+        }
+    }
+
+    out.push_str(
+        "\nlegend: loop=process+heartbeat · treadmill=connected+last_speed_ts · \
+         hr=hr_connected+last_bpm_ts · config=enabled vs phase\n",
+    );
+    out
+}
+
+fn age_secs_rfc3339(rfc3339: &str, now_ms: i64) -> Option<i64> {
+    let dt = DateTime::parse_from_rfc3339(rfc3339).ok()?;
+    let then_ms = dt.with_timezone(&Utc).timestamp_millis();
+    Some((now_ms - then_ms) / 1000)
+}
+
 /// Print daemon/treadmill/power state and today's workouts, reading only
 /// SQLite (`daemon_status` + `activity_segments`) and `launchctl` — never
 /// touches the BLE adapter, so it cannot contend with a running daemon for it.
@@ -1889,6 +2061,38 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_report_flags_stale_heartbeat_and_zone_mismatch() {
+        let now = Utc::now();
+        let now_ms = now.timestamp_millis();
+        let status = store::DaemonStatus {
+            connected: true,
+            presence_state: Some("Walking".into()),
+            updated_at: (now - chrono::Duration::seconds(200)).to_rfc3339(),
+            power_mode: "ac_scanning".into(),
+            hr_connected: true,
+            last_bpm: Some(111),
+            last_bpm_ts: Some(now_ms - 60_000),
+            last_speed_kmh: Some(3.0),
+            last_speed_ts: Some(now_ms - 1_000),
+            zone_hold_active: true,
+            zone_hold_phase: Some("ramp".into()),
+            ..Default::default()
+        };
+        let report = format_doctor_report(true, Some(&status), false, now_ms, 120, 15);
+        assert!(report.contains("WARN: heartbeat older than 120s"));
+        assert!(report.contains("WARN: hr_connected=true but last bpm is stale"));
+        assert!(report.contains("WARN: config enabled=false but phase/active still engaged"));
+        assert!(report.contains("contact (inferred): stale"));
+    }
+
+    #[test]
+    fn doctor_report_handles_missing_status() {
+        let report = format_doctor_report(false, None, false, 0, 120, 15);
+        assert!(report.contains("process:          dead"));
+        assert!(report.contains("never recorded"));
+    }
 
     #[test]
     fn widget_state_maps_every_presence_label() {
