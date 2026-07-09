@@ -128,6 +128,14 @@ BATTERY_LOW_FG='#ff5555'  # Dracula red
 # down). Empty `hr_zone` (Zone Hold off/not engaged) draws the heart plain,
 # same as задача 025/026 before Zone Hold existed.
 
+# Session filter: tmux session name(s) to show this widget in. Empty
+# (default) -> every session, so a fresh checkout/new host shows it
+# everywhere with zero config. Populate to restrict it to specific
+# sessions — e.g. a narrow second-monitor session where the pill crowds out
+# segments that matter more there. Exact match against tmux's `#S` (session
+# name), not a pattern.
+WIDGET_SESSIONS=("main")
+
 # --- Helpers -------------------------------------------------------------------
 
 # Seconds -> `M:SS`, or `H:MM:SS` past an hour.
@@ -146,6 +154,17 @@ fmt_dist() {
 }
 
 # --- Main ----------------------------------------------------------------------
+
+# Session filter (see $WIDGET_SESSIONS above): skip entirely before even
+# touching the binary if the current session isn't in the allow-list.
+if (( ${#WIDGET_SESSIONS[@]} > 0 )); then
+  session="$(tmux display-message -p '#S' 2>/dev/null || true)"
+  match=0
+  for s in "${WIDGET_SESSIONS[@]}"; do
+    [[ "$s" == "$session" ]] && { match=1; break; }
+  done
+  (( match )) || exit 0
+fi
 
 # No binary yet (fresh machine, not built/installed) -> render nothing rather
 # than error.
