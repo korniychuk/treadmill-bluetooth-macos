@@ -173,6 +173,15 @@ pub struct RawSample {
     pub steps: Option<u32>,
 }
 
+/// One stored HR sample as `recompute-hr` (задача 034) sees it: identity, time,
+/// and the untouched wire frame it was decoded from.
+#[derive(Debug, Clone)]
+pub struct HrRow {
+    pub id: i64,
+    pub ts_ms: i64,
+    pub raw_frame: Vec<u8>,
+}
+
 /// Below this many `hr_samples` in a window, [`Store::hr_summary_for`] returns
 /// `None` rather than a summary computed from too little data to be meaningful.
 const MIN_HR_SAMPLES_FOR_SUMMARY: usize = 10;
@@ -880,6 +889,46 @@ impl Store {
             .context("run raw_samples_ordered query")?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("collect raw_samples_ordered rows")
+    }
+
+    /// Every HR sample in chronological order, with its raw wire frame — the
+    /// ground truth `recompute-hr` (задача 034) replays through
+    /// `hr::ContactTracker`.
+    pub fn hr_samples_ordered(&self) -> Result<Vec<HrRow>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, ts_ms, raw_frame FROM hr_samples ORDER BY ts_ms ASC, id ASC")
+            .context("prepare hr_samples_ordered query")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(HrRow {
+                    id: row.get(0)?,
+                    ts_ms: row.get(1)?,
+                    raw_frame: row.get(2)?,
+                })
+            })
+            .context("run hr_samples_ordered query")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect hr_samples_ordered rows")
+    }
+
+    /// Delete the given HR samples in one transaction (задача 034). All-or-nothing:
+    /// a crash mid-delete must not leave a half-cleaned history whose sequence
+    /// structure no longer reflects either state.
+    pub fn delete_hr_samples(&mut self, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction().context("begin hr cleanup tx")?;
+        {
+            let mut stmt = tx
+                .prepare("DELETE FROM hr_samples WHERE id = ?1")
+                .context("prepare hr sample delete")?;
+            for id in ids {
+                stmt.execute([id]).context("delete hr sample")?;
+            }
+        }
+        tx.commit().context("commit hr cleanup tx")
     }
 
     /// Atomically replace the entire `activity_segments` table with `segments`
