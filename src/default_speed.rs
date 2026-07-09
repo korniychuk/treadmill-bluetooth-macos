@@ -203,9 +203,9 @@ mod tests {
         // A qualifying workout: 40 min of credited walking, one open segment.
         let start = Utc.with_ymd_and_hms(2026, 7, 5, 10, 0, 0).unwrap();
         let end = start + Duration::minutes(40);
-        let id = store.credit_activity(100, 200, 1800, start, None).unwrap();
+        let handle = store.credit_activity(100, 200, 1800, start, None).unwrap();
         store
-            .credit_activity(100, 200, 1000, end, Some(id))
+            .credit_activity(100, 200, 1000, end, Some(handle))
             .unwrap();
 
         // Speed samples across the window: mostly 2.5, a few crawl and burst.
@@ -234,7 +234,7 @@ mod tests {
         store.start_session().unwrap(); // session id 1, satisfies raw_samples FK
         let start = Utc.with_ymd_and_hms(2026, 7, 5, 10, 0, 0).unwrap();
         // Only 10 min of walking — under the 30-min bar.
-        store.credit_activity(100, 200, 600, start, None).unwrap();
+        let _ = store.credit_activity(100, 200, 600, start, None).unwrap();
         insert_speed(&store, start.timestamp_millis(), 2.5);
 
         assert!(compute_default_speed(&store, 15).unwrap().is_none());

@@ -483,12 +483,15 @@ impl Store {
     /// activity segment (`activity_segments`), in one transaction so a crash
     /// mid-credit cannot leave them disagreeing.
     ///
-    /// `open_segment` is the id of the segment the daemon considers open (from
-    /// its in-memory `current_segment`): `Some(id)` extends it, `None` opens a
-    /// new segment. Returns the id of the segment credited (the existing one, or
-    /// the freshly inserted one), which the caller stores back as its open
-    /// segment. There is no `open` flag in the DB — "open" lives in daemon
-    /// memory, so a daemon restart simply starts a new segment and read-time
+    /// `open_segment` is the open handle the daemon holds in memory (id +
+    /// `started_at`, задача 044): `Some` extends only when both match a row,
+    /// `None` opens a new segment. Matching id alone is insufficient —
+    /// `recompute-segments` renumbers ids from 1, so a live daemon could
+    /// otherwise UPDATE a different historical segment. Returns `(id, started_at)`
+    /// for the segment credited (caller stores that as its open handle).
+    ///
+    /// There is no `open` flag in the DB — "open" lives in daemon memory, so a
+    /// daemon restart simply starts a new segment and read-time
     /// [`merge_segments`] re-joins it to the pre-restart one if the gap is under
     /// the configured threshold (same restart reasoning as `device_baseline`).
     ///
@@ -506,8 +509,8 @@ impl Store {
         distance_m: i64,
         walking_time_s: i64,
         now: DateTime<Utc>,
-        open_segment: Option<i64>,
-    ) -> Result<i64> {
+        open_segment: Option<(i64, String)>,
+    ) -> Result<(i64, String)> {
         let today = now.with_timezone(&Local).format("%Y-%m-%d").to_string();
         let tx = self
             .conn
@@ -525,12 +528,10 @@ impl Store {
         )
         .context("credit daily_stats")?;
 
-        // Extend the open segment if the daemon still holds one *and* it really
-        // exists (a stale id — e.g. a wiped DB under a long-lived daemon — must
-        // not silently no-op the UPDATE and lose the credit); otherwise open a
-        // new segment.
+        // Extend only when id *and* started_at match (задача 044); a renumbered
+        // table after recompute keeps the historical row out of the live cache.
         let extended = match open_segment {
-            Some(id) => {
+            Some((id, ref started_at)) => {
                 let rows = tx
                     .execute(
                         "UPDATE activity_segments SET
@@ -538,38 +539,47 @@ impl Store {
                             distance_m = distance_m + ?2,
                             steps = steps + ?3,
                             walking_time_s = walking_time_s + ?4
-                         WHERE id = ?5",
-                        params![now.to_rfc3339(), distance_m, steps, walking_time_s, id],
+                         WHERE id = ?5 AND started_at = ?6",
+                        params![
+                            now.to_rfc3339(),
+                            distance_m,
+                            steps,
+                            walking_time_s,
+                            id,
+                            started_at
+                        ],
                     )
                     .context("extend activity segment")?;
                 if rows == 0 {
                     tracing::warn!(
                         id,
-                        "open segment id not found — opening a new segment instead"
+                        started_at = %started_at,
+                        "cached segment id no longer matches — reopened"
                     );
                     None
                 } else {
-                    Some(id)
+                    Some((id, started_at.clone()))
                 }
             }
             None => None,
         };
 
-        let segment_id = match extended {
-            Some(id) => id,
+        let segment = match extended {
+            Some(handle) => handle,
             None => {
+                let started = now.to_rfc3339();
                 tx.execute(
                     "INSERT INTO activity_segments (started_at, ended_at, date, distance_m, steps, walking_time_s)
                      VALUES (?1, ?1, ?2, ?3, ?4, ?5)",
-                    params![now.to_rfc3339(), today, distance_m, steps, walking_time_s],
+                    params![&started, today, distance_m, steps, walking_time_s],
                 )
                 .context("insert activity segment")?;
-                tx.last_insert_rowid()
+                (tx.last_insert_rowid(), started)
             }
         };
 
         tx.commit().context("commit credit_activity transaction")?;
-        Ok(segment_id)
+        Ok(segment)
     }
 
     /// Persist one decoded Treadmill Data (`0x2ACD`) sample verbatim.
@@ -1380,15 +1390,15 @@ mod tests {
         Store::open_at(Path::new(":memory:")).expect("open in-memory store")
     }
 
-    /// Credit one walking burst, threading the daemon's open-segment id.
+    /// Credit one walking burst, threading the daemon's open-segment handle.
     fn credit(
         store: &mut Store,
         steps: i64,
         dist: i64,
         time: i64,
         now: DateTime<Utc>,
-        open: Option<i64>,
-    ) -> i64 {
+        open: Option<(i64, String)>,
+    ) -> (i64, String) {
         store.credit_activity(steps, dist, time, now, open).unwrap()
     }
 
@@ -1413,10 +1423,11 @@ mod tests {
         let t1 = t0 + Duration::minutes(10);
 
         // Same open segment across both bursts (daemon never left Walking).
-        let id = credit(&mut store, 5, 10, 30, t0, None);
-        let id2 = credit(&mut store, 5, 10, 30, t1, Some(id));
+        let handle = credit(&mut store, 5, 10, 30, t0, None);
+        let handle2 = credit(&mut store, 5, 10, 30, t1, Some(handle.clone()));
 
-        assert_eq!(id, id2, "extending, not opening a new segment");
+        assert_eq!(handle.0, handle2.0, "extending, not opening a new segment");
+        assert_eq!(handle.1, handle2.1);
         let segs = store.all_segments_asc().unwrap();
         assert_eq!(segs.len(), 1, "single continuous segment");
         assert_eq!(segs[0].steps, 10);
@@ -1434,10 +1445,10 @@ mod tests {
 
         // The daemon closed the first segment (presence left Walking), so the
         // second burst is credited with `None` → a brand-new segment.
-        let id = credit(&mut store, 5, 10, 30, t0, None);
-        let id2 = credit(&mut store, 5, 10, 30, t1, None);
+        let handle = credit(&mut store, 5, 10, 30, t0, None);
+        let handle2 = credit(&mut store, 5, 10, 30, t1, None);
 
-        assert_ne!(id, id2);
+        assert_ne!(handle.0, handle2.0);
         assert_eq!(
             store.all_segments_asc().unwrap().len(),
             2,
@@ -1454,8 +1465,15 @@ mod tests {
 
         // A bogus open id (e.g. DB wiped under a long-lived daemon) must open a
         // new segment rather than silently no-op the UPDATE and drop the credit.
-        let id2 = credit(&mut store, 7, 14, 42, t1, Some(999_999));
-        assert_ne!(id2, 999_999);
+        let handle2 = credit(
+            &mut store,
+            7,
+            14,
+            42,
+            t1,
+            Some((999_999, t0.to_rfc3339())),
+        );
+        assert_ne!(handle2.0, 999_999);
         let segs = store.all_segments_asc().unwrap();
         assert_eq!(segs.len(), 2);
         assert_eq!(
@@ -1463,6 +1481,37 @@ mod tests {
             12,
             "both credits landed"
         );
+    }
+
+    /// After `replace_activity_segments` renumbers ids, a live cache holding
+    /// `(id, started_at)` must not extend a different historical row (задача 044).
+    #[test]
+    fn credit_activity_rejects_id_reuse_with_different_started_at() {
+        let mut store = memory_store();
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 5, 10, 0, 0).unwrap();
+        let t1 = t0 + Duration::minutes(30);
+        let t2 = t1 + Duration::minutes(5);
+        let live = credit(&mut store, 10, 20, 60, t0, None);
+        // Simulate recompute: wipe and reinsert with deterministic ids from 1
+        // but a different started_at on id=1 (historical closed segment).
+        let historical = Segment {
+            id: 1,
+            date: "2026-07-01".into(),
+            started_at: (t0 - Duration::days(4)).to_rfc3339(),
+            ended_at: (t0 - Duration::days(4) + Duration::minutes(20)).to_rfc3339(),
+            distance_m: 100,
+            steps: 50,
+            walking_time_s: 1200,
+        };
+        let historical_started = historical.started_at.clone();
+        store.replace_activity_segments(&[historical]).unwrap();
+        // Cached handle still has live's started_at under id 1 — must open new.
+        let after = credit(&mut store, 5, 10, 30, t2, Some(live));
+        assert_ne!(after.1, historical_started);
+        let segs = store.all_segments_asc().unwrap();
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].steps, 50, "historical row untouched");
+        assert_eq!(segs[1].steps, 5, "live credit opened a new segment");
     }
 
     #[test]

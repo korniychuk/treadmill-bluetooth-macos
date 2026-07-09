@@ -1,6 +1,6 @@
 # 044 — `recompute-segments` при живом демоне: id-коллизия портит чужой сегмент
 
-> **Статус: open**
+> **Статус: done**
 > **Источник:** [research/004](../research/004-independent-reliability-review.md) §3 N3
 > **Класс:** data integrity / dual-writer window
 > **Приоритет:** medium (тихая порча истории; проявляется только при recompute во время ходьбы)
@@ -29,10 +29,10 @@
 
 ## Acceptance
 
-- [ ] `credit_activity` не может дописать в сегмент с совпавшим id, но другим `started_at`
-- [ ] `tm recompute-segments` при живом демоне отказывает с понятным сообщением
-- [ ] task 015 док + CLAUDE.md упоминают предусловие/поведение
-- [ ] Regression-тест на id-переназначение
+- [x] `credit_activity` не может дописать в сегмент с совпавшим id, но другим `started_at`
+- [x] `tm recompute-segments` при живом демоне отказывает с понятным сообщением
+- [x] task 015 док + CLAUDE.md упоминают предусловие/поведение
+- [x] Regression-тест на id-переназначение
 
 ## Затронутые файлы
 

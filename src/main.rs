@@ -249,9 +249,11 @@ async fn main() -> Result<()> {
         return run_doctor();
     }
     if let Commands::RecomputeSegments = command {
+        refuse_if_daemon_live("recompute-segments")?;
         return recompute::run();
     }
     if let Commands::RecomputeHr { dry_run } = command {
+        refuse_if_daemon_live("recompute-hr")?;
         return recompute_hr::run(dry_run);
     }
     if let Commands::Widget = command {
@@ -1287,6 +1289,26 @@ const WATCHDOG_STALE_THRESHOLD_S: i64 = daemon::WATCHDOG_STALE_THRESHOLD.as_secs
 /// belt notifies ~1/s and the daemon's HR silence window is 10s, so 15s covers
 /// one missed cycle and nothing more.
 const HR_STALE_THRESHOLD_S: i64 = 15;
+
+/// Refuse repair commands while the daemon holds a live heartbeat (задача 044).
+/// `recompute-segments` renumbers segment ids; a live daemon caching an open id
+/// would then credit into a different historical row.
+fn refuse_if_daemon_live(cmd: &str) -> Result<()> {
+    if !daemon_process_alive() {
+        return Ok(());
+    }
+    let store = store::Store::open()?;
+    if let Some(status) = store.daemon_status()?
+        && daemon_status_fresh(&status)
+    {
+        anyhow::bail!(
+            "{cmd}: daemon is running with a fresh heartbeat — stop it first \
+             (`launchctl kickstart -k gui/$(id -u)/com.korniychuk.treadmill-bluetooth-macos` \
+             or `scripts/uninstall-daemon.sh`) so open segment ids cannot collide"
+        );
+    }
+    Ok(())
+}
 
 /// Liveness matrix for one-shot diagnosis (задача 038). Read-only: SQLite +
 /// config + launchctl — never opens BLE.

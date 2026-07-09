@@ -270,8 +270,8 @@ cargo run -- stats     # статистика за сегодня; `stats --all`
 cargo run -- status    # состояние демона/дорожки/HR/zone (read-only, без BLE)
 cargo run -- doctor    # матрица живости для диагностики (задача 038; без BLE)
 cargo run -- widget    # компактный TSV текущей тренировки для status-bar виджета; пусто если дорожка off (см. docs/tasks/009)
-cargo run -- recompute-segments  # пересобрать activity_segments из raw_samples (без BLE, идемпотентно; docs/tasks/015)
-cargo run -- recompute-hr        # вычистить hr_samples, записанные со снятого датчика (без BLE, --dry-run; docs/tasks/034)
+cargo run -- recompute-segments  # пересобрать activity_segments из raw_samples (без BLE, идемпотентно; docs/tasks/015). Откажет, если демон жив (задача 044).
+cargo run -- recompute-hr        # вычистить hr_samples, записанные со снятого датчика (без BLE, --dry-run; docs/tasks/034). Откажет, если демон жив.
 cargo run -- default-speed  # показать расчётную дефолтную скорость на старте тренировки (без BLE; docs/tasks/016)
 cargo run -- hr        # диагностика: подключиться к HR-датчику, печатать заряд + live bpm (docs/tasks/025,026)
 cargo run -- zone      # Zone Hold: статус (без аргумента) или on/off/setup/limits/target/list/add/edit/remove/mode (docs/tasks/027)

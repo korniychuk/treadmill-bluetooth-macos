@@ -42,10 +42,11 @@ pub struct PendingCredit {
 pub struct ActivityAccumulator {
     presence: PresenceTracker,
     pending: PendingCredit,
-    /// The open activity segment's id, or `None` when no segment is open.
-    /// Extended by each credited step, closed (set to `None`) on the presence
-    /// transition leaving `Walking`.
-    current_segment: Option<i64>,
+    /// Open activity segment handle `(id, started_at)`, or `None` when closed.
+    /// Identity includes `started_at` so a renumbered table after
+    /// `recompute-segments` cannot extend a different historical row (задача 044).
+    /// Closed (set to `None`) on the presence transition leaving `Walking`.
+    current_segment: Option<(i64, String)>,
 }
 
 impl ActivityAccumulator {
@@ -123,11 +124,12 @@ impl Default for ActivityAccumulator {
 /// is dropped instead of committed — otherwise every departure would silently
 /// credit an extra `AWAY_THRESHOLD` worth of phantom distance/time.
 ///
-/// `current_segment` is the caller's in-memory open-segment id (задача 014):
-/// each confirming step extends it (or opens one if `None`), and the returned
-/// id is stored back. The segment is *closed* elsewhere — on the presence
-/// transition leaving `Walking` (see [`ActivityAccumulator::observe`]), which
-/// clears it to `None` so the next step opens a fresh segment.
+/// `current_segment` is the caller's in-memory open-segment handle
+/// `(id, started_at)` (задачи 014/044): each confirming step extends it (or
+/// opens one if `None`), and the returned handle is stored back. The segment is
+/// *closed* elsewhere — on the presence transition leaving `Walking` (see
+/// [`ActivityAccumulator::observe`]), which clears it to `None` so the next
+/// step opens a fresh segment.
 ///
 /// `now` is the sample's timestamp, threaded through to `store::credit_activity`
 /// so cross-segment gaps match wall-clock precisely (live) or the replayed
@@ -135,7 +137,7 @@ impl Default for ActivityAccumulator {
 pub fn credit_or_hold(
     store: &mut Store,
     pending: &mut PendingCredit,
-    current_segment: &mut Option<i64>,
+    current_segment: &mut Option<(i64, String)>,
     state: PresenceState,
     now: DateTime<Utc>,
     deltas: RawDeltas,
@@ -145,14 +147,14 @@ pub fn credit_or_hold(
             pending.distance_m += deltas.distance_m;
             pending.elapsed_s += deltas.elapsed_s;
             if deltas.steps > 0 {
-                let id = store.credit_activity(
+                let handle = store.credit_activity(
                     deltas.steps,
                     pending.distance_m,
                     pending.elapsed_s,
                     now,
-                    *current_segment,
+                    current_segment.clone(),
                 )?;
-                *current_segment = Some(id);
+                *current_segment = Some(handle);
                 *pending = PendingCredit::default();
             }
         }
@@ -177,7 +179,7 @@ mod tests {
     fn confirmed_step_flushes_pending_distance_and_time() {
         let mut store = memory_store();
         let mut pending = PendingCredit::default();
-        let mut segment: Option<i64> = None;
+        let mut segment: Option<(i64, String)> = None;
         let now = Utc::now();
 
         // Ambiguous gap: belt moved 3m/1s but no step registered yet.
@@ -226,7 +228,7 @@ mod tests {
     fn confirmed_away_discards_pending_instead_of_crediting_it() {
         let mut store = memory_store();
         let mut pending = PendingCredit::default();
-        let mut segment: Option<i64> = None;
+        let mut segment: Option<(i64, String)> = None;
         let now = Utc::now();
 
         // The belt kept moving for the whole confirmation window before the
