@@ -113,7 +113,10 @@ const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// silent for 10+ hours / 79+ minutes) is caught in ~2 minutes. `Instant`
 /// on macOS does not advance during system sleep, so waking from a long
 /// sleep cannot false-positive here.
-const WATCHDOG_STALE_THRESHOLD: Duration = Duration::from_secs(120);
+/// Shared with CLI status/widget/routing (задача 043): one source of truth for
+/// "daemon heartbeat too old to trust". Was previously hand-duplicated in
+/// `main.rs` as 95s and had already drifted from this 120s value.
+pub(crate) const WATCHDOG_STALE_THRESHOLD: Duration = Duration::from_secs(120);
 
 /// Tighter staleness threshold that applies only while telemetry is actively
 /// streaming (задача 018). A connected treadmill sends a sample ~1/s, so silence
@@ -1682,13 +1685,8 @@ async fn zone_hold_tick(
                             "zone hold: safety cap exceeded — force-reducing speed"
                         );
                         apply_zone_hold_speed(peripheral, target).await;
-                    } else {
-                        // Already at floor within deadband — no write, no beep
-                        // spam every safety cooldown (задача 041 / class 030).
-                        // Transition-rate: only log when we would have written.
-                        // Floor no-ops are silent (class 030 / задача 041).
-                        let _ = (bpm, safety_cap, measured_speed_kmh);
                     }
+                    // else: already at min within deadband — no write (задача 041).
                 }
                 zh_persist_snapshot(state, phase, &resolved, Some(bpm), measured_speed_kmh);
                 return;

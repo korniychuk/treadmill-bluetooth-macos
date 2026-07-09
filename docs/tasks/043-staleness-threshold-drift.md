@@ -1,6 +1,6 @@
 # 043 — Staleness-константы: дрейф main↔daemon уже случился
 
-> **Статус: open**
+> **Статус: done**
 > **Источник:** [research/004](../research/004-independent-reliability-review.md) §3 N2
 > **Класс:** contract drift / duplicated constants
 > **Приоритет:** medium-high (дёшево; влияет на routing control-команд)
@@ -40,10 +40,10 @@ const WATCHDOG_STALE_THRESHOLD: Duration = Duration::from_secs(120);
 
 ## Acceptance
 
-- [ ] Ровно одно определение watchdog-порога в кодовой базе (или производное с явной формулой)
-- [ ] `tm status`/`tm widget`/`daemon_holds_link` согласованы с реальным порогом демона
-- [ ] `widget_speed_field` использует HR-порог и покрыт тестами
-- [ ] Нет комментариев «keep in sync by hand» на константах
+- [x] Ровно одно определение watchdog-порога в кодовой базе (или производное с явной формулой)
+- [x] `tm status`/`tm widget`/`daemon_holds_link` согласованы с реальным порогом демона
+- [x] `widget_speed_field` использует HR-порог и покрыт тестами
+- [x] Нет комментариев «keep in sync by hand» на константах
 
 ## Затронутые файлы
 

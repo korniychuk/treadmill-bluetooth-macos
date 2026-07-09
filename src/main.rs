@@ -1268,18 +1268,16 @@ fn raw_hint(show: bool, value: &str) -> String {
     }
 }
 
-/// Duplicated from `daemon::WATCHDOG_STALE_THRESHOLD` (private to
-/// `daemon.rs`) — same rationale as `daemon.rs`'s own hand-kept duplicate of
-/// `scan::SCAN_TIMEOUT`: no clean cross-module export yet, keep in sync by
-/// hand. Used only to flag `daemon_status.updated_at` as possibly stale here.
-const WATCHDOG_STALE_THRESHOLD_S: i64 = 15 /* scan */ + 20 /* connect */ + 60 /* margin */;
+/// Seconds form of [`daemon::WATCHDOG_STALE_THRESHOLD`] (задача 043 — single
+/// source of truth; do not re-derive as an independent literal).
+const WATCHDOG_STALE_THRESHOLD_S: i64 = daemon::WATCHDOG_STALE_THRESHOLD.as_secs() as i64;
 
-/// How old a bpm reading may be before the widget/status stop showing it
-/// (задача 033). Deliberately *not* [`WATCHDOG_STALE_THRESHOLD_S`], which is
-/// sized for "the daemon hung" (scan + connect + margin = 95s) — a pulse frozen
-/// for a minute and a half is a lie. A worn strap notifies ~1/s and the daemon's
-/// own `HR_NOTIFICATION_TIMEOUT` is 10s, so 15s covers one missed cycle and
-/// nothing more.
+/// How old a bpm (or belt-speed) reading may be before the widget/status stop
+/// showing it (задачи 033/029/043). Deliberately *not*
+/// [`WATCHDOG_STALE_THRESHOLD_S`], which is sized for "the daemon hung" (~120s)
+/// — a pulse or speed frozen for two minutes is a lie. A worn strap / moving
+/// belt notifies ~1/s and the daemon's HR silence window is 10s, so 15s covers
+/// one missed cycle and nothing more.
 const HR_STALE_THRESHOLD_S: i64 = 15;
 
 /// Print daemon/treadmill/power state and today's workouts, reading only
@@ -1573,16 +1571,24 @@ fn widget_hr_zone_field(status: &store::DaemonStatus, widget_state: &str) -> Str
 
 /// The widget's 12th field: live belt speed as a formatted string (задача
 /// 029), or empty when the `show_speed` config toggle is off, the reading is
-/// stale (same freshness threshold as [`widget_hr_field`]), or the belt is
-/// stopped (`0` km/h — not worth showing, that's the common idle state).
+/// stale (same freshness threshold as [`widget_hr_field`] — задача 043), or
+/// the belt is stopped (`0` km/h — not worth showing, that's the common idle
+/// state).
 fn widget_speed_field(status: &store::DaemonStatus) -> String {
     if !goals::load_show_speed() {
         return String::new();
     }
+    widget_speed_value(status, Utc::now().timestamp_millis())
+}
+
+/// Pure half of [`widget_speed_field`] (config toggle already applied): age vs
+/// [`HR_STALE_THRESHOLD_S`] and zero-speed blanking. `now_ms` is injected so
+/// unit tests do not need a live config or wall clock.
+fn widget_speed_value(status: &store::DaemonStatus, now_ms: i64) -> String {
     match (status.last_speed_kmh, status.last_speed_ts) {
         (Some(kmh), Some(ts_ms)) => {
-            let age_s = (Utc::now().timestamp_millis() - ts_ms) / 1000;
-            if age_s <= WATCHDOG_STALE_THRESHOLD_S && kmh > 0.0 {
+            let age_s = (now_ms - ts_ms) / 1000;
+            if age_s <= HR_STALE_THRESHOLD_S && kmh > 0.0 {
                 format_speed_kmh(kmh)
             } else {
                 String::new()
@@ -1932,10 +1938,40 @@ mod tests {
             widget_hr_field(&status_with_bpm(true, HR_STALE_THRESHOLD_S + 1)),
             ""
         );
-        // A bpm older than the HR threshold but younger than the old watchdog
+        // A bpm older than the HR threshold but younger than the watchdog
         // one is exactly the regression задача 033 fixes.
         const { assert!(HR_STALE_THRESHOLD_S < WATCHDOG_STALE_THRESHOLD_S) };
         assert_eq!(widget_hr_field(&status_with_bpm(true, 60)), "");
+    }
+
+    fn status_with_speed(kmh: f64, age_s: i64) -> store::DaemonStatus {
+        let now = Utc::now().timestamp_millis();
+        store::DaemonStatus {
+            last_speed_kmh: Some(kmh),
+            last_speed_ts: Some(now - age_s * 1000),
+            ..Default::default()
+        }
+    }
+
+    /// Belt speed uses the same 15s freshness as HR (задача 043), not the
+    /// 120s watchdog threshold that previously left frozen kmh on screen.
+    #[test]
+    fn widget_speed_value_uses_hr_stale_threshold() {
+        let now = Utc::now().timestamp_millis();
+        assert_eq!(
+            widget_speed_value(&status_with_speed(3.2, 1), now),
+            "3.2kmh"
+        );
+        assert_eq!(
+            widget_speed_value(&status_with_speed(3.0, HR_STALE_THRESHOLD_S), now),
+            "3kmh"
+        );
+        assert_eq!(
+            widget_speed_value(&status_with_speed(3.2, HR_STALE_THRESHOLD_S + 1), now),
+            ""
+        );
+        // Zero / stopped belt is blank even when fresh.
+        assert_eq!(widget_speed_value(&status_with_speed(0.0, 1), now), "");
     }
 
     fn workout_ending_at(ended_at: &str) -> store::Workout {
