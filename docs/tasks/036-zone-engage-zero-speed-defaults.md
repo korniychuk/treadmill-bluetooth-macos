@@ -1,21 +1,29 @@
-# 036 — Engage-пути Zone Hold: `unwrap_or(0.0)` на missing speed
+# 036 — Engage-пути Zone Hold: `unwrap_or(0.0)` — скрытый инвариант, не живой баг
 
 > **Статус: open**  
-> **Источник:** [research/003](../research/003-reliability-architecture-review.md) §3.5, Phase 0.2  
-> **Класс:** `units` / call-site defaults (хвост 030)  
-> **Приоритет:** high
+> **Источник:** [research/003](../research/003-reliability-architecture-review.md) §3.5, Phase 0.2; **премиза скорректирована** [research/004](../research/004-independent-reliability-review.md) §2.2  
+> **Класс:** invariant hardening + regression gap (хвост 030)  
+> **Приоритет:** ~~high~~ → **medium** — путь сегодня недостижим (см. ниже), из Phase 0 выведена
 
-## Симптом (latent)
+## ⚠ Поправка премизы (review 004)
 
-На presence-transition / engage Zone Hold кадр FTMS Treadmill Data может нести `speed_kmh = None` (флаг `MORE_DATA` — скорость в следующем кадре, см. `src/ftms.rs`).
+Утверждение «MORE_DATA frame (`speed=None`) на transition может стартовать Ramp с 0» — **неверно для текущего кода**. `presence.rs:75-93`: `observe` при `speed_kmh = None` возвращает `None` (state не меняется → нет transition), значит transition-блок `daemon.rs:747` выполняется только с `Some(speed)` — все три `unwrap_or(0.0)` недостижимы с `None`. Проверено двумя независимыми ревьюерами и вручную.
 
-Сейчас engage-пути подставляют `0.0` → контроллер / restore / default-speed читают «лента остановилась» на живой ходьбе → Ramp может стартовать с 0, default-speed ceiling check врёт, restore toast врёт.
+**Но задача остаётся**: безопасность :755/:771/:797 — **скрытый кросс-модульный инвариант**, живущий в одной строке `presence.rs:86`. Если presence когда-нибудь научится давать transition без скорости (например, по шагам), три `unwrap_or(0.0)` молча оживут ровно с описанными ниже последствиями. Фикс тот же — протащить `Option` и убрать fabricated 0.0; меняется только срочность.
+
+## Плюс: незакрытый regression-пробел 030-part-B
+
+Инвентаризация тестов (004 §4) показала: `zone_hold_tick` skip-on-`None` (второй фикс 030, `daemon.rs` ~1527) — **единственный фикс кластера 030–034 без регрессионного теста** (ноль call sites в `mod tests`). Закрыть здесь же — та же тема Option-speed.
+
+## Потенциальный симптом (если инвариант сломается)
+
+Engage-пути подставляют `0.0` → контроллер / restore / default-speed читают «лента остановилась» на живой ходьбе → Ramp может стартовать с 0, default-speed ceiling check врёт, restore toast врёт.
 
 ## Контекст: 030 починил не всё
 
 В 030 `zone_hold_tick` уже принимает `Option<f32>` и **пропускает тик** на `None` — правильный паттерн.
 
-Engage-пути в `stream_with_presence` **остались**:
+Engage-пути в `stream_with_presence` **остались** (достижимы только через transition, см. поправку выше):
 
 | Строка (≈) | Код | Использование |
 |---:|---|---|
@@ -64,9 +72,9 @@ Engage-пути в `stream_with_presence` **остались**:
 ## Acceptance
 
 - [ ] Нет `data.speed_kmh.unwrap_or(0.0)` на engage/resume/default путях
-- [ ] MORE_DATA frame (`speed=None`) на Walking transition не даёт target/ramp seed 0.0
+- [ ] Гипотетический transition с `speed=None` не даёт target/ramp seed 0.0 (защита не зависит от `presence.rs:86`)
 - [ ] `try_apply_default_speed` / restore не получают fake 0.0
-- [ ] `zone_hold_tick` path (030) остаётся skip-on-None
+- [ ] `zone_hold_tick` path (030) остаётся skip-on-None **и получает regression-тест** (пробел 030-part-B закрыт)
 - [ ] Regression tests green
 
 ## Затронутые файлы

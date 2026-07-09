@@ -18,6 +18,8 @@ let hrr = (hrmax - resting).max(0.0);
 
 **Не** мусор и не класс 030: оператор просит Karvonen, получает **численные** HRmax-проценты. Молча.
 
+Уточнение severity (review [004](../research/004-independent-reliability-review.md)): fallback-зоны **систематически ниже** задуманных (Karvonen с реальным resting всегда даёт границы выше HRmax-процентов) — оператор тренируется ниже целевой аэробной зоны, т.е. деградация направленная, не «эквивалентный метод». Фикс тот же (WARN + явный fallback), но молчать об этом нельзя.
+
 ## Решение
 
 В `resolve_zone_bpm` (или на resolve path `ResolvedZone`):

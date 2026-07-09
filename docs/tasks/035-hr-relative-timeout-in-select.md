@@ -1,9 +1,18 @@
 # 035 — HR silence: relative `timeout` в `select!` никогда не набегает
 
 > **Статус: open**  
-> **Источник:** [research/003](../research/003-reliability-architecture-review.md) §3.2, Phase 0.1  
+> **Источник:** [research/003](../research/003-reliability-architecture-review.md) §3.2, Phase 0.1; severity ↑ и расширение скоупа — [research/004](../research/004-independent-reliability-review.md) §2.1  
 > **Класс:** `liveness` (тот же, что 031)  
 > **Приоритет:** high — latent same-class bug; чинить первым
+
+## ⚠ Severity выше, чем казалось (review 004)
+
+Последствие зависшего таймаута — не только «reconnect мёртв, виджет спасёт». `zh_bpm` на входе Zone Hold (`daemon.rs:903`) гейтится **только** на `hr_connected`, свежесть `last_bpm_ts` не проверяется нигде в контуре управления (15с-порог живёт только в виджете). При «линк жив, notify молчит» `ContactTracker` тоже не спасает — он per-frame, а кадров нет. Итог: Zone Hold кормит контроллер замороженным bpm; в `Band`-режиме под-зонный frozen bpm даёт `+max_step` каждые `correction_interval` — **лента разгоняется до `effective_max_speed_kmh` по мёртвому датчику**.
+
+Поэтому скоуп расширен двумя пунктами defense-in-depth (оба дёшевы, те же строки):
+
+- **Freshness-гейт на `zh_bpm`**: bpm старше порога (константа, ~10–15с — согласовать с `HR_NOTIFICATION_TIMEOUT`) → `None`, контроллер молчит. Контур управления не должен зависеть от единственного детектора живости.
+- **Чистка `last_bpm`/`last_bpm_ts` на link-loss ветках** (`Ok(None)` ~1100 / `Err`→silence ~1114): сейчас чистит только contact-Lost путь (~1091); эти ветки всё равно переписываются под sleep_until. Инвариант: `hr_connected=false` ⇒ `last_bpm=None` (остальная HR-гигиена — задача [042](042-hr-link-state-hygiene.md)).
 
 ## Симптом (ещё не в проде, но неизбежен)
 
@@ -66,6 +75,8 @@ Some(stream) => tokio::time::timeout(HR_NOTIFICATION_TIMEOUT, stream.next()).awa
 
 - [ ] Нет `tokio::time::timeout(HR_NOTIFICATION_TIMEOUT, stream.next())` внутри `select!`
 - [ ] `sleep_until(last_hr_at + HR_NOTIFICATION_TIMEOUT)` (или эквивалент absolute Instant)
+- [ ] `zh_bpm` с freshness-гейтом: устаревший `last_bpm_ts` → контроллер получает `None` (unit-тест)
+- [ ] Link-loss ветки чистят `last_bpm`/`last_bpm_ts` (инвариант `hr_connected=false` ⇒ `last_bpm=None`)
 - [ ] Regression test with paused clock + sibling arm green
 - [ ] Existing HR contact / reconnect behaviour unchanged when frames keep flowing
 - [ ] Smoke (live, optional): kill notify path / power-cycle strap mid-session → reconnect within timeout + reconnect interval

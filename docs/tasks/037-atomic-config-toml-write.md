@@ -11,6 +11,10 @@
 
 Главный риск — **не** half-read демоном (окно микросекундное), а **permanent wipe** конфига.
 
+### Доп. следствие half-read (review [004](../research/004-independent-reliability-review.md), уточнение к «окно микросекундное»)
+
+Если config-tick всё же поймает truncate/partial-окно параллельного `tm zone …`: `load_zone_hold_config` на parse-fail возвращает `disabled_default()` → reload-ветка делает `disengage_zone_hold` → **mid-session сброс Zone Hold**. Через ≤5с конфиг перечитается целым, но восстановление идёт через catch-up «zone on» = **свежий 5-минутный Ramp** — оператор молча теряет `Hold` от любой CLI-правки конфига, попавшей в окно. Atomic rename закрывает и это, не только crash-wipe.
+
 ## Где пишут
 
 | Файл | ≈ строки | Функции |
