@@ -35,14 +35,21 @@ pub const DEFAULT_CORRECTION_INTERVAL_SECONDS: i64 = 20;
 pub const DEFAULT_DEADBAND_BPM: i64 = 3;
 /// Max speed change applied per correction, km/h.
 pub const DEFAULT_MAX_STEP_KMH: f32 = 0.3;
-/// Minimum speed delta worth a Control Point write. Live telemetry
-/// (`data.speed_kmh`) jitters by a few hundredths of a km/h around a pinned
-/// clamp (min or max) — without this floor, `next_speed` would re-issue the
-/// *same* target every correction interval forever once the belt is stuck at
-/// its ceiling/floor, each write costing a RequestControl+SetSpeed round-trip
-/// (and an audible beep) for zero actual change. Well above FTMS's 0.01 km/h
-/// wire resolution (`control.rs::set_speed`) and well below `max_step_kmh`,
-/// so genuine corrections are unaffected.
+/// Minimum speed delta worth a Control Point write. Pinned at a clamp (min
+/// or max), the live-telemetry value and the clamp constant are computed
+/// down two different float paths — telemetry decodes as `raw as f32 *
+/// 0.01` (`ftms.rs`, `0.01` isn't exactly representable in binary32, so
+/// e.g. raw=320 decodes to `3.1999998`, not `3.2`) while the clamp comes
+/// from config parsing — so they never compare bit-equal even though both
+/// mean the same nominal speed (confirmed empirically: telemetry stayed
+/// bit-identical at `3.1999998` for 20+ minutes straight, i.e. no real
+/// jitter, purely a fixed ~2e-7 representation gap). Exact equality made
+/// `next_speed` re-issue the *same* target every correction interval
+/// forever once pinned, each write costing a RequestControl+SetSpeed
+/// round-trip (and an audible double beep) for zero actual change. This
+/// tolerance is comfortably above that gap (and would also absorb genuine
+/// device-reported jitter, if a given model has any) and well below
+/// `max_step_kmh`, so real corrections are unaffected.
 pub const MIN_SPEED_CHANGE_KMH: f32 = 0.05;
 /// Grace window after returning to `Walking` during which no correction runs.
 pub const DEFAULT_REENTRY_GRACE_SECONDS: i64 = 45;
@@ -974,19 +981,21 @@ mod tests {
     }
 
     #[test]
-    fn band_mode_ignores_telemetry_jitter_at_the_pin() {
+    fn band_mode_ignores_float_precision_gap_at_the_pin() {
         let params = band_params();
-        // Live speed telemetry never lands on the clamp exactly — it jitters
-        // by a few hundredths of a km/h. Pinned at max, still below the
+        // Telemetry-decoded speed (`raw as f32 * 0.01`) never lands bit-equal
+        // on the config-parsed clamp — e.g. observed in production as
+        // 3.1999998 vs. a 3.2 clamp, a fixed ~2e-7 gap, not jitter (see
+        // MIN_SPEED_CHANGE_KMH doc comment). Pinned at max, still below the
         // zone: must not re-fire a same-value write every tick (the bug that
-        // caused a Control Point round-trip, and an audible beep, on a
-        // no-op speed every ~20s).
+        // caused a Control Point round-trip, and an audible double beep, on
+        // a no-op speed every ~20s).
         assert_eq!(next_speed(&params, DEFAULT_MAX_SPEED_KMH - 0.02, 100), None);
         assert_eq!(next_speed(&params, DEFAULT_MAX_SPEED_KMH + 0.03, 100), None);
         // Pinned at min, HR still high → same for the floor.
         assert_eq!(next_speed(&params, DEFAULT_MIN_SPEED_KMH + 0.02, 140), None);
         assert_eq!(next_speed(&params, DEFAULT_MIN_SPEED_KMH - 0.03, 140), None);
-        // But a genuine gap beyond the noise floor still corrects.
+        // But a genuine gap beyond the tolerance still corrects.
         assert_eq!(
             next_speed(&params, DEFAULT_MAX_SPEED_KMH - 0.2, 100),
             Some(DEFAULT_MAX_SPEED_KMH)
