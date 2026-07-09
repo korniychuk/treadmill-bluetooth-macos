@@ -79,15 +79,17 @@ enum Commands {
     /// Emit a compact, machine-readable snapshot for a status-bar widget
     /// (tmux/Dracula). Prints one TSV line `state\tworkout_count\tcur_walking_s\t
     /// cur_steps\tcur_distance_m\tday_walking_s\tday_steps\tday_distance_m\t
-    /// hr_bpm\thr_battery_pct` while the treadmill is connected and the daemon
-    /// heartbeat is fresh, or nothing at all otherwise (so the widget hides).
-    /// `cur_*` is the current workout, `day_*` today's calendar totals; both
-    /// are presence-filtered walking (no step-away/pause). `hr_bpm` is empty
-    /// unless a heart-rate sensor is worn and its reading is fresh (задача
-    /// 025); `hr_battery_pct` is the sensor's last-read battery level, empty
-    /// if unknown (задача 026). Like `status`,
+    /// hr_bpm\thr_battery_pct\thr_zone\tspeed_kmh` while the treadmill is
+    /// connected and the daemon heartbeat is fresh, or nothing at all
+    /// otherwise (so the widget hides). `cur_*` is the current workout,
+    /// `day_*` today's calendar totals; both are presence-filtered walking
+    /// (no step-away/pause). `hr_bpm` is empty unless a heart-rate sensor is
+    /// worn and its reading is fresh (задача 025); `hr_battery_pct` is the
+    /// sensor's last-read battery level, empty if unknown (задача 026).
+    /// `speed_kmh` is the live belt speed, empty unless `tm speed-widget on`
+    /// (задача 029). Like `status`,
     /// never opens the BLE adapter. See
-    /// docs/tasks/009 and 014.
+    /// docs/tasks/009, 014, 027 and 029.
     Widget,
     /// Print the computed default belt speed the daemon would apply at the next
     /// workout start — the trimmed-mean cruising pace of your most recent ≥30min
@@ -143,6 +145,22 @@ enum Commands {
         #[command(subcommand)]
         action: Option<ZoneAction>,
     },
+    /// Toggle the live belt-speed field in `tm widget` (задача 029): `on`/
+    /// `off`, or no sub-action to print the current setting. Not `speed` —
+    /// that command already sets the belt's *target* speed via the Control
+    /// Point. Read/write config only, no BLE.
+    SpeedWidget {
+        #[command(subcommand)]
+        action: Option<SpeedWidgetAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SpeedWidgetAction {
+    /// Show the live belt speed (km/h) in `tm widget`.
+    On,
+    /// Hide the live belt speed field.
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -229,6 +247,9 @@ async fn main() -> Result<()> {
     if let Commands::Zone { action } = command {
         return run_zone(action);
     }
+    if let Commands::SpeedWidget { action } = command {
+        return run_speed_widget(action);
+    }
     // Control commands route through the daemon's queue when it holds the BLE
     // link (two processes can't co-own the connection — задача 013), and only
     // fall back to a direct connection when the daemon is off. Handled here,
@@ -273,6 +294,7 @@ async fn main() -> Result<()> {
         | Commands::NotifyTest
         | Commands::DefaultSpeed
         | Commands::Zone { .. }
+        | Commands::SpeedWidget { .. }
         | Commands::Start
         | Commands::Stop
         | Commands::Speed { .. } => {
@@ -967,6 +989,30 @@ fn zone_mode(tracking: &str) -> Result<()> {
     }
 }
 
+/// Dispatch a `tm speed-widget` sub-action (задача 029). Read/write config
+/// only — no BLE, same constraint as `zone`/`status`/`widget`.
+fn run_speed_widget(action: Option<SpeedWidgetAction>) -> Result<()> {
+    match action {
+        None => {
+            let enabled = goals::load_show_speed();
+            println!(
+                "Speed widget: {}",
+                if enabled { "on" } else { "off" }
+            );
+            Ok(())
+        }
+        Some(SpeedWidgetAction::On) => set_show_speed(true),
+        Some(SpeedWidgetAction::Off) => set_show_speed(false),
+    }
+}
+
+fn set_show_speed(enabled: bool) -> Result<()> {
+    let path = zone_hold_config_path()?;
+    goals::upsert_top_level_key(&path, "show_speed", if enabled { "true" } else { "false" })?;
+    println!("Speed widget {}.", if enabled { "enabled" } else { "disabled" });
+    Ok(())
+}
+
 /// Update a single `[zone_hold]` key in place, creating the config directory
 /// if this is the first write to it.
 fn set_zone_hold_key(key: &str, value: String) -> Result<()> {
@@ -1374,10 +1420,10 @@ fn run_status() -> Result<()> {
 /// treadmill is not on/connected (so the widget hides). Read-only, no BLE —
 /// mirrors `run_status`'s constraint. See docs/tasks/009.
 ///
-/// The line is tab-separated with 11 fields (задача 027 extension):
+/// The line is tab-separated with 12 fields (задача 029 extension):
 /// `state \t workout_count \t cur_walking_s \t cur_steps \t cur_distance_m \t
 /// day_walking_s \t day_steps \t day_distance_m \t hr_bpm \t hr_battery_pct \t
-/// hr_zone`.
+/// hr_zone \t speed_kmh`.
 /// - `state` — `walking | away | paused | unknown`.
 /// - `workout_count` — number of TODAY's *merged* workouts (reflects the
 ///   configured `workout_gap_minutes`), so the widget can pick a single- vs
@@ -1397,6 +1443,10 @@ fn run_status() -> Result<()> {
 ///   Hold is actually engaged (`zone_hold_active` + `Hold` phase) in the
 ///   current `walking` state — see docs/tasks/027 §Индикация зоны. Empty is
 ///   the signal for the consumer to colour the heart glyph neutrally.
+/// - `speed_kmh` — live belt speed (задача 029), formatted as e.g. `3.1kmh`/
+///   `3kmh`, or **empty** when the `show_speed` config toggle (`tm
+///   speed-widget on/off`) is off, the reading is stale, or the belt is
+///   stopped (`0`).
 fn run_widget() -> Result<()> {
     let store = store::Store::open()?;
 
@@ -1458,9 +1508,10 @@ fn run_widget() -> Result<()> {
         .map(|pct| pct.to_string())
         .unwrap_or_default();
     let hr_zone = widget_hr_zone_field(&status, state);
+    let speed_kmh = widget_speed_field(&status);
 
     println!(
-        "{state}\t{workout_count}\t{cur_walking_s}\t{cur_steps}\t{cur_distance_m}\t{day_walking_s}\t{day_steps}\t{day_distance_m}\t{hr_bpm}\t{hr_battery_pct}\t{hr_zone}",
+        "{state}\t{workout_count}\t{cur_walking_s}\t{cur_steps}\t{cur_distance_m}\t{day_walking_s}\t{day_steps}\t{day_distance_m}\t{hr_bpm}\t{hr_battery_pct}\t{hr_zone}\t{speed_kmh}",
     );
     Ok(())
 }
@@ -1498,6 +1549,39 @@ fn widget_hr_zone_field(status: &store::DaemonStatus, widget_state: &str) -> Str
         return String::new();
     }
     status.zone_hold_position.clone().unwrap_or_default()
+}
+
+/// The widget's 12th field: live belt speed as a formatted string (задача
+/// 029), or empty when the `show_speed` config toggle is off, the reading is
+/// stale (same freshness threshold as [`widget_hr_field`]), or the belt is
+/// stopped (`0` km/h — not worth showing, that's the common idle state).
+fn widget_speed_field(status: &store::DaemonStatus) -> String {
+    if !goals::load_show_speed() {
+        return String::new();
+    }
+    match (status.last_speed_kmh, status.last_speed_ts) {
+        (Some(kmh), Some(ts_ms)) => {
+            let age_s = (Utc::now().timestamp_millis() - ts_ms) / 1000;
+            if age_s <= WATCHDOG_STALE_THRESHOLD_S && kmh > 0.0 {
+                format_speed_kmh(kmh)
+            } else {
+                String::new()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// Format a belt speed for display (задача 029): rounded half-up to one
+/// decimal place, dropping the `.0` when the rounded value is a whole number
+/// (`3kmh`, not `3.0kmh`).
+fn format_speed_kmh(kmh: f64) -> String {
+    let rounded = (kmh * 10.0).round() / 10.0;
+    if (rounded.fract()).abs() < f64::EPSILON {
+        format!("{}kmh", rounded as i64)
+    } else {
+        format!("{rounded:.1}kmh")
+    }
 }
 
 /// Is the newest merged workout still the *current* (live) one at `now`? True
@@ -1789,6 +1873,15 @@ mod tests {
         assert_eq!(widget_state(None), "unknown");
         // An unrecognised label degrades to `unknown` rather than leaking through.
         assert_eq!(widget_state(Some("Bogus")), "unknown");
+    }
+
+    #[test]
+    fn format_speed_kmh_rounds_half_up_and_drops_trailing_zero() {
+        assert_eq!(format_speed_kmh(3.12), "3.1kmh");
+        assert_eq!(format_speed_kmh(3.16), "3.2kmh");
+        assert_eq!(format_speed_kmh(3.0), "3kmh");
+        assert_eq!(format_speed_kmh(2.96), "3kmh");
+        assert_eq!(format_speed_kmh(0.04), "0kmh");
     }
 
     fn workout_ending_at(ended_at: &str) -> store::Workout {

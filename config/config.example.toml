@@ -22,6 +22,11 @@ goals = [8000, 10000, 12000]
 # After the pause the treadmill's own built-in shutoff powers it down.
 # auto_pause_minutes = 5
 
+# Show the live belt speed (km/h) in the tmux widget, e.g. `3.1kmh`. Off by
+# default. Toggle with `tm speed-widget on`/`off` instead of hand-editing —
+# either works, this is just a plain boolean.
+# show_speed = false
+
 # Zone Hold (задача 027): closed-loop mode that auto-adjusts belt speed off a
 # worn heart-rate sensor (задача 025) to hold a target heart-rate zone during
 # desk walking. Off by default — turn it on with `tm zone on` (interactive

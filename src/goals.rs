@@ -37,6 +37,10 @@ pub const DEFAULT_WORKOUT_GAP_MINUTES: i64 = 15;
 /// `0` disables auto-pause entirely.
 pub const DEFAULT_AUTO_PAUSE_MINUTES: i64 = 5;
 
+/// Default for the `show_speed` widget toggle (задача 029): off, so the
+/// widget's live-speed field stays opt-in — `tm speed-widget on` enables it.
+pub const DEFAULT_SHOW_SPEED: bool = false;
+
 /// Hard cap on configured goals — three tiers of celebration copy exist, so a
 /// fourth goal has nowhere sensible to land. Extra thresholds are dropped
 /// (lowest kept) with a WARN.
@@ -243,6 +247,93 @@ pub fn load_auto_pause() -> Option<Duration> {
     };
     // 0 = explicitly disabled; any positive count is a real threshold.
     (minutes > 0).then(|| Duration::from_secs(minutes as u64 * 60))
+}
+
+/// Parse outcome of the optional `show_speed` key (задача 029). Kept distinct
+/// like [`GapSetting`]/[`AutoPauseSetting`] so the caller logs only the
+/// anomalous (present-but-invalid) case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShowSpeedSetting {
+    /// Key present and a boolean.
+    Configured(bool),
+    /// Key present but not a boolean, or the file is unreadable/malformed.
+    Invalid,
+    /// Key absent (normal — most configs never set this).
+    Unset,
+}
+
+/// Read `show_speed` from the per-user config. Pure and unit-tested — the
+/// logging/fallback decision lives in [`load_show_speed`].
+fn read_show_speed(path: &std::path::Path) -> ShowSpeedSetting {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return ShowSpeedSetting::Invalid;
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
+        return ShowSpeedSetting::Invalid;
+    };
+    match value.get("show_speed") {
+        None => ShowSpeedSetting::Unset,
+        Some(v) => match v.as_bool() {
+            Some(b) => ShowSpeedSetting::Configured(b),
+            None => ShowSpeedSetting::Invalid,
+        },
+    }
+}
+
+/// Load the `show_speed` widget toggle (задача 029): whether `tm widget`
+/// should populate its live belt-speed field. Falls back to
+/// [`DEFAULT_SHOW_SPEED`] (off) when unconfigured or invalid. Read-time, like
+/// `workout_gap_minutes`/`auto_pause_minutes` — loaded by `widget`, not the
+/// daemon. Logging is quiet on the common paths (absent key, missing file);
+/// only a present-but-invalid value is an anomaly worth a WARN.
+pub fn load_show_speed() -> bool {
+    match config_path() {
+        Some(path) if path.exists() => match read_show_speed(&path) {
+            ShowSpeedSetting::Configured(enabled) => enabled,
+            ShowSpeedSetting::Unset => DEFAULT_SHOW_SPEED,
+            ShowSpeedSetting::Invalid => {
+                warn!(
+                    path = %path.display(),
+                    default = DEFAULT_SHOW_SPEED,
+                    "show_speed present but not a boolean — using default",
+                );
+                DEFAULT_SHOW_SPEED
+            }
+        },
+        // No file / no resolvable path is the normal uncustomised case.
+        _ => DEFAULT_SHOW_SPEED,
+    }
+}
+
+/// Update (or insert) a single top-level `key = value` line in the per-user
+/// config, leaving every other line untouched — same line-based-upsert
+/// approach as [`crate::zone_hold::upsert_zone_hold_keys`], but for a plain
+/// top-level key rather than one scoped to a `[section]`. A top-level key must
+/// precede any `[section]` header in TOML, so a missing key is inserted right
+/// before the first such header (or appended at EOF if there is none). Used by
+/// `tm speed-widget on/off` (задача 029) so toggling it never disturbs
+/// `[zone_hold]` or any other hand-edited section.
+pub fn upsert_top_level_key(path: &std::path::Path, key: &str, value: &str) -> anyhow::Result<()> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
+
+    let section_start = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .unwrap_or(lines.len());
+
+    let prefix = format!("{key} =");
+    let existing_line = lines[..section_start]
+        .iter()
+        .position(|l| l.trim_start().starts_with(&prefix));
+    let new_line = format!("{key} = {value}");
+    match existing_line {
+        Some(offset) => lines[offset] = new_line,
+        None => lines.insert(section_start, new_line),
+    }
+
+    std::fs::write(path, lines.join("\n") + "\n")?;
+    Ok(())
 }
 
 /// Turn raw thresholds into tiered [`Goal`]s: sort ascending, dedup, cap to
@@ -534,6 +625,62 @@ mod tests {
         for f in [good, disabled, absent, neg, str_val, junk] {
             std::fs::remove_file(f).ok();
         }
+    }
+
+    #[test]
+    fn read_show_speed_distinguishes_configured_absent_and_invalid() {
+        let dir = std::env::temp_dir().join(format!("tm-showspeed-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let on = dir.join("on.toml");
+        std::fs::write(&on, "goals = [8000]\nshow_speed = true\n").unwrap();
+        assert_eq!(read_show_speed(&on), ShowSpeedSetting::Configured(true));
+
+        let off = dir.join("off.toml");
+        std::fs::write(&off, "show_speed = false\n").unwrap();
+        assert_eq!(read_show_speed(&off), ShowSpeedSetting::Configured(false));
+
+        // Key absent — normal, most configs never set this.
+        let absent = dir.join("absent.toml");
+        std::fs::write(&absent, "goals = [8000]\n").unwrap();
+        assert_eq!(read_show_speed(&absent), ShowSpeedSetting::Unset);
+
+        // Present but not a boolean → Invalid (caller WARNs + defaults).
+        let str_val = dir.join("str.toml");
+        std::fs::write(&str_val, "show_speed = \"yes\"\n").unwrap();
+        assert_eq!(read_show_speed(&str_val), ShowSpeedSetting::Invalid);
+
+        let junk = dir.join("junk.toml");
+        std::fs::write(&junk, "not valid toml").unwrap();
+        assert_eq!(read_show_speed(&junk), ShowSpeedSetting::Invalid);
+
+        for f in [on, off, absent, str_val, junk] {
+            std::fs::remove_file(f).ok();
+        }
+    }
+
+    #[test]
+    fn upsert_top_level_key_inserts_before_first_section_and_replaces_in_place() {
+        let dir = std::env::temp_dir().join(format!("tm-upsert-toplevel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Insert into a file with no existing key and a trailing section — must
+        // land before `[zone_hold]`, not after (would be invalid TOML).
+        let path = dir.join("insert.toml");
+        std::fs::write(&path, "goals = [8000]\n\n[zone_hold]\nenabled = true\n").unwrap();
+        upsert_top_level_key(&path, "show_speed", "true").unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        let key_pos = written.find("show_speed = true").unwrap();
+        let section_pos = written.find("[zone_hold]").unwrap();
+        assert!(key_pos < section_pos, "key must precede the section header");
+
+        // Replacing an existing key updates it in place rather than duplicating.
+        upsert_top_level_key(&path, "show_speed", "false").unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written.matches("show_speed").count(), 1);
+        assert!(written.contains("show_speed = false"));
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

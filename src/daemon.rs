@@ -507,6 +507,8 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                         state.zone_hold_position = None;
                         state.zone_hold_target_lo = None;
                         state.zone_hold_target_hi = None;
+                        state.last_speed_kmh = None;
+                        state.last_speed_ts = None;
                         state.zone_hold_last_speed = None;
                         state.persist(&store, &watchdog)?;
 
@@ -703,6 +705,12 @@ async fn stream_with_presence(
                 // Keep a short rolling history for the cruising estimate, plus the
                 // plain last-non-zero value as a fallback.
                 if let Some(speed) = data.speed_kmh {
+                    // Live speed snapshot for `tm widget` (задача 029) — every
+                    // sample, unconditionally (unlike `last_walking_speed`
+                    // below, which only tracks non-zero cruising speed).
+                    state.last_speed_kmh = Some(speed as f64);
+                    state.last_speed_ts = Some(Utc::now().timestamp_millis());
+
                     let now = Instant::now();
                     speed_history.push_back((now, speed));
                     while let Some(&(t, _)) = speed_history.front() {
@@ -1696,6 +1704,11 @@ struct DaemonState {
     zone_hold_last_speed: Option<f64>,
     zone_hold_phase: Option<String>,
     zone_hold_position: Option<String>,
+    /// Live belt-speed snapshot (задача 029) — updated on every telemetry
+    /// sample regardless of Zone Hold, same reasoning as `last_bpm`/
+    /// `last_bpm_ts` above. `last_speed_ts` is Unix millis.
+    last_speed_kmh: Option<f64>,
+    last_speed_ts: Option<i64>,
 }
 
 impl DaemonState {
@@ -1720,6 +1733,8 @@ impl DaemonState {
             zone_hold_last_speed: None,
             zone_hold_phase: None,
             zone_hold_position: None,
+            last_speed_kmh: None,
+            last_speed_ts: None,
         }
     }
 
@@ -1774,6 +1789,8 @@ impl DaemonState {
             zone_hold_last_speed: self.zone_hold_last_speed,
             zone_hold_phase: self.zone_hold_phase.clone(),
             zone_hold_position: self.zone_hold_position.clone(),
+            last_speed_kmh: self.last_speed_kmh,
+            last_speed_ts: self.last_speed_ts,
         })?;
         watchdog.touch();
         Ok(())

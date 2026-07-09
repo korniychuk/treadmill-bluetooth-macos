@@ -140,6 +140,13 @@ pub struct DaemonStatus {
     pub zone_hold_last_speed: Option<f64>,
     pub zone_hold_phase: Option<String>,
     pub zone_hold_position: Option<String>,
+    /// Live belt speed snapshot (задача 029), same "daemon mirrors what it
+    /// just observed" pattern as `last_bpm`/`last_bpm_ts` — updated on every
+    /// telemetry sample regardless of Zone Hold (unlike `zone_hold_last_speed`,
+    /// which is `None` whenever the controller isn't active). `last_speed_ts`
+    /// is Unix millis, matching `last_bpm_ts`.
+    pub last_speed_kmh: Option<f64>,
+    pub last_speed_ts: Option<i64>,
 }
 
 /// Per-sample deltas against the persisted device baseline. Not yet a
@@ -355,6 +362,10 @@ impl Store {
         )?;
         self.add_column_if_missing("ALTER TABLE daemon_status ADD COLUMN zone_hold_phase TEXT")?;
         self.add_column_if_missing("ALTER TABLE daemon_status ADD COLUMN zone_hold_position TEXT")?;
+
+        // Live belt-speed snapshot columns (задача 029).
+        self.add_column_if_missing("ALTER TABLE daemon_status ADD COLUMN last_speed_kmh REAL")?;
+        self.add_column_if_missing("ALTER TABLE daemon_status ADD COLUMN last_speed_ts INTEGER")?;
         Ok(())
     }
 
@@ -921,9 +932,10 @@ impl Store {
                      config_goals, config_auto_pause_secs, config_loaded_at,
                      hr_connected, last_bpm, last_bpm_ts, hr_battery_pct,
                      zone_hold_active, zone_hold_target_lo, zone_hold_target_hi,
-                     zone_hold_last_speed, zone_hold_phase, zone_hold_position)
+                     zone_hold_last_speed, zone_hold_phase, zone_hold_position,
+                     last_speed_kmh, last_speed_ts)
                  VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                         ?15, ?16, ?17, ?18, ?19, ?20)
+                         ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
                  ON CONFLICT(id) DO UPDATE SET
                     connected = excluded.connected,
                     presence_state = excluded.presence_state,
@@ -944,7 +956,9 @@ impl Store {
                     zone_hold_target_hi = excluded.zone_hold_target_hi,
                     zone_hold_last_speed = excluded.zone_hold_last_speed,
                     zone_hold_phase = excluded.zone_hold_phase,
-                    zone_hold_position = excluded.zone_hold_position",
+                    zone_hold_position = excluded.zone_hold_position,
+                    last_speed_kmh = excluded.last_speed_kmh,
+                    last_speed_ts = excluded.last_speed_ts",
                 params![
                     status.connected,
                     status.presence_state,
@@ -966,6 +980,8 @@ impl Store {
                     status.zone_hold_last_speed,
                     status.zone_hold_phase,
                     status.zone_hold_position,
+                    status.last_speed_kmh,
+                    status.last_speed_ts,
                 ],
             )
             .context("upsert daemon_status")?;
@@ -982,7 +998,8 @@ impl Store {
                         config_goals, config_auto_pause_secs, config_loaded_at,
                         hr_connected, last_bpm, last_bpm_ts, hr_battery_pct,
                         zone_hold_active, zone_hold_target_lo, zone_hold_target_hi,
-                        zone_hold_last_speed, zone_hold_phase, zone_hold_position
+                        zone_hold_last_speed, zone_hold_phase, zone_hold_position,
+                        last_speed_kmh, last_speed_ts
                  FROM daemon_status WHERE id = 0",
                 [],
                 |row| {
@@ -1007,6 +1024,8 @@ impl Store {
                         zone_hold_last_speed: row.get(17)?,
                         zone_hold_phase: row.get(18)?,
                         zone_hold_position: row.get(19)?,
+                        last_speed_kmh: row.get(20)?,
+                        last_speed_ts: row.get(21)?,
                     })
                 },
             )
@@ -1586,6 +1605,8 @@ mod tests {
             zone_hold_last_speed: Some(3.2),
             zone_hold_phase: Some("hold".to_string()),
             zone_hold_position: Some("in".to_string()),
+            last_speed_kmh: Some(3.1),
+            last_speed_ts: Some(1_720_000_000_500),
         };
         store.upsert_daemon_status(&status).unwrap();
 
@@ -1609,6 +1630,8 @@ mod tests {
         assert_eq!(read_back.zone_hold_last_speed, Some(3.2));
         assert_eq!(read_back.zone_hold_phase.as_deref(), Some("hold"));
         assert_eq!(read_back.zone_hold_position.as_deref(), Some("in"));
+        assert_eq!(read_back.last_speed_kmh, Some(3.1));
+        assert_eq!(read_back.last_speed_ts, Some(1_720_000_000_500));
 
         // Second upsert overwrites in place — still exactly one row (id=0).
         let status2 = DaemonStatus {

@@ -31,11 +31,11 @@ from one CLI command:
 tm widget
 ```
 
-- Prints **one TSV line, 11 tab-separated fields**, while the treadmill is
+- Prints **one TSV line, 12 tab-separated fields**, while the treadmill is
   connected and the daemon's heartbeat is fresh:
 
   ```
-  STATE  WORKOUT_COUNT  CUR_WALKING_S  CUR_STEPS  CUR_DISTANCE_M  DAY_WALKING_S  DAY_STEPS  DAY_DISTANCE_M  HR_BPM  HR_BATTERY_PCT  HR_ZONE
+  STATE  WORKOUT_COUNT  CUR_WALKING_S  CUR_STEPS  CUR_DISTANCE_M  DAY_WALKING_S  DAY_STEPS  DAY_DISTANCE_M  HR_BPM  HR_BATTERY_PCT  HR_ZONE  SPEED_KMH
   ```
 
   - `STATE` ∈ `walking | paused | away | unknown`.
@@ -59,14 +59,22 @@ tm widget
     reference script weights the whole `♥ NNN` token by this value — bold in
     `in`, bold+italic in `above`, plain in `below`/empty; colour is never
     touched (stays the plain per-state colour, unchanged from задачи 025/026).
+  - `SPEED_KMH` — live belt speed, pre-formatted (e.g. `3.1kmh`/`3kmh`, .1
+    precision rounded half-up, `.0` dropped), or **empty** unless the
+    `show_speed` config toggle (`tm speed-widget on`/`off`, задача 029) is on,
+    the reading is fresh, and the belt isn't stopped (`0`). No icon by design
+    (no Nerd Font speed glyph read as unambiguous) — the reference script
+    renders it as plain `N.Nkmh` text, number in the state's foreground
+    colour, `kmh` dimmed.
 
 - Prints **nothing** (exit 0) whenever the treadmill is off, the daemon is
   dead, or its heartbeat is stale — the unambiguous signal to hide the
   segment.
 
 See `docs/tasks/009-tmux-workout-widget.md`, `docs/tasks/025-heart-rate-polar-h10.md`,
-`docs/tasks/026-hr-battery-level.md` and `docs/tasks/027-zone-hold-hr-adaptive-speed.md`
-in this repo for the full contract history and design rationale. If you change
+`docs/tasks/026-hr-battery-level.md`, `docs/tasks/027-zone-hold-hr-adaptive-speed.md`
+and `docs/tasks/029-speed-widget-display.md` in this repo for the full contract
+history and design rationale. If you change
 the field count/order in `tm widget`, update this script's
 `IFS=$'\t' read -r ...` line to match.
 

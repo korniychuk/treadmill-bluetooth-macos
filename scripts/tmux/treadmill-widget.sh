@@ -3,12 +3,14 @@
 # Treadmill workout widget for a tmux status bar.
 #
 # Reference implementation: renders the state/metrics of `tm widget` (see
-# treadmill-bluetooth-macos docs/tasks/009, 025, 026 and 027) as a colour-coded
-# powerline pill. Presentation only — the data + visibility contract lives in
-# the treadmill CLI, which prints one 11-field TSV line while the treadmill is
-# connected and the daemon heartbeat is fresh, or nothing otherwise:
+# treadmill-bluetooth-macos docs/tasks/009, 025, 026, 027 and 029) as a
+# colour-coded powerline pill. Presentation only — the data + visibility
+# contract lives in the treadmill CLI, which prints one 12-field TSV line
+# while the treadmill is connected and the daemon heartbeat is fresh, or
+# nothing otherwise:
 #   state, workout_count, cur_walking_s, cur_steps, cur_distance_m,
-#   day_walking_s, day_steps, day_distance_m, hr_bpm, hr_battery_pct, hr_zone
+#   day_walking_s, day_steps, day_distance_m, hr_bpm, hr_battery_pct, hr_zone,
+#   speed_kmh
 # (cur_* = current/latest workout today, day_* = today's totals across all
 # workouts). cur_* are all zero when there is no LIVE workout (connected but
 # idle — the last workout ended longer ago than the merge gap); the body
@@ -22,7 +24,9 @@
 # the current bpm against the target zone, populated only while Zone Hold is
 # actually driving corrections in the `walking` state; this script weights
 # the whole `♥ NNN` token by it — bold/italic, not colour (see §Zone Hold
-# weight below).
+# weight below). `speed_kmh` (задача 029) is the live belt speed, pre-
+# formatted (e.g. `3.1kmh`/`3kmh`) or empty — empty unless `tm speed-widget
+# on` is set and the belt is moving; see §Speed below.
 #
 # HIDE-WHEN-OFF: when `tm widget` prints nothing (or fails), this script
 # exits 0 with no output. Whether that actually hides the segment in your
@@ -153,13 +157,14 @@ fmt_dist() {
 line="$("$TM" widget 2>/dev/null || true)"
 [[ -n "$line" ]] || exit 0
 
-# `tm widget` emits 11 tab-separated fields (see treadmill repo docs/tasks/009,
-# 025, 026, 027): state, workout_count today, then the CURRENT workout's
+# `tm widget` emits 12 tab-separated fields (see treadmill repo docs/tasks/009,
+# 025, 026, 027, 029): state, workout_count today, then the CURRENT workout's
 # (walking_s, steps, distance_m), then TODAY's totals (walking_s, steps,
 # distance_m), then hr_bpm (empty unless a sensor is worn and fresh), then
 # hr_battery_pct (empty unless read at least once), then hr_zone (empty unless
-# Zone Hold is actively correcting).
-IFS=$'\t' read -r state wcount cur_s cur_steps cur_dist day_s day_steps day_dist hr_bpm hr_batt hr_zone <<<"$line"
+# Zone Hold is actively correcting), then speed_kmh (empty unless `tm
+# speed-widget on` and the belt is moving — see §Speed below).
+IFS=$'\t' read -r state wcount cur_s cur_steps cur_dist day_s day_steps day_dist hr_bpm hr_batt hr_zone speed_kmh <<<"$line"
 
 # Defend against a malformed line: any missing/non-numeric numeric field -> hide.
 for n in "$wcount" "$cur_s" "$cur_steps" "$cur_dist" "$day_s" "$day_steps" "$day_dist"; do
@@ -173,6 +178,9 @@ done
 # hr_zone is a closed set (задача 027); any other value degrades to "neutral"
 # rather than trusting an unrecognised token from a future/older daemon build.
 case "$hr_zone" in below|in|above) ;; *) hr_zone='' ;; esac
+# speed_kmh is pre-formatted by `tm widget` itself (e.g. `3.1kmh`/`3kmh`,
+# задача 029); a malformed value just hides that one detail.
+[[ -z "$speed_kmh" || "$speed_kmh" =~ ^[0-9]+(\.[0-9])?kmh$ ]] || speed_kmh=''
 
 case "$state" in
   walking) icon=$ICON_WALKING; bg=$BG_WALKING; fg=$FG_WALKING; dim=$DIM_DARK ;;
@@ -211,8 +219,12 @@ fi
 
 # Heart-rate suffix (задача 025): drawn only when the sensor is worn/fresh
 # (`hr_bpm` non-empty), so it silently disappears the moment the strap comes
-# off — no separate visibility toggle needed. The whole `♥ NNN` token is
-# weighted (bold/italic, never colour — see the tunables above) by `hr_zone`
+# off — no separate visibility toggle needed. Explicitly tagged `fg=$fg`
+# (the current-workout/state colour) rather than left to inherit whatever
+# the distance segment left active — the multi-workout body's last-printed
+# piece is the dimmed day-total, so relying on inheritance made the heart
+# match the "day total" colour instead of "today's workout" by accident. The
+# whole `♥ NNN` token is additionally weighted (bold/italic) by `hr_zone`
 # (задача 027) when Zone Hold is actively correcting; empty `hr_zone` leaves
 # it plain, unchanged from задачи 025/026. A low-battery glyph (задача 026)
 # rides right after it, only once the level drops to/below $LOW_BATTERY_PCT —
@@ -224,13 +236,25 @@ if [[ -n "$hr_bpm" ]]; then
     *)     heart_style='' ;;
   esac
   if [[ -n "$heart_style" ]]; then
-    body+=$(printf '  #[%s]%s %s#[nobold,noitalics]' "$heart_style" "$ICON_HEART" "$hr_bpm")
+    body+=$(printf '  #[fg=%s,%s]%s %s#[nobold,noitalics,fg=%s]' "$fg" "$heart_style" "$ICON_HEART" "$hr_bpm" "$fg")
   else
-    body+=$(printf '  %s %s' "$ICON_HEART" "$hr_bpm")
+    body+=$(printf '  #[fg=%s]%s %s' "$fg" "$ICON_HEART" "$hr_bpm")
   fi
   if [[ -n "$hr_batt" ]] && (( hr_batt <= LOW_BATTERY_PCT )); then
     body+=$(printf ' #[fg=%s]%s#[fg=%s]' "$BATTERY_LOW_FG" "$ICON_BATTERY_LOW" "$fg")
   fi
+fi
+
+# Speed suffix (задача 029): `tm widget` already pre-formats the number
+# (rounded, trailing `.0` dropped) and appends the `kmh` unit — this script
+# only splits it back into number/unit to colour them differently. No icon
+# (operator veto — no Nerd Font speed glyph read as unambiguous); the number
+# uses the same near-black as day-steps ($STEPS_FG), `kmh` is dimmed like the
+# day-total half of the other metrics ($dim). Empty unless the `show_speed`
+# config toggle is on and the belt is actually moving.
+if [[ -n "$speed_kmh" ]]; then
+  speed_num=${speed_kmh%kmh}
+  body+=$(printf '  #[fg=%s]%s#[fg=%s]kmh#[fg=%s]' "$STEPS_FG" "$speed_num" "$dim" "$fg")
 fi
 
 # Paint the pill: leading powerline arrow (pill colour on $BAR_BG, skipped if
