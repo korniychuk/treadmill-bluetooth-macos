@@ -1,6 +1,6 @@
 # 046 — `raw_samples`: индекс по `ts_ms` + решение по retention
 
-> **Статус: open**
+> **Статус: done**
 > **Источник:** [research/004](../research/004-independent-reliability-review.md) §3 N6
 > **Класс:** storage growth / query performance
 > **Приоритет:** medium-low (деградация линейная, не обрыв)
@@ -29,10 +29,18 @@
 
 ## Acceptance
 
-- [ ] Индекс `raw_samples(ts_ms)` создаётся миграцией
-- [ ] `status_events` ограничен retention'ом
-- [ ] Политика по `raw_samples` выбрана, обоснована измерением и записана здесь
-- [ ] `tm stats --all` / `recompute-segments` не полносканят по `ts_ms`
+- [x] Индекс `raw_samples(ts_ms)` создаётся миграцией
+- [x] `status_events` ограничен retention'ом (90 days)
+- [x] Политика по `raw_samples` выбрана, обоснована измерением и записана здесь
+- [x] `tm stats --all` / `recompute-segments` не полносканят по `ts_ms`
+
+## Retention decision (implementation)
+
+- **Measured (2026-07-10):** live `treadmill.db` ≈ **8 MB** after months of use —
+  cheap; recompute/default-speed still need long history.
+- **`raw_samples`:** **no prune** in v1. Ground truth for `recompute-segments` and
+  `default-speed`; growth is linear and currently small.
+- **`status_events`:** prune rows older than **90 days** on migrate/open.
 
 ## Затронутые файлы
 

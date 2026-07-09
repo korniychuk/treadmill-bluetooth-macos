@@ -35,6 +35,11 @@ use crate::hr::HrMeasurement;
 /// the daemon's 30s staleness guard, so a still-relevant row is never dropped.
 const CONTROL_COMMAND_RETENTION: Duration = Duration::minutes(5);
 
+/// Age after which `status_events` rows are pruned (задача 046). Diagnostic
+/// FTMS status frames are not ground truth for recompute; 90 days is enough
+/// for incident archaeology without unbounded growth.
+const STATUS_EVENTS_RETENTION: Duration = Duration::days(90);
+
 /// Aggregated totals for a single calendar day (local time).
 #[derive(Debug, Clone, Default)]
 pub struct DailyStats {
@@ -280,6 +285,7 @@ impl Store {
                     raw_frame BLOB NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_raw_samples_session ON raw_samples(session_id);
+                CREATE INDEX IF NOT EXISTS idx_raw_samples_ts ON raw_samples(ts_ms);
                 CREATE TABLE IF NOT EXISTS hr_samples (
                     id         INTEGER PRIMARY KEY,
                     session_id INTEGER REFERENCES sessions(id),
@@ -375,6 +381,17 @@ impl Store {
         // Live belt-speed snapshot columns (задача 029).
         self.add_column_if_missing("ALTER TABLE daemon_status ADD COLUMN last_speed_kmh REAL")?;
         self.add_column_if_missing("ALTER TABLE daemon_status ADD COLUMN last_speed_ts INTEGER")?;
+
+        // Hot readers filter/order by ts_ms (stats, default-speed, recompute);
+        // only session_id was indexed historically (задача 046).
+        self.conn
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_raw_samples_ts ON raw_samples(ts_ms);
+                 CREATE INDEX IF NOT EXISTS idx_status_events_ts ON status_events(ts_ms);",
+            )
+            .context("create raw_samples/status_events ts indexes")?;
+
+        self.prune_status_events()?;
         Ok(())
     }
 
@@ -1152,6 +1169,21 @@ impl Store {
         Ok(())
     }
 
+    /// Drop `status_events` older than [`STATUS_EVENTS_RETENTION`] (задача 046).
+    /// Runs on open/migrate so growth is bounded without a separate job.
+    /// `raw_samples` is intentionally **not** pruned: it is ground truth for
+    /// recompute-segments and default-speed (measured ~8MB after months of use).
+    fn prune_status_events(&self) -> Result<()> {
+        let cutoff_ms = (Utc::now() - STATUS_EVENTS_RETENTION).timestamp_millis();
+        self.conn
+            .execute(
+                "DELETE FROM status_events WHERE ts_ms < ?1",
+                params![cutoff_ms],
+            )
+            .context("prune old status_events")?;
+        Ok(())
+    }
+
     /// The oldest still-pending control command, parsed. An unparseable row
     /// (corrupt `created_at` or `command`) is a poison pill — it would fail
     /// forever on every poll — so it is marked `failed` and skipped here
@@ -1865,6 +1897,39 @@ mod tests {
             .unwrap()
             .expect("good command surfaces");
         assert_eq!(pending.id, good);
+    }
+
+    #[test]
+    fn prune_status_events_drops_rows_older_than_retention() {
+        let store = memory_store();
+        let session = store.start_session().unwrap();
+        let old_ms = (Utc::now() - Duration::days(120)).timestamp_millis();
+        let fresh_ms = Utc::now().timestamp_millis();
+        store
+            .conn
+            .execute(
+                "INSERT INTO status_events (session_id, ts_ms, event_code, raw_frame) VALUES (?1, ?2, 1, x'00')",
+                params![session, old_ms],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO status_events (session_id, ts_ms, event_code, raw_frame) VALUES (?1, ?2, 2, x'00')",
+                params![session, fresh_ms],
+            )
+            .unwrap();
+        store.prune_status_events().unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM status_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let remaining: i64 = store
+            .conn
+            .query_row("SELECT ts_ms FROM status_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, fresh_ms);
     }
 
     fn insert_hr(store: &Store, session_id: i64, ts_ms: i64, bpm: u16) {
