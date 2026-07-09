@@ -131,6 +131,14 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
   последнюю зону.
   `tm widget` — поле `HR_ZONE` (below/in/above/пусто, красится только в
   `walking` при активном контроллере); `tm status` — строка Zone Hold.
+  `next_speed` сравнивает target с измеренной скоростью через
+  `MIN_SPEED_CHANGE_KMH` (0.05 км/ч), не на точное равенство (задача
+  030) — на клампе (min/max) живая FTMS-телеметрия никогда не репортит
+  ровно клампованное значение (шум в сотых км/ч), точное сравнение
+  давало холостые Control Point записи (RequestControl+SetSpeed, двойной
+  бип ленты) каждые ~20с без реального изменения скорости, пока ЧСС вне
+  зоны. Порог выше wire-точности FTMS (0.01 км/ч), ниже `max_step_kmh` —
+  настоящие коррекции не глушатся.
 - `src/goals.rs` (доп., задача 029) — `load_show_speed()` (top-level
   `show_speed`, тот же absent-тихо/invalid-WARN стиль, дефолт `false`) +
   `upsert_top_level_key(path, key, value)` — line-based апдейт **top-level**

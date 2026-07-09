@@ -35,6 +35,15 @@ pub const DEFAULT_CORRECTION_INTERVAL_SECONDS: i64 = 20;
 pub const DEFAULT_DEADBAND_BPM: i64 = 3;
 /// Max speed change applied per correction, km/h.
 pub const DEFAULT_MAX_STEP_KMH: f32 = 0.3;
+/// Minimum speed delta worth a Control Point write. Live telemetry
+/// (`data.speed_kmh`) jitters by a few hundredths of a km/h around a pinned
+/// clamp (min or max) — without this floor, `next_speed` would re-issue the
+/// *same* target every correction interval forever once the belt is stuck at
+/// its ceiling/floor, each write costing a RequestControl+SetSpeed round-trip
+/// (and an audible beep) for zero actual change. Well above FTMS's 0.01 km/h
+/// wire resolution (`control.rs::set_speed`) and well below `max_step_kmh`,
+/// so genuine corrections are unaffected.
+pub const MIN_SPEED_CHANGE_KMH: f32 = 0.05;
 /// Grace window after returning to `Walking` during which no correction runs.
 pub const DEFAULT_REENTRY_GRACE_SECONDS: i64 = 45;
 /// HR percent-of-HRmax above which the controller force-reduces regardless of
@@ -399,7 +408,7 @@ pub fn next_speed(params: &ControllerParams, current_speed_kmh: f32, bpm: u16) -
     };
 
     let target = (current_speed_kmh + step).clamp(params.min_speed_kmh, params.max_speed_kmh);
-    (target != current_speed_kmh).then_some(target)
+    ((target - current_speed_kmh).abs() > MIN_SPEED_CHANGE_KMH).then_some(target)
 }
 
 /// Per-user config path shared with `goals`/`auto_pause` (`~/.config/treadmill-
@@ -962,6 +971,26 @@ mod tests {
         assert_eq!(next_speed(&params, DEFAULT_MAX_SPEED_KMH, 100), None);
         // Already at min, HR still high → stays pinned.
         assert_eq!(next_speed(&params, DEFAULT_MIN_SPEED_KMH, 140), None);
+    }
+
+    #[test]
+    fn band_mode_ignores_telemetry_jitter_at_the_pin() {
+        let params = band_params();
+        // Live speed telemetry never lands on the clamp exactly — it jitters
+        // by a few hundredths of a km/h. Pinned at max, still below the
+        // zone: must not re-fire a same-value write every tick (the bug that
+        // caused a Control Point round-trip, and an audible beep, on a
+        // no-op speed every ~20s).
+        assert_eq!(next_speed(&params, DEFAULT_MAX_SPEED_KMH - 0.02, 100), None);
+        assert_eq!(next_speed(&params, DEFAULT_MAX_SPEED_KMH + 0.03, 100), None);
+        // Pinned at min, HR still high → same for the floor.
+        assert_eq!(next_speed(&params, DEFAULT_MIN_SPEED_KMH + 0.02, 140), None);
+        assert_eq!(next_speed(&params, DEFAULT_MIN_SPEED_KMH - 0.03, 140), None);
+        // But a genuine gap beyond the noise floor still corrects.
+        assert_eq!(
+            next_speed(&params, DEFAULT_MAX_SPEED_KMH - 0.2, 100),
+            Some(DEFAULT_MAX_SPEED_KMH)
+        );
     }
 
     fn center_params() -> ControllerParams {
