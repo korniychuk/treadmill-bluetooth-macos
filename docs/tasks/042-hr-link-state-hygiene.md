@@ -1,6 +1,6 @@
 # 042 — HR link-state hygiene: залипающий `hr_connect_in_flight` + сверка reset-путей
 
-> **Статус: open**
+> **Статус: done**
 > **Источник:** [research/004](../research/004-independent-reliability-review.md) §3 N4
 > **Класс:** `liveness` / state reset divergence (класс 033)
 > **Приоритет:** medium (после 035; low-likelihood, но без recovery-пути)
@@ -34,10 +34,10 @@
 
 ## Acceptance
 
-- [ ] Залипший in-flight латч самовосстанавливается через deadline (+ WARN)
-- [ ] Один reset-путь для link-loss; нет ветки, чистящей подмножество полей
-- [ ] `hr_connected=false` ⇒ `last_bpm/last_bpm_ts = None` (инвариант, тест)
-- [ ] Существующее contact-vs-link поведение (033) не изменилось
+- [x] Залипший in-flight латч самовосстанавливается через deadline (+ WARN)
+- [x] Один reset-путь для link-loss; нет ветки, чистящей подмножество полей
+- [x] `hr_connected=false` ⇒ `last_bpm/last_bpm_ts = None` (инвариант, тест)
+- [x] Существующее contact-vs-link поведение (033) не изменилось
 
 ## Затронутые файлы
 

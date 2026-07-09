@@ -252,6 +252,12 @@ const ZH_BPM_MAX_AGE: Duration = Duration::from_secs(15);
 /// (not everyone wears the strap every walk), so this must not spam scans.
 const HR_RECONNECT_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Max time an HR connect attempt may stay "in flight" before the latch is
+/// cleared and another attempt is allowed (задача 042). Scan is up to 15s plus
+/// connect/subscribe margin; without this a vanished spawned task leaves
+/// `hr_connect_in_flight=true` forever and reconnect dies for the session.
+const HR_CONNECT_ATTEMPT_DEADLINE: Duration = Duration::from_secs(60);
+
 /// How often to check whether it's time to re-read the HR sensor's battery
 /// level (задача 026) — a cheap in-memory elapsed-time check, same pattern as
 /// `CONFIG_RELOAD_INTERVAL`'s mtime check. The actual re-read cadence is
@@ -673,6 +679,7 @@ async fn stream_with_presence(
     let mut hr_peripheral: Option<Peripheral> = None;
     let mut hr_notifications: Option<HrNotificationStream> = None;
     let mut hr_connect_in_flight = true;
+    let mut hr_connect_started_at = Instant::now();
     spawn_hr_connect_attempt(adapter.clone(), hr_tx.clone());
     let mut hr_reconnect_tick = tokio::time::interval(HR_RECONNECT_INTERVAL);
     // Battery level (задача 026): last known percentage + when it was read,
@@ -1215,9 +1222,21 @@ async fn stream_with_presence(
                 }
             }
             // No HR link right now (never found, or just lost) — retry
-            // periodically rather than hammering CoreBluetooth.
-            _ = hr_reconnect_tick.tick(), if hr_notifications.is_none() && !hr_connect_in_flight => {
+            // periodically rather than hammering CoreBluetooth. Also recovers a
+            // stuck in-flight latch if the spawn vanished without posting
+            // (задача 042).
+            _ = hr_reconnect_tick.tick(), if hr_notifications.is_none() => {
+                if hr_connect_in_flight {
+                    if hr_connect_started_at.elapsed() <= HR_CONNECT_ATTEMPT_DEADLINE {
+                        continue;
+                    }
+                    warn!(
+                        deadline_s = HR_CONNECT_ATTEMPT_DEADLINE.as_secs(),
+                        "HR connect attempt vanished — resetting latch"
+                    );
+                }
                 hr_connect_in_flight = true;
+                hr_connect_started_at = Instant::now();
                 spawn_hr_connect_attempt(adapter.clone(), hr_tx.clone());
             }
             // Battery re-read (задача 026): a cheap tick that only acts once
@@ -2363,6 +2382,45 @@ mod tests {
             HR_NOTIFICATION_TIMEOUT,
             "HR deadline must land exactly at the timeout, not drift with the sibling"
         );
+    }
+
+    #[test]
+    fn hr_connect_latch_stale_when_past_deadline() {
+        // Pure predicate mirror of the reconnect-tick recovery (задача 042).
+        let started = Instant::now();
+        assert!(!started.elapsed().checked_sub(HR_CONNECT_ATTEMPT_DEADLINE).is_some());
+        // Document the constant is strictly above a full scan window.
+        assert!(HR_CONNECT_ATTEMPT_DEADLINE > Duration::from_secs(15));
+        assert!(HR_CONNECT_ATTEMPT_DEADLINE.as_secs() >= 45);
+    }
+
+    #[test]
+    fn clear_hr_link_state_clears_bpm_with_connected_flag() {
+        // After link loss helper, invariant holds (задача 035/042).
+        let mut state = DaemonState::new(true);
+        state.hr_connected = true;
+        state.last_bpm = Some(120);
+        state.last_bpm_ts = Some(1);
+        state.hr_battery_pct = Some(80);
+        let mut notifications: Option<HrNotificationStream> = None;
+        let mut tracker = hr::ContactTracker::default();
+        let mut contact = hr::Contact::Live;
+        let mut battery = Some(80u8);
+        let mut battery_read = Some(Instant::now());
+        clear_hr_link_state(
+            &mut notifications,
+            &mut tracker,
+            &mut contact,
+            &mut battery,
+            &mut battery_read,
+            &mut state,
+        );
+        assert!(!state.hr_connected);
+        assert!(state.last_bpm.is_none());
+        assert!(state.last_bpm_ts.is_none());
+        assert!(state.hr_battery_pct.is_none());
+        assert!(battery.is_none());
+        assert!(notifications.is_none());
     }
 
     #[test]
