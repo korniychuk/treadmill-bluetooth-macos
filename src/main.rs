@@ -1022,10 +1022,7 @@ fn run_speed_widget(action: Option<SpeedWidgetAction>) -> Result<()> {
     match action {
         None => {
             let enabled = goals::load_show_speed();
-            println!(
-                "Speed widget: {}",
-                if enabled { "on" } else { "off" }
-            );
+            println!("Speed widget: {}", if enabled { "on" } else { "off" });
             Ok(())
         }
         Some(SpeedWidgetAction::On) => set_show_speed(true),
@@ -1036,7 +1033,10 @@ fn run_speed_widget(action: Option<SpeedWidgetAction>) -> Result<()> {
 fn set_show_speed(enabled: bool) -> Result<()> {
     let path = zone_hold_config_path()?;
     goals::upsert_top_level_key(&path, "show_speed", if enabled { "true" } else { "false" })?;
-    println!("Speed widget {}.", if enabled { "enabled" } else { "disabled" });
+    println!(
+        "Speed widget {}.",
+        if enabled { "enabled" } else { "disabled" }
+    );
     Ok(())
 }
 
@@ -1365,10 +1365,7 @@ fn format_doctor_report(
             out.push_str("  battery:          n/a\n");
             out.push_str("  contact (inferred): n/a\n");
             out.push_str("\nzone hold\n");
-            out.push_str(&format!(
-                "  config enabled:   {}\n",
-                zone_config_enabled
-            ));
+            out.push_str(&format!("  config enabled:   {}\n", zone_config_enabled));
             out.push_str("  phase snapshot:   n/a\n");
             out.push_str("  active flag:      n/a\n");
             out.push_str("\nlegend: loop=process+heartbeat · treadmill=connected+last_speed_ts · hr=hr_connected+last_bpm_ts · config=enabled vs phase\n");
@@ -1394,7 +1391,9 @@ fn format_doctor_report(
             match (s.last_speed_ts, s.last_speed_kmh) {
                 (Some(ts), _) => {
                     let age = (now_ms - ts) / 1000;
-                    out.push_str(&format!("  last 0x2ACD age:  {age}s (from last_speed_ts)\n"));
+                    out.push_str(&format!(
+                        "  last 0x2ACD age:  {age}s (from last_speed_ts)\n"
+                    ));
                     if s.connected && age > hr_stale_s * 2 {
                         // 2× sample freshness: belt telem ~1/s; long silence while
                         // `connected` is the 031-class symptom.
@@ -1853,7 +1852,10 @@ fn widget_state(presence_state: Option<&str>) -> &'static str {
         Some(other) => {
             // Edge case: schema drift or a writer that skipped `PresenceState::wire`
             // (задача 047). Log once per call path is fine — widget polls every 2s.
-            tracing::warn!(value = other, "widget: unrecognised presence_state — treating as unknown");
+            tracing::warn!(
+                value = other,
+                "widget: unrecognised presence_state — treating as unknown"
+            );
             "unknown"
         }
     }

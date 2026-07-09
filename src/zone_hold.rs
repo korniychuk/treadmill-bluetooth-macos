@@ -617,9 +617,7 @@ fn parse_zone_hold_config(raw: &str) -> ZoneHoldConfig {
         })
         .filter(|zones| !zones.is_empty())
         .unwrap_or_else(default_zones);
-    if raw_zone_count > zones.len()
-        && matches!(target_zone, ZoneSelector::Number(_))
-    {
+    if raw_zone_count > zones.len() && matches!(target_zone, ZoneSelector::Number(_)) {
         warn!(
             raw = raw_zone_count,
             kept = zones.len(),
@@ -750,7 +748,10 @@ fn non_negative_int_or(table: &toml::Value, key: &str, default: i64) -> i64 {
     match table.get(key).and_then(|v| v.as_integer()) {
         Some(n) if n >= 0 => n,
         Some(_) => {
-            warn!(key, "zone_hold config value not non-negative — using default");
+            warn!(
+                key,
+                "zone_hold config value not non-negative — using default"
+            );
             default
         }
         None => {

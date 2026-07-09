@@ -405,6 +405,9 @@ mod tests {
         observe_at(&mut tracker, &WORN, 0);
         assert_eq!(observe_at(&mut tracker, &WORN, frozen_s), Contact::Lost);
         // Strap back on: a different bpm proves a live pulse again.
-        assert_eq!(observe_at(&mut tracker, &WORN2, frozen_s + 1), Contact::Live);
+        assert_eq!(
+            observe_at(&mut tracker, &WORN2, frozen_s + 1),
+            Contact::Live
+        );
     }
 }

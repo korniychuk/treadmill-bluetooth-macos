@@ -71,7 +71,10 @@ pub fn plan_contact_loss(rows: &[HrRow]) -> Vec<i64> {
         // undecodable row means the stored bytes are corrupt. Skip it without
         // feeding the tracker rather than guess at its contact state.
         let Some(measurement) = hr::parse_hr_measurement(&row.raw_frame) else {
-            warn!(id = row.id, "hr sample has an undecodable raw frame — skipping");
+            warn!(
+                id = row.id,
+                "hr sample has an undecodable raw frame — skipping"
+            );
             continue;
         };
 
@@ -208,7 +211,9 @@ mod tests {
     fn only_the_frames_past_the_tolerance_are_doomed() {
         // Two RR-less frames are tolerated; the run only counts as contact loss
         // from the third onwards.
-        let rows = rows(&[&WORN, &WORN, &REMOVED, &REMOVED, &REMOVED, &REMOVED, &REMOVED]);
+        let rows = rows(&[
+            &WORN, &WORN, &REMOVED, &REMOVED, &REMOVED, &REMOVED, &REMOVED,
+        ]);
         assert_eq!(plan_contact_loss(&rows), vec![5, 6, 7]);
     }
 
@@ -261,7 +266,13 @@ mod tests {
         // `WORN` and `REMOVED` share bpm 0x6f here, mimicking the live capture.
         let worn_111: [u8; 4] = [0x10, 0x6f, 0xfb, 0x17];
         let frames: Vec<&[u8]> = (0..120)
-            .map(|i| if i % 3 == 0 { &worn_111[..] } else { &REMOVED[..] })
+            .map(|i| {
+                if i % 3 == 0 {
+                    &worn_111[..]
+                } else {
+                    &REMOVED[..]
+                }
+            })
             .collect();
         let rows = rows(&frames);
         let mut doomed = plan_contact_loss(&rows);
@@ -326,10 +337,7 @@ mod tests {
         assert_eq!(full.len(), rows.len());
 
         // And it really is a fixpoint.
-        let survivors: Vec<HrRow> = rows
-            .into_iter()
-            .filter(|r| !full.contains(&r.id))
-            .collect();
+        let survivors: Vec<HrRow> = rows.into_iter().filter(|r| !full.contains(&r.id)).collect();
         assert!(plan_to_fixpoint(&survivors).is_empty());
     }
 

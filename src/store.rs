@@ -1497,14 +1497,7 @@ mod tests {
 
         // A bogus open id (e.g. DB wiped under a long-lived daemon) must open a
         // new segment rather than silently no-op the UPDATE and drop the credit.
-        let handle2 = credit(
-            &mut store,
-            7,
-            14,
-            42,
-            t1,
-            Some((999_999, t0.to_rfc3339())),
-        );
+        let handle2 = credit(&mut store, 7, 14, 42, t1, Some((999_999, t0.to_rfc3339())));
         assert_ne!(handle2.0, 999_999);
         let segs = store.all_segments_asc().unwrap();
         assert_eq!(segs.len(), 2);

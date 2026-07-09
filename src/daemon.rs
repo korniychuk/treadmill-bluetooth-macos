@@ -2415,7 +2415,12 @@ mod tests {
     fn hr_connect_latch_stale_when_past_deadline() {
         // Pure predicate mirror of the reconnect-tick recovery (задача 042).
         let started = Instant::now();
-        assert!(!started.elapsed().checked_sub(HR_CONNECT_ATTEMPT_DEADLINE).is_some());
+        assert!(
+            !started
+                .elapsed()
+                .checked_sub(HR_CONNECT_ATTEMPT_DEADLINE)
+                .is_some()
+        );
         // Document the constant is strictly above a full scan window.
         assert!(HR_CONNECT_ATTEMPT_DEADLINE > Duration::from_secs(15));
         assert!(HR_CONNECT_ATTEMPT_DEADLINE.as_secs() >= 45);
@@ -2454,7 +2459,10 @@ mod tests {
     fn operator_override_active_within_window() {
         let now = Instant::now();
         assert!(!operator_override_active(now, None));
-        assert!(operator_override_active(now, Some(now + Duration::from_secs(30))));
+        assert!(operator_override_active(
+            now,
+            Some(now + Duration::from_secs(30))
+        ));
         assert!(!operator_override_active(
             now + Duration::from_secs(61),
             Some(now + Duration::from_secs(60))
@@ -2724,7 +2732,11 @@ mod tests {
             3.0,
             Instant::now(),
         );
-        assert_eq!(phase, ZoneHoldPhase::Off, "no engage without measured speed");
+        assert_eq!(
+            phase,
+            ZoneHoldPhase::Off,
+            "no engage without measured speed"
+        );
     }
 
     /// Pure mirror of zone_hold_tick's early return when speed is None
