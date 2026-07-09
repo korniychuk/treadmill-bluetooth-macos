@@ -34,6 +34,16 @@
 # directory for the Dracula recipe (frame-colour trick) and the generic
 # tmux recipe (`#()` naturally renders empty output as nothing).
 #
+# NO PER-SESSION LOGIC HERE. tmux caches `#()` output per COMMAND STRING and
+# reuses that one result for every attached client ("the previous result from
+# running the same command is used", man tmux). So this script runs once for
+# the whole server, cannot know which session is being drawn, and anything it
+# asks tmux (`display-message -p '#S'` answers for the *current* client, which
+# flips between attached clients) makes the pill flicker in ALL sessions at
+# once. Restricting the widget to certain sessions belongs in the status-line
+# FORMAT, which tmux expands per-client — see README.md §Showing it only in
+# some sessions.
+#
 # All glyphs/colours below are tunables, not requirements — edit freely to
 # match your theme. Defaults are tuned for the Dracula tmux theme (hex
 # colours, a leading powerline arrow byte-matched to Dracula's own
@@ -128,14 +138,6 @@ BATTERY_LOW_FG='#ff5555'  # Dracula red
 # down). Empty `hr_zone` (Zone Hold off/not engaged) draws the heart plain,
 # same as задача 025/026 before Zone Hold existed.
 
-# Session filter: tmux session name(s) to show this widget in. Empty
-# (default) -> every session, so a fresh checkout/new host shows it
-# everywhere with zero config. Populate to restrict it to specific
-# sessions — e.g. a narrow second-monitor session where the pill crowds out
-# segments that matter more there. Exact match against tmux's `#S` (session
-# name), not a pattern.
-WIDGET_SESSIONS=("main")
-
 # --- Helpers -------------------------------------------------------------------
 
 # Seconds -> `M:SS`, or `H:MM:SS` past an hour.
@@ -154,17 +156,6 @@ fmt_dist() {
 }
 
 # --- Main ----------------------------------------------------------------------
-
-# Session filter (see $WIDGET_SESSIONS above): skip entirely before even
-# touching the binary if the current session isn't in the allow-list.
-if (( ${#WIDGET_SESSIONS[@]} > 0 )); then
-  session="$(tmux display-message -p '#S' 2>/dev/null || true)"
-  match=0
-  for s in "${WIDGET_SESSIONS[@]}"; do
-    [[ "$s" == "$session" ]] && { match=1; break; }
-  done
-  (( match )) || exit 0
-fi
 
 # No binary yet (fresh machine, not built/installed) -> render nothing rather
 # than error.

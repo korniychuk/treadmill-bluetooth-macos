@@ -133,6 +133,44 @@ When the script prints nothing, `#()` naturally renders as an empty string,
 so the segment disappears on its own — no extra configuration needed. Adjust
 `status-right`/`status-left` composition and `status-interval` to taste.
 
+## Showing it only in some sessions
+
+Handy when one monitor is narrow and the pill crowds out segments that matter
+more there.
+
+**Do not add a session check to `treadmill-widget.sh`.** tmux caches `#()`
+output per *command string* and gives that single result to every attached
+client (*"the previous result from running the same command is used"* — `man
+tmux`). The script runs once for the whole server and cannot tell which
+session is being drawn; `tmux display-message -p '#S'` inside it answers for
+whichever client is *current*, so the pill ends up blinking in **all**
+sessions at once as focus moves between them.
+
+Formats, unlike jobs, are expanded **per client** — so put the filter there,
+wrapping the job token itself:
+
+```tmux
+set -g @treadmill-sessions "main"   # fnmatch pattern; "*" = every session
+set -g status-right '#{?#{m:#{@treadmill-sessions},#{session_name}},#(~/path/to/treadmill-widget.sh),} …'
+```
+
+Keep the `#(...)` token byte-identical to what it was — it doubles as tmux's
+job cache key.
+
+Under Dracula there is no hook to wrap a `custom:` segment, so rewrite the
+`status-right` it just built, *after* `run '~/.tmux/plugins/tpm/tpm'`:
+
+```tmux
+set -g @treadmill-sessions "main"
+run '~/.tmux/treadmill-session-filter.sh'
+```
+
+Leaving Dracula's own frame around the conditional means a non-matching
+session renders exactly like a switched-off treadmill — it blends into the
+bar. The rewrite must live in a **script file**, not an inline `run '...'`:
+`run-shell` expands formats in its command string, which would eat the very
+`#(...)` / `#{?...}` tokens you are trying to write.
+
 ## Customizing
 
 Open `treadmill-widget.sh` and edit the "Tunables" block near the top:
