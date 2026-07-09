@@ -294,7 +294,11 @@ pub fn resolve_zone_bpm(
                 (hrmax * max / 100.0).round() as u16,
             ),
             Method::Karvonen => {
-                let resting = resting_hr.unwrap_or(0) as f32;
+                // Missing/0 resting → algebraically identical to HRmax percents
+                // (задача 040). WARN lives at config load (not here): this pure
+                // function runs every zone-hold tick and must not spam logs.
+                // Zones sit systematically lower than true Karvonen with resting.
+                let resting = resting_hr.filter(|&r| r > 0).unwrap_or(0) as f32;
                 let hrr = (hrmax - resting).max(0.0);
                 (
                     (resting + hrr * min / 100.0).round() as u16,
@@ -500,6 +504,14 @@ fn parse_zone_hold_config(raw: &str) -> ZoneHoldConfig {
             Method::HrMax
         }
     };
+    // Once per load (задача 040) — resolve_zone_bpm also falls back algebraically
+    // but must stay silent (called every zone-hold tick).
+    if method == Method::Karvonen && resting_hr.is_none() {
+        warn!(
+            "zone_hold: method=karvonen but resting_hr missing — \
+             falling back to hrmax percents (zones lower than intended)"
+        );
+    }
 
     let target_zone = match table.get("target_zone") {
         None => defaults.target_zone.clone(),
@@ -693,7 +705,7 @@ pub fn upsert_zone_hold_keys(path: &Path, updates: &[(&str, String)]) -> anyhow:
             lines.push(format!("{key} = {value}"));
         }
         lines.push(String::new());
-        std::fs::write(path, lines.join("\n"))?;
+        crate::goals::write_atomic(path, lines.join("\n"))?;
         return Ok(());
     };
 
@@ -715,7 +727,7 @@ pub fn upsert_zone_hold_keys(path: &Path, updates: &[(&str, String)]) -> anyhow:
         }
     }
 
-    std::fs::write(path, lines.join("\n") + "\n")?;
+    crate::goals::write_atomic(path, lines.join("\n") + "\n")?;
     Ok(())
 }
 
@@ -780,7 +792,7 @@ pub fn replace_zones(path: &Path, zones: &[ZoneDef]) -> anyhow::Result<()> {
         lines.push(String::new());
     }
 
-    std::fs::write(path, lines.join("\n"))?;
+    crate::goals::write_atomic(path, lines.join("\n"))?;
     Ok(())
 }
 
@@ -810,6 +822,20 @@ mod tests {
             },
         );
         assert_eq!((low, high), (112, 131));
+    }
+
+    #[test]
+    fn resolve_zone_bpm_karvonen_without_resting_equals_hrmax() {
+        let hrmax = 187.0;
+        let bounds = ZoneBounds::Percent {
+            min: 60.0,
+            max: 70.0,
+        };
+        let with_hrmax = resolve_zone_bpm(hrmax, None, Method::HrMax, bounds);
+        let with_karvonen_missing = resolve_zone_bpm(hrmax, None, Method::Karvonen, bounds);
+        let with_karvonen_zero = resolve_zone_bpm(hrmax, Some(0), Method::Karvonen, bounds);
+        assert_eq!(with_karvonen_missing, with_hrmax);
+        assert_eq!(with_karvonen_zero, with_hrmax);
     }
 
     #[test]

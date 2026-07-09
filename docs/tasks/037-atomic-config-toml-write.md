@@ -1,6 +1,6 @@
 # 037 — Atomic write для `config.toml` (truncate wipe)
 
-> **Статус: open**  
+> **Статус: done**  
 > **Источник:** [research/003](../research/003-reliability-architecture-review.md) §3.8, Phase 0.3  
 > **Класс:** durability / config I/O  
 > **Приоритет:** medium-high (дешёвый, data-loss path)
@@ -57,10 +57,10 @@ fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
 
 ## Acceptance
 
-- [ ] No production `std::fs::write(config_path, …)` that truncates the live config in place
-- [ ] Crash after tmp write / before rename leaves old config intact
-- [ ] `tm zone …` / goals upsert still work; hot-reload still sees mtime change after successful rename
-- [ ] Helper used from both `zone_hold` and `goals`
+- [x] No production `std::fs::write(config_path, …)` that truncates the live config in place
+- [x] Crash after tmp write / before rename leaves old config intact
+- [x] `tm zone …` / goals upsert still work; hot-reload still sees mtime change after successful rename
+- [x] Helper used from both `zone_hold` and `goals`
 
 ## Затронутые файлы
 

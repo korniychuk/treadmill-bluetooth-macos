@@ -1,6 +1,6 @@
 # 040 — Karvonen без `resting_hr`: WARN + явный fallback
 
-> **Статус: open**  
+> **Статус: done**  
 > **Источник:** [research/003](../research/003-reliability-architecture-review.md) §3.5, Phase 0.6  
 > **Класс:** config semantics / observability  
 > **Приоритет:** low-medium (не measurement bug; дешёвый)
@@ -39,10 +39,10 @@ let hrr = (hrmax - resting).max(0.0);
 
 ## Acceptance
 
-- [ ] Missing resting + karvonen → WARN (load or resolve)
-- [ ] Numeric zones = HrMax percents (documented)
-- [ ] No panic / no engage block solely due to missing resting
-- [ ] Unit test for equality / fallback
+- [x] Missing resting + karvonen → WARN (load or resolve)
+- [x] Numeric zones = HrMax percents (documented)
+- [x] No panic / no engage block solely due to missing resting
+- [x] Unit test for equality / fallback
 
 ## Затронутые файлы
 

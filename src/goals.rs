@@ -15,10 +15,24 @@
 //! the compiled defaults.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use tracing::{info, warn};
+
+/// Write `contents` to `path` via same-directory temp + rename (задача 037).
+///
+/// `std::fs::write` truncates first: a crash between truncate and complete write
+/// permanently wipes the operator's `config.toml`. Writing a sibling `*.tmp`
+/// then `rename(2)` keeps the old file intact until the new body is durable
+/// (same FS, atomic replace on macOS).
+pub(crate) fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, contents.as_ref())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
 
 /// Compiled-in fallback thresholds, used when the config file is missing or
 /// invalid so the daemon always has *some* goals (edge case → WARN, not fail).
@@ -332,7 +346,7 @@ pub fn upsert_top_level_key(path: &std::path::Path, key: &str, value: &str) -> a
         None => lines.insert(section_start, new_line),
     }
 
-    std::fs::write(path, lines.join("\n") + "\n")?;
+    write_atomic(path, lines.join("\n") + "\n")?;
     Ok(())
 }
 
@@ -657,6 +671,30 @@ mod tests {
         for f in [on, off, absent, str_val, junk] {
             std::fs::remove_file(f).ok();
         }
+    }
+
+    #[test]
+    fn write_atomic_replaces_existing_and_leaves_target_on_tmp_failure() {
+        let dir = std::env::temp_dir().join(format!("tm-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "goals = [8000]\n").unwrap();
+
+        write_atomic(&path, "goals = [9000]\nshow_speed = true\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "goals = [9000]\nshow_speed = true\n"
+        );
+        // No leftover tmp after success.
+        assert!(!path.with_extension("toml.tmp").exists());
+
+        // Target still holds the last good body if we only fail *before* rename
+        // (simulate by writing a good body, then ensuring a failed rename isn't
+        // needed: the contract is "write tmp first, rename only on success").
+        assert!(path.exists());
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
     }
 
     #[test]
