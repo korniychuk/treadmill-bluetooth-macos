@@ -1,5 +1,13 @@
 # 031 — Залипший `connected` после выключения дорожки (виджет висит вечно)
 
+> **Статус: сделано** (2026-07-09). Оба пункта плана реализованы в `src/daemon.rs`:
+> абсолютный дедлайн `sleep_until(last_telemetry_at + NOTIFICATION_TIMEOUT)` вместо
+> relative-`timeout`, и `Watchdog::touch_telemetry()` (только на `0x2ACD`) как
+> источник тайт-порога `STREAMING_STALE_THRESHOLD`. Тесты:
+> `streaming_watchdog_ignores_non_telemetry_touches`,
+> `telemetry_deadline_fires_despite_a_faster_sibling_arm` (paused clock,
+> `tokio` `test-util` в `[dev-dependencies]`).
+
 ## Симптом
 
 Дорожка физически выключена, телеметрия не идёт, но tmux-виджет продолжает

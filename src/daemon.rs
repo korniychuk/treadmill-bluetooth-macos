@@ -558,7 +558,9 @@ async fn stream_with_presence(
     // tight streaming threshold (задача 018) and reset the clock so the
     // (possibly slow) subscribe phase above doesn't count against it. `run()`
     // clears streaming the moment this function returns, by any path.
-    watchdog.touch();
+    // `touch_telemetry` (not `touch`): the streaming phase watches the treadmill
+    // clock, which must start now rather than at the anchor (задача 031).
+    watchdog.touch_telemetry();
     watchdog.set_streaming(true);
 
     let session_id = store.start_session()?;
@@ -631,6 +633,10 @@ async fn stream_with_presence(
     let mut hr_battery_last_read: Option<Instant> = None;
     let mut hr_battery_check_tick = tokio::time::interval(HR_BATTERY_CHECK_INTERVAL);
 
+    // Deadline anchor for the telemetry-silence arm below (задача 031); advanced
+    // only by a decoded `0x2ACD` frame, never by HR/control/config activity.
+    let mut last_telemetry_at = tokio::time::Instant::now();
+
     loop {
         tokio::select! {
             biased;
@@ -668,14 +674,18 @@ async fn stream_with_presence(
                 }
                 continue;
             }
-            notification = tokio::time::timeout(NOTIFICATION_TIMEOUT, notifications.next()) => {
-                let notification = match notification {
-                    Ok(Some(notification)) => notification,
-                    Ok(None) => break, // stream closed cleanly (rare, but handle it)
-                    Err(_) => {
-                        warn!(timeout_s = NOTIFICATION_TIMEOUT.as_secs(), "no telemetry received — treating as disconnected");
-                        break;
-                    }
+            // Absolute deadline, not `timeout(NOTIFICATION_TIMEOUT, ...)`: `select!`
+            // rebuilds every arm's future on each pass, so a relative timeout is
+            // reset by whichever sibling arm completes first — and `command_tick`
+            // fires every second. `sleep_until` survives the rebuild because the
+            // deadline is a point in time, not a duration (задача 031).
+            _ = tokio::time::sleep_until(last_telemetry_at + NOTIFICATION_TIMEOUT) => {
+                warn!(timeout_s = NOTIFICATION_TIMEOUT.as_secs(), "no telemetry received — treating as disconnected");
+                break;
+            }
+            notification = notifications.next() => {
+                let Some(notification) = notification else {
+                    break; // stream closed cleanly (rare, but handle it)
                 };
                 if notification.uuid == ftms::FITNESS_MACHINE_STATUS {
                     let ts_ms = Utc::now().timestamp_millis();
@@ -695,6 +705,8 @@ async fn stream_with_presence(
                     warn!(bytes = ?notification.value, "undecodable treadmill frame");
                     continue;
                 };
+                last_telemetry_at = tokio::time::Instant::now();
+                watchdog.touch_telemetry();
                 logger.log(&data)?;
                 store.insert_raw_sample(session_id, Utc::now().timestamp_millis(), &data, &notification.value)?;
 
@@ -1829,6 +1841,12 @@ struct Watchdog {
     /// Milliseconds since `anchor` at the moment of the last `touch()`,
     /// shared with the monitor task.
     last_touch_ms: Arc<AtomicU64>,
+    /// Milliseconds since `anchor` at the moment of the last `touch_telemetry()`,
+    /// i.e. the last decoded `0x2ACD` frame (задача 031). Kept apart from
+    /// `last_touch_ms` because the general touch rides on `State::persist()`,
+    /// which any loop branch (HR frame, control poll, config reload) triggers —
+    /// it proves the event loop is alive, never that the treadmill is talking.
+    last_telemetry_ms: Arc<AtomicU64>,
     /// Whether telemetry is actively streaming (задача 018). Selects the tighter
     /// [`STREAMING_STALE_THRESHOLD`] over the general [`WATCHDOG_STALE_THRESHOLD`],
     /// shared with the monitor task.
@@ -1840,13 +1858,25 @@ impl Watchdog {
         Self {
             anchor: Instant::now(),
             last_touch_ms: Arc::new(AtomicU64::new(0)),
+            last_telemetry_ms: Arc::new(AtomicU64::new(0)),
             streaming: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn touch(&self) {
+        self.store_now(&self.last_touch_ms);
+    }
+
+    /// Record a treadmill telemetry frame (`0x2ACD`). The only thing the tight
+    /// [`STREAMING_STALE_THRESHOLD`] is allowed to watch — see `last_telemetry_ms`.
+    fn touch_telemetry(&self) {
+        self.store_now(&self.last_telemetry_ms);
+        self.touch();
+    }
+
+    fn store_now(&self, slot: &AtomicU64) {
         let elapsed_ms = u64::try_from(self.anchor.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.last_touch_ms.store(elapsed_ms, Ordering::Relaxed);
+        slot.store(elapsed_ms, Ordering::Relaxed);
     }
 
     /// Mark whether telemetry is actively streaming, switching which staleness
@@ -1867,26 +1897,34 @@ impl Watchdog {
         }
     }
 
-    /// Whether the last touch is older than the current-phase threshold
-    /// ([`Self::stale_threshold`]), given the elapsed-since-anchor time. Split
-    /// from `spawn_monitor` so the threshold logic is unit-testable without a
-    /// runtime or real waiting.
+    /// Milliseconds since `anchor` of the progress signal the current phase
+    /// watches: treadmill frames while streaming, any loop progress otherwise.
+    fn last_progress_ms(&self) -> u64 {
+        if self.streaming.load(Ordering::Relaxed) {
+            self.last_telemetry_ms.load(Ordering::Relaxed)
+        } else {
+            self.last_touch_ms.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Whether the watched progress signal is older than the current-phase
+    /// threshold ([`Self::stale_threshold`]), given the elapsed-since-anchor
+    /// time. Split from `spawn_monitor` so the threshold logic is unit-testable
+    /// without a runtime or real waiting.
     fn is_stale_at(&self, elapsed_since_anchor: Duration) -> bool {
-        let last_touch = Duration::from_millis(self.last_touch_ms.load(Ordering::Relaxed));
-        elapsed_since_anchor.saturating_sub(last_touch) > self.stale_threshold()
+        let last = Duration::from_millis(self.last_progress_ms());
+        elapsed_since_anchor.saturating_sub(last) > self.stale_threshold()
     }
 
     /// Start the independent monitor task. On detected staleness it logs an
     /// `ERROR` and exits the whole process with [`WATCHDOG_EXIT_CODE`] so
     /// launchd (`KeepAlive=true`) restarts the daemon cleanly.
     fn spawn_monitor(&self) {
-        let anchor = self.anchor;
-        let last_touch_ms = Arc::clone(&self.last_touch_ms);
-        let streaming = Arc::clone(&self.streaming);
         let probe = Self {
-            anchor,
-            last_touch_ms,
-            streaming,
+            anchor: self.anchor,
+            last_touch_ms: Arc::clone(&self.last_touch_ms),
+            last_telemetry_ms: Arc::clone(&self.last_telemetry_ms),
+            streaming: Arc::clone(&self.streaming),
         };
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(WATCHDOG_POLL_INTERVAL);
@@ -1894,10 +1932,9 @@ impl Watchdog {
                 tick.tick().await;
                 let elapsed = probe.anchor.elapsed();
                 if probe.is_stale_at(elapsed) {
-                    let last_touch =
-                        Duration::from_millis(probe.last_touch_ms.load(Ordering::Relaxed));
+                    let last_touch = Duration::from_millis(probe.last_progress_ms());
                     error!(
-                        stale_s = (elapsed - last_touch).as_secs(),
+                        stale_s = elapsed.saturating_sub(last_touch).as_secs(),
                         threshold_s = probe.stale_threshold().as_secs(),
                         streaming = probe.streaming.load(Ordering::Relaxed),
                         exit_code = WATCHDOG_EXIT_CODE,
@@ -1972,6 +2009,56 @@ mod tests {
         watchdog.set_streaming(false);
         assert!(!watchdog.is_stale_at(between));
         assert_eq!(watchdog.stale_threshold(), WATCHDOG_STALE_THRESHOLD);
+    }
+
+    /// The задача 031 regression: `persist()`-driven `touch()` (HR frames,
+    /// control polls, config reloads) must not keep the streaming watchdog alive
+    /// while the treadmill itself has gone silent. Only `touch_telemetry()` does.
+    #[test]
+    fn streaming_watchdog_ignores_non_telemetry_touches() {
+        let watchdog = Watchdog::new();
+        watchdog.set_streaming(true);
+        let dead = STREAMING_STALE_THRESHOLD * 2;
+
+        // A generic touch (as any `persist()` call site does) leaves the
+        // treadmill clock untouched — the link still reads as dead.
+        watchdog.touch();
+        assert!(watchdog.is_stale_at(watchdog.anchor.elapsed() + dead));
+
+        // A decoded `0x2ACD` frame is what clears it.
+        watchdog.touch_telemetry();
+        assert!(!watchdog.is_stale_at(watchdog.anchor.elapsed() + STREAMING_STALE_THRESHOLD / 2));
+    }
+
+    /// The telemetry deadline must survive `select!` rebuilding its arm on every
+    /// pass — the bug of задача 031, where a 1s sibling tick reset a relative
+    /// `timeout(NOTIFICATION_TIMEOUT, ...)` forever.
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_deadline_fires_despite_a_faster_sibling_arm() {
+        let last_telemetry_at = tokio::time::Instant::now();
+        let mut sibling = tokio::time::interval(Duration::from_secs(1));
+        let mut ticks = 0u32;
+
+        let fired = loop {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(last_telemetry_at + NOTIFICATION_TIMEOUT) => break true,
+                _ = sibling.tick() => {
+                    ticks += 1;
+                    // Guard against an infinite loop if the deadline never lands.
+                    if ticks > NOTIFICATION_TIMEOUT.as_secs() as u32 * 2 {
+                        break false;
+                    }
+                }
+            }
+        };
+
+        assert!(fired, "telemetry deadline never fired");
+        assert_eq!(
+            last_telemetry_at.elapsed(),
+            NOTIFICATION_TIMEOUT,
+            "deadline must land exactly at the timeout, not drift with the sibling"
+        );
     }
 
     #[test]
