@@ -141,7 +141,12 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
   (RequestControl+SetSpeed, двойной бип ленты) каждые ~20с без реального
   изменения скорости, пока ЧСС вне зоны. Порог на порядки выше этого
   разрыва и wire-точности FTMS (0.01 км/ч), ниже `max_step_kmh` —
-  настоящие коррекции не глушатся.
+  настоящие коррекции не глушатся. `zone_hold_tick` (`daemon.rs`)
+  принимает скорость как `Option<f32>` (было `f32` с `unwrap_or(0.0)`
+  на call site) и молча пропускает тик, если в конкретном
+  FTMS-фрейме скорости нет (легитимный `MORE_DATA`-сплит, `ftms.rs`) —
+  подстановка `0.0` читалась бы как "лента встала" и могла обвалить
+  команду до `min_speed_kmh` на живой скорости.
 - `src/goals.rs` (доп., задача 029) — `load_show_speed()` (top-level
   `show_speed`, тот же absent-тихо/invalid-WARN стиль, дефолт `false`) +
   `upsert_top_level_key(path, key, value)` — line-based апдейт **top-level**

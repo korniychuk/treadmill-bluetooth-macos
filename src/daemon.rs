@@ -888,7 +888,7 @@ async fn stream_with_presence(
                                 &config.zone_hold,
                                 resolved,
                                 &mut zh_phase,
-                                data.speed_kmh.unwrap_or(0.0),
+                                data.speed_kmh,
                                 zh_bpm,
                                 &mut zh_last_correction_at,
                                 &mut zh_last_safety_write_at,
@@ -1420,13 +1420,23 @@ async fn zone_hold_tick(
     config: &zone_hold::ZoneHoldConfig,
     resolved: zone_hold::ResolvedZone,
     phase: &mut ZoneHoldPhase,
-    measured_speed_kmh: f32,
+    measured_speed_kmh: Option<f32>,
     bpm: Option<u16>,
     last_correction_at: &mut Option<Instant>,
     last_safety_write_at: &mut Option<Instant>,
     now: Instant,
     state: &mut DaemonState,
 ) {
+    // Instantaneous Speed is absent from a Treadmill Data frame only when
+    // FTMS's "More Data" bit splits it across two notifications (legal per
+    // spec, see `ftms.rs`) — rare but real. Guessing 0.0 here would read as
+    // "belt stopped" and could yank a live, merely-mid-flight speed down to
+    // `min_speed_kmh`. Skip this single tick instead; the next sample (well
+    // inside one correction interval) has it.
+    let Some(measured_speed_kmh) = measured_speed_kmh else {
+        return;
+    };
+
     let correction_interval = Duration::from_secs(config.correction_interval_seconds as u64);
     let correction_due = |last: Option<Instant>| {
         last.is_none_or(|t| now.saturating_duration_since(t) >= correction_interval)
