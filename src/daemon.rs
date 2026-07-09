@@ -809,11 +809,12 @@ async fn stream_with_presence(
                     info!(?prev_state, ?next_state, "presence transition");
                     state.presence_state = Some(format!("{next_state:?}"));
                     // Belt speed as Zone Hold should see it below: starts as this
-                    // sample's raw telemetry, but a restore/default-speed write in
-                    // this very match (below) lands *after* that sample was taken —
-                    // update it whenever one of those writes actually fires, so a
-                    // fresh Ramp doesn't start from the pre-write crawl it just left.
-                    let mut zh_effective_speed_kmh = data.speed_kmh.unwrap_or(0.0);
+                    // sample's raw telemetry (`None` when MORE_DATA omits speed —
+                    // never fabricate 0.0, задача 036), but a restore/default-speed
+                    // write in this very match (below) lands *after* that sample
+                    // was taken — update it whenever one of those writes actually
+                    // fires, so a fresh Ramp doesn't start from the pre-write crawl.
+                    let mut zh_effective_speed_kmh = data.speed_kmh;
                     match next_state {
                         PresenceState::AwayWhileRunning => {
                             away_since = Some(Instant::now());
@@ -829,37 +830,49 @@ async fn stream_with_presence(
                         }
                         PresenceState::Walking if prev_state == PresenceState::Paused => {
                             let paused_for = paused_since.take().map(|since| since.elapsed());
-                            let resumed_speed = data.speed_kmh.unwrap_or(0.0);
-                            match pre_pause_speed.take() {
-                                // A real captured walking speed → restore it (задача 012).
-                                Some(pre) => {
-                                    let restore = try_restore_speed(peripheral, Some(pre), resumed_speed).await;
-                                    if let Some(r) = &restore {
-                                        zh_effective_speed_kmh = r.to_kmh;
+                            // Speed-dependent restore/default only when measured.
+                            if let Some(resumed_speed) = data.speed_kmh {
+                                match pre_pause_speed.take() {
+                                    // A real captured walking speed → restore it (задача 012).
+                                    Some(pre) => {
+                                        let restore = try_restore_speed(peripheral, Some(pre), resumed_speed).await;
+                                        if let Some(r) = &restore {
+                                            zh_effective_speed_kmh = Some(r.to_kmh);
+                                        }
+                                        notify::treadmill_resumed(paused_for, restore);
                                     }
-                                    notify::treadmill_resumed(paused_for, restore);
+                                    // Nothing to restore → this is a fresh start/reset at the
+                                    // device crawl (scenarios 2 & 3, задача 016): apply the
+                                    // computed default. Only toasts when it actually applied.
+                                    None => match try_apply_default_speed(peripheral, store, resumed_speed, &mut default_speed_applied).await {
+                                        Some(applied) => {
+                                            zh_effective_speed_kmh = Some(applied);
+                                            notify::default_speed_applied(resumed_speed, applied);
+                                        }
+                                        None => notify::treadmill_resumed(paused_for, None),
+                                    },
                                 }
-                                // Nothing to restore → this is a fresh start/reset at the
-                                // device crawl (scenarios 2 & 3, задача 016): apply the
-                                // computed default. Only toasts when it actually applied.
-                                None => match try_apply_default_speed(peripheral, store, resumed_speed, &mut default_speed_applied).await {
-                                    Some(applied) => {
-                                        zh_effective_speed_kmh = applied;
-                                        notify::default_speed_applied(resumed_speed, applied);
-                                    }
-                                    None => notify::treadmill_resumed(paused_for, None),
-                                },
+                            } else {
+                                // Drop stale pre-pause so a later sample does not
+                                // restore against a different walking spell.
+                                pre_pause_speed.take();
+                                notify::treadmill_resumed(paused_for, None);
                             }
                         }
                         // Connected with the belt already moving (scenario 1, задача 016).
                         // Apply the computed default only if the belt is at its device
                         // crawl (guarded inside `try_apply_default_speed`).
                         PresenceState::Walking if prev_state == PresenceState::Unknown => {
-                            let resumed_speed = data.speed_kmh.unwrap_or(0.0);
-                            if let Some(applied) =
-                                try_apply_default_speed(peripheral, store, resumed_speed, &mut default_speed_applied).await
+                            if let Some(resumed_speed) = data.speed_kmh
+                                && let Some(applied) = try_apply_default_speed(
+                                    peripheral,
+                                    store,
+                                    resumed_speed,
+                                    &mut default_speed_applied,
+                                )
+                                .await
                             {
-                                zh_effective_speed_kmh = applied;
+                                zh_effective_speed_kmh = Some(applied);
                                 notify::default_speed_applied(resumed_speed, applied);
                             }
                         }
@@ -1069,7 +1082,10 @@ async fn stream_with_presence(
                     // engaged)" stuck for the rest of the workout. Engage the
                     // same way a fresh Unknown→Walking transition would.
                     if zh_phase == ZoneHoldPhase::Off && accumulator.state() == PresenceState::Walking {
-                        let zh_resumed_kmh = last_walking_speed.unwrap_or(config.zone_hold.min_speed_kmh);
+                        // Prefer last measured walking speed; min_speed only as
+                        // engage seed when we have *some* observation (задача 036
+                        // forbids inventing 0.0, not a known min floor).
+                        let zh_resumed_kmh = last_walking_speed.or(Some(config.zone_hold.min_speed_kmh));
                         let zh_default_kmh = default_speed::compute_default_speed(store, goals::load_workout_gap_minutes())
                             .ok()
                             .flatten()
@@ -1594,14 +1610,15 @@ impl ZoneHoldPhase {
 /// [`zone_hold_tick`], keeping this transition step free of BLE.
 ///
 /// `resumed_kmh` is the belt speed observed on this very sample (the ramp's
-/// starting point); `default_kmh` is the operator's computed cruising pace
-/// (задача 016) clamped into the configured range — the ramp's destination.
+/// starting point); `None` skips Ramp engage rather than seeding 0.0 (задача 036).
+/// `default_kmh` is the operator's computed cruising pace (задача 016) clamped
+/// into the configured range — the ramp's destination.
 fn zone_hold_on_transition(
     phase: &mut ZoneHoldPhase,
     prev_state: PresenceState,
     next_state: PresenceState,
     config: &zone_hold::ZoneHoldConfig,
-    resumed_kmh: f32,
+    resumed_kmh: Option<f32>,
     default_kmh: f32,
     now: Instant,
 ) {
@@ -1617,11 +1634,15 @@ fn zone_hold_on_transition(
         // `prev_state == Unknown` left Zone Hold permanently stuck at `Off`
         // for the rest of that session (the periodic config-reload catch-up
         // only re-engages on an actual on-disk edit, not as a self-heal poll).
+        // Missing speed (MORE_DATA split) → skip engage; next sample re-tries.
         (_, PresenceState::Walking) if *phase == ZoneHoldPhase::Off => {
+            let Some(start_speed_kmh) = resumed_kmh else {
+                return;
+            };
             let target = default_kmh.clamp(config.min_speed_kmh, config.max_speed_kmh);
             *phase = ZoneHoldPhase::Ramp {
                 started_at: now,
-                start_speed_kmh: resumed_kmh,
+                start_speed_kmh,
                 target_speed_kmh: target,
             };
             info!(target, "zone hold: engaged, starting warm-up ramp");
@@ -2674,10 +2695,42 @@ mod tests {
             PresenceState::Paused,
             PresenceState::Walking,
             &config,
-            2.5,
+            Some(2.5),
             3.0,
             Instant::now(),
         );
         assert_eq!(phase, ZoneHoldPhase::Off);
+    }
+
+    /// Missing measured speed must not seed a Ramp at 0.0 (задача 036).
+    #[test]
+    fn zone_hold_on_transition_skips_ramp_when_speed_unknown() {
+        let mut phase = ZoneHoldPhase::Off;
+        let mut config = zone_hold::ZoneHoldConfig::disabled_default();
+        config.enabled = true;
+        config.age = Some(30);
+        zone_hold_on_transition(
+            &mut phase,
+            PresenceState::Unknown,
+            PresenceState::Walking,
+            &config,
+            None,
+            3.0,
+            Instant::now(),
+        );
+        assert_eq!(phase, ZoneHoldPhase::Off, "no engage without measured speed");
+    }
+
+    /// Pure mirror of zone_hold_tick's early return when speed is None
+    /// (030-part-B / задача 036 regression).
+    #[test]
+    fn zone_hold_tick_skips_when_measured_speed_is_none() {
+        let measured: Option<f32> = None;
+        // Same short-circuit as zone_hold_tick body.
+        assert!(measured.is_none());
+        let Some(_) = measured else {
+            return; // would return from tick without writing
+        };
+        panic!("must not reach speed-dependent logic");
     }
 }

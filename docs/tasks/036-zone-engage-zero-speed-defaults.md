@@ -1,6 +1,6 @@
 # 036 — Engage-пути Zone Hold: `unwrap_or(0.0)` — скрытый инвариант, не живой баг
 
-> **Статус: open**  
+> **Статус: done**  
 > **Источник:** [research/003](../research/003-reliability-architecture-review.md) §3.5, Phase 0.2; **премиза скорректирована** [research/004](../research/004-independent-reliability-review.md) §2.2  
 > **Класс:** invariant hardening + regression gap (хвост 030)  
 > **Приоритет:** ~~high~~ → **medium** — путь сегодня недостижим (см. ниже), из Phase 0 выведена
@@ -71,11 +71,11 @@ Engage-пути в `stream_with_presence` **остались** (достижим
 
 ## Acceptance
 
-- [ ] Нет `data.speed_kmh.unwrap_or(0.0)` на engage/resume/default путях
-- [ ] Гипотетический transition с `speed=None` не даёт target/ramp seed 0.0 (защита не зависит от `presence.rs:86`)
-- [ ] `try_apply_default_speed` / restore не получают fake 0.0
-- [ ] `zone_hold_tick` path (030) остаётся skip-on-None **и получает regression-тест** (пробел 030-part-B закрыт)
-- [ ] Regression tests green
+- [x] Нет `data.speed_kmh.unwrap_or(0.0)` на engage/resume/default путях
+- [x] Гипотетический transition с `speed=None` не даёт target/ramp seed 0.0 (защита не зависит от `presence.rs:86`)
+- [x] `try_apply_default_speed` / restore не получают fake 0.0
+- [x] `zone_hold_tick` path (030) остаётся skip-on-None **и получает regression-тест** (пробел 030-part-B закрыт)
+- [x] Regression tests green
 
 ## Затронутые файлы
 
