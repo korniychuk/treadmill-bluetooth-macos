@@ -1,6 +1,6 @@
 # 035 — HR silence: relative `timeout` в `select!` никогда не набегает
 
-> **Статус: open**  
+> **Статус: done**  
 > **Источник:** [research/003](../research/003-reliability-architecture-review.md) §3.2, Phase 0.1; severity ↑ и расширение скоупа — [research/004](../research/004-independent-reliability-review.md) §2.1  
 > **Класс:** `liveness` (тот же, что 031)  
 > **Приоритет:** high — latent same-class bug; чинить первым
@@ -73,11 +73,11 @@ Some(stream) => tokio::time::timeout(HR_NOTIFICATION_TIMEOUT, stream.next()).awa
 
 ## Acceptance
 
-- [ ] Нет `tokio::time::timeout(HR_NOTIFICATION_TIMEOUT, stream.next())` внутри `select!`
-- [ ] `sleep_until(last_hr_at + HR_NOTIFICATION_TIMEOUT)` (или эквивалент absolute Instant)
-- [ ] `zh_bpm` с freshness-гейтом: устаревший `last_bpm_ts` → контроллер получает `None` (unit-тест)
-- [ ] Link-loss ветки чистят `last_bpm`/`last_bpm_ts` (инвариант `hr_connected=false` ⇒ `last_bpm=None`)
-- [ ] Regression test with paused clock + sibling arm green
+- [x] Нет `tokio::time::timeout(HR_NOTIFICATION_TIMEOUT, stream.next())` внутри `select!`
+- [x] `sleep_until(last_hr_at + HR_NOTIFICATION_TIMEOUT)` (или эквивалент absolute Instant)
+- [x] `zh_bpm` с freshness-гейтом: устаревший `last_bpm_ts` → контроллер получает `None` (unit-тест)
+- [x] Link-loss ветки чистят `last_bpm`/`last_bpm_ts` (инвариант `hr_connected=false` ⇒ `last_bpm=None`)
+- [x] Regression test with paused clock + sibling arm green
 - [ ] Existing HR contact / reconnect behaviour unchanged when frames keep flowing
 - [ ] Smoke (live, optional): kill notify path / power-cycle strap mid-session → reconnect within timeout + reconnect interval
 

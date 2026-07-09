@@ -195,7 +195,20 @@ const AUTO_PAUSE_RETRY_COOLDOWN: Duration = Duration::from_secs(15);
 /// treating the strap as removed/lost (задача 025). A worn H10 sends samples
 /// ~1/s, same cadence as the treadmill's own telemetry; generous margin above
 /// jitter while still catching a removed strap quickly.
+///
+/// Must be an **absolute** `sleep_until` deadline in `select!` (задача 035), not
+/// a relative `timeout` around `stream.next()` — sibling arms (command_tick 1s,
+/// treadmill frames) rebuild every arm and would reset a relative timeout forever
+/// (same class as задача 031 for treadmill telemetry).
 const HR_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Max age of `last_bpm` before Zone Hold treats bpm as absent (задача 035
+/// defense-in-depth). Matches widget/`tm status` HR freshness (15s): the control
+/// path must not feed a frozen bpm into speed corrections when notify has gone
+/// silent but the BLE link is still up. Slightly above [`HR_NOTIFICATION_TIMEOUT`]
+/// so silence-detection reconnects first when the absolute deadline works; this
+/// gate still protects if that path lags.
+const ZH_BPM_MAX_AGE: Duration = Duration::from_secs(15);
 
 /// How often the daemon retries finding/connecting an HR sensor while one
 /// isn't currently linked (no strap worn, or the last link was lost). Coarser
@@ -642,6 +655,9 @@ async fn stream_with_presence(
     // Deadline anchor for the telemetry-silence arm below (задача 031); advanced
     // only by a decoded `0x2ACD` frame, never by HR/control/config activity.
     let mut last_telemetry_at = tokio::time::Instant::now();
+    // Absolute HR-silence deadline (задача 035), advanced only by a received
+    // `0x2A37` frame or when a new HR stream is installed — never by sibling arms.
+    let mut last_hr_at = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -900,7 +916,13 @@ async fn stream_with_presence(
                 if should_run_zone_hold(config.zone_hold.enabled, &zh_phase) {
                     match config.zone_hold.resolve_target_zone() {
                         Some(resolved) => {
-                            let zh_bpm = state.hr_connected.then_some(state.last_bpm).flatten().map(|b| b as u16);
+                            let zh_bpm = zh_bpm_if_fresh(
+                                state.hr_connected,
+                                state.last_bpm,
+                                state.last_bpm_ts,
+                                Utc::now().timestamp_millis(),
+                                ZH_BPM_MAX_AGE,
+                            );
                             zone_hold_tick(
                                 peripheral,
                                 &config.zone_hold,
@@ -1024,6 +1046,8 @@ async fn stream_with_presence(
                         hr_contact_tracker = hr::ContactTracker::default();
                         hr_contact = hr::Contact::Live;
                         hr_notifications = Some(stream);
+                        // Give the first frame the full silence window (задача 035).
+                        last_hr_at = tokio::time::Instant::now();
                         hr_peripheral = Some(peripheral);
                         hr_battery_pct = battery_pct;
                         hr_battery_last_read = Some(Instant::now());
@@ -1036,23 +1060,24 @@ async fn stream_with_presence(
                     }
                 }
             }
-            // Live HR telemetry, mirroring the treadmill's own bounded-timeout
-            // disconnect detection. `tokio::select!` re-constructs every
-            // branch's future on each pass regardless of an `if` precondition
-            // (only *polling* is gated by it) — an `.unwrap()` in the future
-            // expression itself would panic the instant `hr_notifications` is
-            // `None`, which is exactly what happened live on the first real
-            // treadmill connect. So the `None` case is handled inside the
-            // async block via a future that never resolves, instead of
-            // relying on a precondition to protect an unwrap.
-            hr_result = async {
+            // Live HR frames (задача 025). Silence is a separate absolute
+            // `sleep_until` arm (задача 035) — never wrap `stream.next()` in a
+            // relative `timeout` inside `select!` (sibling arms would reset it).
+            // `None` stream uses `pending()` so we never unwrap a missing stream
+            // in the future expression (that panic hit live on first treadmill
+            // connect before the precondition-vs-rebuild subtlety was known).
+            hr_notification = async {
                 match hr_notifications.as_mut() {
-                    Some(stream) => tokio::time::timeout(HR_NOTIFICATION_TIMEOUT, stream.next()).await,
+                    Some(stream) => stream.next().await,
                     None => std::future::pending().await,
                 }
             } => {
-                match hr_result {
-                    Ok(Some(notification)) if notification.uuid == hr::HEART_RATE_MEASUREMENT => {
+                match hr_notification {
+                    Some(notification) if notification.uuid == hr::HEART_RATE_MEASUREMENT => {
+                        // Any frame advances the silence clock — including
+                        // contact-Lost frozen bpm — so partial silence still
+                        // uses the absolute deadline, not contact logic.
+                        last_hr_at = tokio::time::Instant::now();
                         if let Some(m) = hr::parse_hr_measurement(&notification.value) {
                             // Contact, not link (задача 033). A strap off the
                             // body still notifies ~1/s with the last bpm frozen;
@@ -1096,35 +1121,46 @@ async fn stream_with_presence(
                             }
                         }
                     }
-                    Ok(Some(_)) => {} // notification for a characteristic we don't track
-                    Ok(None) => {
+                    Some(_) => {
+                        // Non-HR characteristic; still counts as link activity.
+                        last_hr_at = tokio::time::Instant::now();
+                    }
+                    None => {
                         warn!("HR notification stream ended — sensor likely removed");
-                        hr_notifications = None;
-                        state.hr_connected = false;
-                        hr_contact_tracker = hr::ContactTracker::default();
-                        hr_contact = hr::Contact::Live;
-                        hr_battery_pct = None;
-                        hr_battery_last_read = None;
-                        state.hr_battery_pct = None;
+                        clear_hr_link_state(
+                            &mut hr_notifications,
+                            &mut hr_contact_tracker,
+                            &mut hr_contact,
+                            &mut hr_battery_pct,
+                            &mut hr_battery_last_read,
+                            state,
+                        );
                         state.persist(store, watchdog)?;
                         if let Some(p) = hr_peripheral.take() {
                             scan::disconnect_best_effort(&p).await;
                         }
                     }
-                    Err(_) => {
-                        warn!(timeout_s = HR_NOTIFICATION_TIMEOUT.as_secs(), "no HR telemetry received — treating sensor as removed");
-                        hr_notifications = None;
-                        state.hr_connected = false;
-                        hr_contact_tracker = hr::ContactTracker::default();
-                        hr_contact = hr::Contact::Live;
-                        hr_battery_pct = None;
-                        hr_battery_last_read = None;
-                        state.hr_battery_pct = None;
-                        state.persist(store, watchdog)?;
-                        if let Some(p) = hr_peripheral.take() {
-                            scan::disconnect_best_effort(&p).await;
-                        }
-                    }
+                }
+            }
+            // Absolute HR silence deadline (задача 035) — same pattern as the
+            // treadmill telemetry arm above (задача 031).
+            _ = tokio::time::sleep_until(last_hr_at + HR_NOTIFICATION_TIMEOUT),
+                if hr_notifications.is_some() => {
+                warn!(
+                    timeout_s = HR_NOTIFICATION_TIMEOUT.as_secs(),
+                    "no HR telemetry received — treating sensor as removed"
+                );
+                clear_hr_link_state(
+                    &mut hr_notifications,
+                    &mut hr_contact_tracker,
+                    &mut hr_contact,
+                    &mut hr_battery_pct,
+                    &mut hr_battery_last_read,
+                    state,
+                );
+                state.persist(store, watchdog)?;
+                if let Some(p) = hr_peripheral.take() {
+                    scan::disconnect_best_effort(&p).await;
                 }
             }
             // No HR link right now (never found, or just lost) — retry
@@ -1403,6 +1439,50 @@ enum ZoneHoldPhase {
 /// a disabled Zone Hold can never drive the belt.
 fn should_run_zone_hold(enabled: bool, phase: &ZoneHoldPhase) -> bool {
     enabled && *phase != ZoneHoldPhase::Off
+}
+
+/// Bpm for Zone Hold only when the HR link is live *and* the last sample is
+/// fresh enough (задача 035). Pure: wall-clock age is injected so unit tests
+/// need no BLE. Stale or missing → `None` (controller freezes corrections).
+fn zh_bpm_if_fresh(
+    hr_connected: bool,
+    last_bpm: Option<i64>,
+    last_bpm_ts_ms: Option<i64>,
+    now_ms: i64,
+    max_age: Duration,
+) -> Option<u16> {
+    if !hr_connected {
+        return None;
+    }
+    let bpm = last_bpm?;
+    let ts = last_bpm_ts_ms?;
+    let age_ms = now_ms.saturating_sub(ts);
+    if age_ms > max_age.as_millis() as i64 {
+        return None;
+    }
+    u16::try_from(bpm).ok()
+}
+
+/// Tear down HR *link*-scoped state after stream end or silence (задача 035).
+/// Clears bpm snapshot so `hr_connected=false` always implies `last_bpm=None`.
+/// Contact-Lost keeps the BLE stream and battery — that path does not call this.
+fn clear_hr_link_state(
+    hr_notifications: &mut Option<HrNotificationStream>,
+    hr_contact_tracker: &mut hr::ContactTracker,
+    hr_contact: &mut hr::Contact,
+    hr_battery_pct: &mut Option<u8>,
+    hr_battery_last_read: &mut Option<Instant>,
+    state: &mut DaemonState,
+) {
+    *hr_notifications = None;
+    state.hr_connected = false;
+    state.last_bpm = None;
+    state.last_bpm_ts = None;
+    *hr_contact_tracker = hr::ContactTracker::default();
+    *hr_contact = hr::Contact::Live;
+    *hr_battery_pct = None;
+    *hr_battery_last_read = None;
+    state.hr_battery_pct = None;
 }
 
 /// Park Zone Hold: phase to `Off` and clear the `tm status`/widget snapshot
@@ -2138,6 +2218,60 @@ mod tests {
             NOTIFICATION_TIMEOUT,
             "deadline must land exactly at the timeout, not drift with the sibling"
         );
+    }
+
+    /// Same class as `telemetry_deadline_fires_despite_a_faster_sibling_arm`
+    /// (задача 031) for the HR link (задача 035): relative `timeout` around
+    /// `stream.next()` never ages while a 1s sibling completes every pass.
+    #[tokio::test(start_paused = true)]
+    async fn hr_silence_deadline_fires_despite_a_faster_sibling_arm() {
+        let last_hr_at = tokio::time::Instant::now();
+        let mut sibling = tokio::time::interval(Duration::from_secs(1));
+        let mut ticks = 0u32;
+
+        let fired = loop {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(last_hr_at + HR_NOTIFICATION_TIMEOUT) => break true,
+                _ = sibling.tick() => {
+                    ticks += 1;
+                    if ticks > HR_NOTIFICATION_TIMEOUT.as_secs() as u32 * 2 {
+                        break false;
+                    }
+                }
+            }
+        };
+
+        assert!(fired, "HR silence deadline never fired");
+        assert_eq!(
+            last_hr_at.elapsed(),
+            HR_NOTIFICATION_TIMEOUT,
+            "HR deadline must land exactly at the timeout, not drift with the sibling"
+        );
+    }
+
+    #[test]
+    fn zh_bpm_if_fresh_requires_link_and_recent_sample() {
+        let max = Duration::from_secs(15);
+        let now = 1_000_000_i64;
+        // Happy path.
+        assert_eq!(
+            zh_bpm_if_fresh(true, Some(120), Some(now - 5_000), now, max),
+            Some(120)
+        );
+        // Not connected → None even with a recent ts.
+        assert_eq!(
+            zh_bpm_if_fresh(false, Some(120), Some(now - 1_000), now, max),
+            None
+        );
+        // Stale (older than max) → None (partial GATT death defense).
+        assert_eq!(
+            zh_bpm_if_fresh(true, Some(111), Some(now - 16_000), now, max),
+            None
+        );
+        // Missing ts or bpm → None.
+        assert_eq!(zh_bpm_if_fresh(true, Some(120), None, now, max), None);
+        assert_eq!(zh_bpm_if_fresh(true, None, Some(now), now, max), None);
     }
 
     #[test]
