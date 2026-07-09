@@ -18,6 +18,7 @@ mod notify;
 mod power;
 mod presence;
 mod recompute;
+mod recompute_hr;
 mod scan;
 mod sniff;
 mod store;
@@ -76,6 +77,14 @@ enum Commands {
     /// presence + credit engine over history (задача 015). One-off, no BLE;
     /// idempotent; leaves `daily_stats`/`raw_samples`/`workouts` untouched.
     RecomputeSegments,
+    /// Delete frozen-bpm samples recorded from a strap off the body, by replaying
+    /// `hr_samples` through the live contact tracker (задача 034). No BLE;
+    /// idempotent; touches nothing but `hr_samples`.
+    RecomputeHr {
+        /// Report what would be deleted without touching the database.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Emit a compact, machine-readable snapshot for a status-bar widget
     /// (tmux/Dracula). Prints one TSV line `state\tworkout_count\tcur_walking_s\t
     /// cur_steps\tcur_distance_m\tday_walking_s\tday_steps\tday_distance_m\t
@@ -235,6 +244,9 @@ async fn main() -> Result<()> {
     if let Commands::RecomputeSegments = command {
         return recompute::run();
     }
+    if let Commands::RecomputeHr { dry_run } = command {
+        return recompute_hr::run(dry_run);
+    }
     if let Commands::Widget = command {
         return run_widget();
     }
@@ -290,6 +302,7 @@ async fn main() -> Result<()> {
         Commands::Stats { .. }
         | Commands::Status
         | Commands::RecomputeSegments
+        | Commands::RecomputeHr { .. }
         | Commands::Widget
         | Commands::NotifyTest
         | Commands::DefaultSpeed

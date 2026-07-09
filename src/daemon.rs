@@ -1058,7 +1058,8 @@ async fn stream_with_presence(
                             // body still notifies ~1/s with the last bpm frozen;
                             // storing those samples poisons `hr_summary_for`
                             // (a whole workout once read `♥ 111/111`).
-                            let contact = hr_contact_tracker.observe(&m);
+                            let frame_ts_ms = Utc::now().timestamp_millis();
+                            let contact = hr_contact_tracker.observe(&m, frame_ts_ms);
                             let changed = contact != hr_contact;
                             hr_contact = contact;
                             match contact {
@@ -1066,7 +1067,7 @@ async fn stream_with_presence(
                                     if changed {
                                         info!(bpm = m.bpm, "HR sensor contact regained");
                                     }
-                                    let ts_ms = Utc::now().timestamp_millis();
+                                    let ts_ms = frame_ts_ms;
                                     store.insert_hr_sample(session_id, ts_ms, &m, &notification.value)?;
                                     state.hr_connected = true;
                                     state.last_bpm = Some(m.bpm as i64);
