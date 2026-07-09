@@ -164,7 +164,19 @@ line="$("$TM" widget 2>/dev/null || true)"
 # hr_battery_pct (empty unless read at least once), then hr_zone (empty unless
 # Zone Hold is actively correcting), then speed_kmh (empty unless `tm
 # speed-widget on` and the belt is moving — see §Speed below).
-IFS=$'\t' read -r state wcount cur_s cur_steps cur_dist day_s day_steps day_dist hr_bpm hr_batt hr_zone speed_kmh <<<"$line"
+#
+# NOT plain `IFS=$'\t' read -r ... <<<"$line"`: tab is one of the three POSIX
+# "IFS whitespace" characters (space/tab/newline), and whenever IFS consists
+# solely of such characters, `read` collapses RUNS of them and strips
+# leading/trailing occurrences — exactly like the default IFS does with
+# spaces. Any empty field in the middle (e.g. `hr_zone` empty, `hr_batt`/
+# `speed_kmh` non-empty) then silently merges with its neighbour and every
+# field after it shifts left by one — a latent bug since задача 026/027 that
+# an all-numeric/all-empty tail happened to mask, made visible once задача
+# 029 put a non-empty field after the frequently-empty `hr_zone`. Fix:
+# substitute tabs for the ASCII Unit Separator (0x1F, not in the "blank"
+# class) before splitting, so `read` treats every delimiter literally.
+IFS=$'\x1f' read -r state wcount cur_s cur_steps cur_dist day_s day_steps day_dist hr_bpm hr_batt hr_zone speed_kmh <<<"${line//$'\t'/$'\x1f'}"
 
 # Defend against a malformed line: any missing/non-numeric numeric field -> hide.
 for n in "$wcount" "$cur_s" "$cur_steps" "$cur_dist" "$day_s" "$day_steps" "$day_dist"; do
