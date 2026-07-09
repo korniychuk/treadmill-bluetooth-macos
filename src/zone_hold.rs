@@ -15,7 +15,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Fallback target zone (1-based index into the configured/default zones)
 /// when `target_zone` is absent — Zone 2 (Aerobic base), the mode's whole
@@ -169,9 +169,33 @@ pub fn find_zone<'a>(
                 .position(|z| z.id.to_lowercase() == needle)
                 .or_else(|| zones.iter().position(|z| z.name.to_lowercase() == needle))
                 .or_else(|| {
-                    zones
+                    let matches: Vec<usize> = zones
                         .iter()
-                        .position(|z| z.name.to_lowercase().contains(&needle))
+                        .enumerate()
+                        .filter(|(_, z)| z.name.to_lowercase().contains(&needle))
+                        .map(|(i, _)| i)
+                        .collect();
+                    if let Some(&first) = matches.first() {
+                        // Order-dependent when multiple names contain the needle
+                        // (задача 045) — surface so operators notice ambiguity.
+                        if matches.len() > 1 {
+                            info!(
+                                needle = %raw,
+                                first_id = %zones[first].id,
+                                match_count = matches.len(),
+                                "zone_hold: target matched by name substring (first wins)"
+                            );
+                        } else {
+                            info!(
+                                needle = %raw,
+                                id = %zones[first].id,
+                                "zone_hold: target matched by name substring"
+                            );
+                        }
+                        Some(first)
+                    } else {
+                        None
+                    }
                 })
                 .map(|index| (index + 1, &zones[index]))
         }
@@ -550,7 +574,8 @@ fn parse_zone_hold_config(raw: &str) -> ZoneHoldConfig {
         }
     };
 
-    let warmup_minutes = positive_int_or(table, "warmup_minutes", defaults.warmup_minutes);
+    // `0` is valid: skip warm-up ramp entirely (задача 045).
+    let warmup_minutes = non_negative_int_or(table, "warmup_minutes", defaults.warmup_minutes);
     let correction_interval_seconds = positive_int_or(
         table,
         "correction_interval_seconds",
@@ -566,13 +591,41 @@ fn parse_zone_hold_config(raw: &str) -> ZoneHoldConfig {
     let safety_cap_percent =
         positive_float_or(table, "safety_cap_percent", defaults.safety_cap_percent);
 
+    let raw_zone_count = table
+        .get("zones")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
     let zones = table
         .get("zones")
         .and_then(|v| v.as_array())
         .filter(|arr| !arr.is_empty())
-        .map(|arr| arr.iter().filter_map(parse_zone_def).collect::<Vec<_>>())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| match parse_zone_def(v) {
+                    Ok(z) => Some(z),
+                    Err(reason) => {
+                        let name = v
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("<unnamed>");
+                        warn!(zone = name, %reason, "zone_hold: dropping invalid zone");
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
         .filter(|zones| !zones.is_empty())
         .unwrap_or_else(default_zones);
+    if raw_zone_count > zones.len()
+        && matches!(target_zone, ZoneSelector::Number(_))
+    {
+        warn!(
+            raw = raw_zone_count,
+            kept = zones.len(),
+            "zone_hold: one or more zones dropped — 1-based target_zone numbering may have shifted"
+        );
+    }
 
     ZoneHoldConfig {
         enabled,
@@ -593,8 +646,16 @@ fn parse_zone_hold_config(raw: &str) -> ZoneHoldConfig {
     }
 }
 
-fn parse_zone_def(value: &toml::Value) -> Option<ZoneDef> {
-    let name = value.get("name")?.as_str()?.to_string();
+/// Physiological bpm bounds accepted for absolute zone config (задача 045).
+const ABSOLUTE_BPM_MIN: i64 = 30;
+const ABSOLUTE_BPM_MAX: i64 = 250;
+
+fn parse_zone_def(value: &toml::Value) -> Result<ZoneDef, String> {
+    let name = value
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "missing name".to_string())?;
     let id = value
         .get("id")
         .and_then(|v| v.as_str())
@@ -610,25 +671,41 @@ fn parse_zone_def(value: &toml::Value) -> Option<ZoneDef> {
         value.get("min_bpm").and_then(|v| v.as_integer()),
         value.get("max_bpm").and_then(|v| v.as_integer()),
     ) {
+        if !(ABSOLUTE_BPM_MIN..=ABSOLUTE_BPM_MAX).contains(&min_bpm)
+            || !(ABSOLUTE_BPM_MIN..=ABSOLUTE_BPM_MAX).contains(&max_bpm)
+        {
+            return Err(format!(
+                "absolute bpm out of range ({ABSOLUTE_BPM_MIN}-{ABSOLUTE_BPM_MAX})"
+            ));
+        }
+        if min_bpm >= max_bpm {
+            return Err("min_bpm must be < max_bpm".into());
+        }
         ZoneBounds::Absolute {
             min_bpm: min_bpm as u16,
             max_bpm: max_bpm as u16,
         }
     } else {
         let min = value
-            .get("min_percent")?
-            .as_float()
-            .or_else(|| value.get("min_percent")?.as_integer().map(|n| n as f64))?
+            .get("min_percent")
+            .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|n| n as f64)))
+            .ok_or_else(|| "missing min_percent/min_bpm pair".to_string())?
             as f32;
         let max = value
-            .get("max_percent")?
-            .as_float()
-            .or_else(|| value.get("max_percent")?.as_integer().map(|n| n as f64))?
+            .get("max_percent")
+            .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|n| n as f64)))
+            .ok_or_else(|| "missing max_percent/max_bpm pair".to_string())?
             as f32;
+        if min >= max {
+            return Err("min_percent must be < max_percent".into());
+        }
+        if !(0.0..=100.0).contains(&min) || !(0.0..=100.0).contains(&max) {
+            return Err("percent bounds must be in 0..=100".into());
+        }
         ZoneBounds::Percent { min, max }
     };
 
-    Some(ZoneDef {
+    Ok(ZoneDef {
         id,
         name,
         bounds,
@@ -661,6 +738,24 @@ fn positive_float_or(table: &toml::Value, key: &str, default: f32) -> f32 {
         None => {
             if table.get(key).is_some() {
                 warn!(key, "zone_hold config value not a number — using default");
+            }
+            default
+        }
+    }
+}
+
+/// Like [`positive_int_or`] but allows `0` (задача 045: `warmup_minutes = 0`
+/// means skip warm-up).
+fn non_negative_int_or(table: &toml::Value, key: &str, default: i64) -> i64 {
+    match table.get(key).and_then(|v| v.as_integer()) {
+        Some(n) if n >= 0 => n,
+        Some(_) => {
+            warn!(key, "zone_hold config value not non-negative — using default");
+            default
+        }
+        None => {
+            if table.get(key).is_some() {
+                warn!(key, "zone_hold config value not an integer — using default");
             }
             default
         }
@@ -822,6 +917,71 @@ mod tests {
             },
         );
         assert_eq!((low, high), (112, 131));
+    }
+
+    #[test]
+    fn parse_zone_def_rejects_inverted_and_out_of_range_bpm() {
+        let bad_order = toml::Value::try_from(toml::toml! {
+            name = "x"
+            min_bpm = 140
+            max_bpm = 100
+        })
+        .unwrap();
+        assert!(parse_zone_def(&bad_order).is_err());
+
+        let wrap = toml::Value::try_from(toml::toml! {
+            name = "y"
+            min_bpm = 70000
+            max_bpm = 70001
+        })
+        .unwrap();
+        assert!(parse_zone_def(&wrap).is_err());
+
+        let ok = toml::Value::try_from(toml::toml! {
+            name = "z"
+            min_bpm = 100
+            max_bpm = 120
+        })
+        .unwrap();
+        assert!(parse_zone_def(&ok).is_ok());
+    }
+
+    #[test]
+    fn parse_zone_hold_drops_invalid_zone_and_keeps_rest() {
+        let raw = r#"
+[zone_hold]
+enabled = true
+age = 30
+target_zone = 2
+[[zone_hold.zones]]
+name = "good"
+min_percent = 50
+max_percent = 60
+[[zone_hold.zones]]
+name = "broken"
+min_percent = 70
+# missing max_percent
+[[zone_hold.zones]]
+name = "also-good"
+min_percent = 60
+max_percent = 70
+"#;
+        let config = parse_zone_hold_config(raw);
+        assert_eq!(config.zones.len(), 2);
+        assert_eq!(config.zones[0].name, "good");
+        assert_eq!(config.zones[1].name, "also-good");
+    }
+
+    #[test]
+    fn warmup_minutes_zero_is_allowed() {
+        let raw = r#"
+[zone_hold]
+enabled = true
+age = 30
+warmup_minutes = 0
+"#;
+        let config = parse_zone_hold_config(raw);
+        assert_eq!(config.warmup_minutes, 0);
     }
 
     #[test]

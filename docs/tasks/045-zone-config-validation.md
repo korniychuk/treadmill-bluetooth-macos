@@ -1,6 +1,6 @@
 # 045 — Валидация zone-конфига: молчаливый drop зон сдвигает `target_zone`
 
-> **Статус: open**
+> **Статус: done**
 > **Источник:** [research/004](../research/004-independent-reliability-review.md) §3 N5
 > **Класс:** config semantics / silent fallback (родственно 040)
 > **Приоритет:** medium
@@ -35,11 +35,11 @@
 
 ## Acceptance
 
-- [ ] Ни один невалидный `[[zone_hold.zones]]` не исчезает без WARN
-- [ ] Дроп зоны при числовом `target_zone` даёт явный WARN о сдвиге нумерации
-- [ ] bpm-границы валидируются (range + ordering)
-- [ ] Политика `warmup_minutes=0` выбрана и протестирована
-- [ ] Существующие zone-тесты зелёные
+- [x] Ни один невалидный `[[zone_hold.zones]]` не исчезает без WARN
+- [x] Дроп зоны при числовом `target_zone` даёт явный WARN о сдвиге нумерации
+- [x] bpm-границы валидируются (range + ordering)
+- [x] Политика `warmup_minutes=0` выбрана и протестирована (`0` = skip warmup)
+- [x] Существующие zone-тесты зелёные
 
 ## Затронутые файлы
 
