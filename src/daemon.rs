@@ -1670,9 +1670,11 @@ async fn zone_hold_tick(
                             execute_control_command(peripheral, ControlCommand::Stop),
                         )
                         .await;
-                    } else {
-                        let target = (measured_speed_kmh - config.max_step_kmh * 2.0)
-                            .max(config.min_speed_kmh);
+                    } else if let Some(target) = zone_hold::safety_force_reduce_target(
+                        measured_speed_kmh,
+                        config.max_step_kmh,
+                        config.min_speed_kmh,
+                    ) {
                         warn!(
                             bpm,
                             safety_cap,
@@ -1680,6 +1682,12 @@ async fn zone_hold_tick(
                             "zone hold: safety cap exceeded — force-reducing speed"
                         );
                         apply_zone_hold_speed(peripheral, target).await;
+                    } else {
+                        // Already at floor within deadband — no write, no beep
+                        // spam every safety cooldown (задача 041 / class 030).
+                        // Transition-rate: only log when we would have written.
+                        // Floor no-ops are silent (class 030 / задача 041).
+                        let _ = (bpm, safety_cap, measured_speed_kmh);
                     }
                 }
                 zh_persist_snapshot(state, phase, &resolved, Some(bpm), measured_speed_kmh);

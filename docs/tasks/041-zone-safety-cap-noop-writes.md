@@ -1,6 +1,6 @@
 # 041 — Safety-cap force-reduce: no-op Control Point writes (030-класс на safety-пути)
 
-> **Статус: open**
+> **Статус: done**
 > **Источник:** [research/004](../research/004-independent-reliability-review.md) §3 N1
 > **Класс:** `units` / deadband (тот же, что 030)
 > **Приоритет:** high — живой воспроизводимый UX-баг, ~10 строк фикса
@@ -37,10 +37,10 @@ apply_zone_hold_speed(peripheral, target).await;   // unconditional
 
 ## Acceptance
 
-- [ ] Пин к `min_speed` при bpm ∈ (safety_cap, hard_stop] → ноль Control Point записей, ноль бипов
-- [ ] Реальный force-reduce (measured > min) работает как раньше
-- [ ] WARN не спамится каждый cooldown на «уже на полу»
-- [ ] Unit-тесты зелёные
+- [x] Пин к `min_speed` при bpm ∈ (safety_cap, hard_stop] → ноль Control Point записей, ноль бипов
+- [x] Реальный force-reduce (measured > min) работает как раньше
+- [x] WARN не спамится каждый cooldown на «уже на полу»
+- [x] Unit-тесты зелёные
 
 ## Затронутые файлы
 

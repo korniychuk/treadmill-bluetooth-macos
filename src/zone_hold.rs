@@ -418,6 +418,20 @@ pub fn next_speed(params: &ControllerParams, current_speed_kmh: f32, bpm: u16) -
     ((target - current_speed_kmh).abs() > MIN_SPEED_CHANGE_KMH).then_some(target)
 }
 
+/// Target for a safety-cap force-reduce write (задача 041): drop by `2 * max_step`,
+/// clamp to `min_speed`. Returns `None` when the computed target is within
+/// [`MIN_SPEED_CHANGE_KMH`] of the measured speed — same deadband as
+/// [`next_speed`] — so a belt already at the floor does not spam no-op Control
+/// Point writes (and double beeps) every safety cooldown.
+pub fn safety_force_reduce_target(
+    measured_speed_kmh: f32,
+    max_step_kmh: f32,
+    min_speed_kmh: f32,
+) -> Option<f32> {
+    let target = (measured_speed_kmh - max_step_kmh * 2.0).max(min_speed_kmh);
+    ((target - measured_speed_kmh).abs() > MIN_SPEED_CHANGE_KMH).then_some(target)
+}
+
 /// Per-user config path shared with `goals`/`auto_pause` (`~/.config/treadmill-
 /// bluetooth-macos/config.toml`, задача 023). Re-resolved here rather than
 /// imported so this module has no dependency on `crate::goals`'s internals —
@@ -978,6 +992,30 @@ mod tests {
         assert_eq!(next_speed(&params, DEFAULT_MAX_SPEED_KMH, 100), None);
         // Already at min, HR still high → stays pinned.
         assert_eq!(next_speed(&params, DEFAULT_MIN_SPEED_KMH, 140), None);
+    }
+
+    #[test]
+    fn safety_force_reduce_target_skips_noop_at_min() {
+        // Pinned at min → target collapses to min ≈ measured → None (задача 041).
+        assert_eq!(
+            safety_force_reduce_target(DEFAULT_MIN_SPEED_KMH, 0.3, DEFAULT_MIN_SPEED_KMH),
+            None
+        );
+        // Within deadband of min after reduce → still None.
+        assert_eq!(
+            safety_force_reduce_target(DEFAULT_MIN_SPEED_KMH + 0.02, 0.3, DEFAULT_MIN_SPEED_KMH),
+            None
+        );
+        // Real reduce: measured well above min → Some(min) when 2*step would go under.
+        assert_eq!(
+            safety_force_reduce_target(DEFAULT_MIN_SPEED_KMH + 0.3, 0.3, DEFAULT_MIN_SPEED_KMH),
+            Some(DEFAULT_MIN_SPEED_KMH)
+        );
+        // Large measured → drop by 2*step without hitting floor.
+        assert_eq!(
+            safety_force_reduce_target(4.0, 0.3, DEFAULT_MIN_SPEED_KMH),
+            Some(3.4)
+        );
     }
 
     #[test]
