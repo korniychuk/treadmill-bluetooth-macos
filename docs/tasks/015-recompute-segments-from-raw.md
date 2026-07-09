@@ -15,6 +15,9 @@ presence/credit-логику, что и живой демон.
 ## Что делаем
 
 Новая CLI-команда **`tm recompute-segments`** (read-only по BLE, как `stats`):
+- **предусловие (задача 044):** демон не должен держать свежий heartbeat —
+  иначе `DELETE`+reinsert id с 1 коллизирует с in-memory open segment; CLI
+  отказывает, пока демон жив;
 - читает все `raw_samples` в порядке `ts_ms`;
 - проигрывает **ту же** presence + credit логику, что живой демон, но по
   историческим таймстампам;
