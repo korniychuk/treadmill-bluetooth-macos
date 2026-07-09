@@ -1261,6 +1261,14 @@ fn raw_hint(show: bool, value: &str) -> String {
 /// hand. Used only to flag `daemon_status.updated_at` as possibly stale here.
 const WATCHDOG_STALE_THRESHOLD_S: i64 = 15 /* scan */ + 20 /* connect */ + 60 /* margin */;
 
+/// How old a bpm reading may be before the widget/status stop showing it
+/// (задача 033). Deliberately *not* [`WATCHDOG_STALE_THRESHOLD_S`], which is
+/// sized for "the daemon hung" (scan + connect + margin = 95s) — a pulse frozen
+/// for a minute and a half is a lie. A worn strap notifies ~1/s and the daemon's
+/// own `HR_NOTIFICATION_TIMEOUT` is 10s, so 15s covers one missed cycle and
+/// nothing more.
+const HR_STALE_THRESHOLD_S: i64 = 15;
+
 /// Print daemon/treadmill/power state and today's workouts, reading only
 /// SQLite (`daemon_status` + `activity_segments`) and `launchctl` — never
 /// touches the BLE adapter, so it cannot contend with a running daemon for it.
@@ -1517,10 +1525,9 @@ fn run_widget() -> Result<()> {
 }
 
 /// The widget's 9th field: live bpm as a plain string, or empty when the
-/// sensor isn't worn or its last reading is stale (задача 025) — same
-/// freshness threshold as the rest of the daemon heartbeat
-/// ([`WATCHDOG_STALE_THRESHOLD_S`]), so a hung daemon can't leave a frozen bpm
-/// showing forever.
+/// sensor isn't worn (`hr_connected` is cleared on both link loss and skin
+/// contact loss — задачи 025/033) or its last reading is stale, so a hung
+/// daemon can't leave a frozen bpm showing forever.
 fn widget_hr_field(status: &store::DaemonStatus) -> String {
     if !status.hr_connected {
         return String::new();
@@ -1528,7 +1535,7 @@ fn widget_hr_field(status: &store::DaemonStatus) -> String {
     match (status.last_bpm, status.last_bpm_ts) {
         (Some(bpm), Some(ts_ms)) => {
             let age_s = (Utc::now().timestamp_millis() - ts_ms) / 1000;
-            if age_s <= WATCHDOG_STALE_THRESHOLD_S {
+            if age_s <= HR_STALE_THRESHOLD_S {
                 bpm.to_string()
             } else {
                 String::new()
@@ -1882,6 +1889,40 @@ mod tests {
         assert_eq!(format_speed_kmh(3.0), "3kmh");
         assert_eq!(format_speed_kmh(2.96), "3kmh");
         assert_eq!(format_speed_kmh(0.04), "0kmh");
+    }
+
+    /// A status with a bpm reading `age_s` seconds old (задача 033).
+    fn status_with_bpm(hr_connected: bool, age_s: i64) -> store::DaemonStatus {
+        store::DaemonStatus {
+            hr_connected,
+            last_bpm: Some(111),
+            last_bpm_ts: Some(Utc::now().timestamp_millis() - age_s * 1000),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn widget_hr_field_shows_a_fresh_bpm_from_a_worn_sensor() {
+        assert_eq!(widget_hr_field(&status_with_bpm(true, 1)), "111");
+        assert_eq!(
+            widget_hr_field(&status_with_bpm(true, HR_STALE_THRESHOLD_S)),
+            "111"
+        );
+    }
+
+    /// Contact loss clears `hr_connected` in the daemon, and a hung daemon is
+    /// caught by the age check — both must blank the heart glyph.
+    #[test]
+    fn widget_hr_field_is_empty_when_disconnected_or_stale() {
+        assert_eq!(widget_hr_field(&status_with_bpm(false, 1)), "");
+        assert_eq!(
+            widget_hr_field(&status_with_bpm(true, HR_STALE_THRESHOLD_S + 1)),
+            ""
+        );
+        // A bpm older than the HR threshold but younger than the old watchdog
+        // one is exactly the regression задача 033 fixes.
+        const { assert!(HR_STALE_THRESHOLD_S < WATCHDOG_STALE_THRESHOLD_S) };
+        assert_eq!(widget_hr_field(&status_with_bpm(true, 60)), "");
     }
 
     fn workout_ending_at(ended_at: &str) -> store::Workout {

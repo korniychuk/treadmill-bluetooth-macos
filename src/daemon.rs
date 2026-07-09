@@ -632,6 +632,12 @@ async fn stream_with_presence(
     let mut hr_battery_pct: Option<u8> = None;
     let mut hr_battery_last_read: Option<Instant> = None;
     let mut hr_battery_check_tick = tokio::time::interval(HR_BATTERY_CHECK_INTERVAL);
+    // Contact state, tracked separately from the BLE link (задача 033): a strap
+    // taken off keeps notifying with a frozen bpm, so the link says "connected"
+    // while the reading is meaningless. The tracker is per-link — reset with the
+    // rest of the HR state whenever the link dies.
+    let mut hr_contact_tracker = hr::ContactTracker::default();
+    let mut hr_contact = hr::Contact::Live;
 
     // Deadline anchor for the telemetry-silence arm below (задача 031); advanced
     // only by a decoded `0x2ACD` frame, never by HR/control/config activity.
@@ -1014,6 +1020,9 @@ async fn stream_with_presence(
                     Some(HrConnectOutcome::Connected(peripheral, stream, battery_pct)) => {
                         info!(?battery_pct, "HR sensor connected and streaming");
                         state.hr_connected = true;
+                        // Fresh link ⇒ fresh contact evidence (задача 033).
+                        hr_contact_tracker = hr::ContactTracker::default();
+                        hr_contact = hr::Contact::Live;
                         hr_notifications = Some(stream);
                         hr_peripheral = Some(peripheral);
                         hr_battery_pct = battery_pct;
@@ -1045,12 +1054,45 @@ async fn stream_with_presence(
                 match hr_result {
                     Ok(Some(notification)) if notification.uuid == hr::HEART_RATE_MEASUREMENT => {
                         if let Some(m) = hr::parse_hr_measurement(&notification.value) {
-                            let ts_ms = Utc::now().timestamp_millis();
-                            store.insert_hr_sample(session_id, ts_ms, &m, &notification.value)?;
-                            state.hr_connected = true;
-                            state.last_bpm = Some(m.bpm as i64);
-                            state.last_bpm_ts = Some(ts_ms);
-                            state.persist(store, watchdog)?;
+                            // Contact, not link (задача 033). A strap off the
+                            // body still notifies ~1/s with the last bpm frozen;
+                            // storing those samples poisons `hr_summary_for`
+                            // (a whole workout once read `♥ 111/111`).
+                            let contact = hr_contact_tracker.observe(&m);
+                            let changed = contact != hr_contact;
+                            hr_contact = contact;
+                            match contact {
+                                hr::Contact::Live => {
+                                    if changed {
+                                        info!(bpm = m.bpm, "HR sensor contact regained");
+                                    }
+                                    let ts_ms = Utc::now().timestamp_millis();
+                                    store.insert_hr_sample(session_id, ts_ms, &m, &notification.value)?;
+                                    state.hr_connected = true;
+                                    state.last_bpm = Some(m.bpm as i64);
+                                    state.last_bpm_ts = Some(ts_ms);
+                                    state.persist(store, watchdog)?;
+                                }
+                                hr::Contact::Lost => {
+                                    // Log the transition, not every frame: the
+                                    // strap can sit on the desk for hours.
+                                    if changed {
+                                        warn!(
+                                            frozen_bpm = m.bpm,
+                                            "HR sensor lost skin contact — dropping samples, keeping the BLE link"
+                                        );
+                                        // The link stays up on purpose: putting
+                                        // the strap back on recovers instantly,
+                                        // with no 15s rescan. Battery (задача
+                                        // 026) is a property of the link, so it
+                                        // survives too.
+                                        state.hr_connected = false;
+                                        state.last_bpm = None;
+                                        state.last_bpm_ts = None;
+                                        state.persist(store, watchdog)?;
+                                    }
+                                }
+                            }
                         }
                     }
                     Ok(Some(_)) => {} // notification for a characteristic we don't track
@@ -1058,6 +1100,8 @@ async fn stream_with_presence(
                         warn!("HR notification stream ended — sensor likely removed");
                         hr_notifications = None;
                         state.hr_connected = false;
+                        hr_contact_tracker = hr::ContactTracker::default();
+                        hr_contact = hr::Contact::Live;
                         hr_battery_pct = None;
                         hr_battery_last_read = None;
                         state.hr_battery_pct = None;
@@ -1070,6 +1114,8 @@ async fn stream_with_presence(
                         warn!(timeout_s = HR_NOTIFICATION_TIMEOUT.as_secs(), "no HR telemetry received — treating sensor as removed");
                         hr_notifications = None;
                         state.hr_connected = false;
+                        hr_contact_tracker = hr::ContactTracker::default();
+                        hr_contact = hr::Contact::Live;
                         hr_battery_pct = None;
                         hr_battery_last_read = None;
                         state.hr_battery_pct = None;

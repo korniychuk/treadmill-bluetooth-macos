@@ -92,7 +92,7 @@ pub struct Workout {
 /// change). Exists so a separate `status` CLI invocation (which must not
 /// itself open the BLE adapter) can report state without racing the daemon
 /// for the adapter. See `docs/tasks/006-...md`, задача B.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DaemonStatus {
     pub connected: bool,
     pub presence_state: Option<String>,
