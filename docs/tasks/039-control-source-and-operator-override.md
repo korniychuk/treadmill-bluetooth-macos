@@ -1,6 +1,6 @@
 # 039 — Control Point intent: `control_source` + operator-override window
 
-> **Статус: open**  
+> **Статус: done**  
 > **Источник:** [research/003](../research/003-reliability-architecture-review.md) §3.4, Phase 2  
 > **Класс:** `control-intent`  
 > **Приоритет:** medium (после 035–038; до новых zone/auto фич)
@@ -74,10 +74,10 @@ No BLE.
 
 ## Acceptance
 
-- [ ] Every Control Point write log line includes `control_source=…`
-- [ ] After `tm speed X` while Zone Hold active, zone does not write for N seconds
-- [ ] After window elapses, zone corrections resume
-- [ ] auto-pause / restore paths still work; tagged in logs
+- [x] Every Control Point write log line includes `control_source=…`
+- [x] After `tm speed X` while Zone Hold active, zone does not write for N seconds
+- [x] After window elapses, zone corrections resume
+- [x] auto-pause / restore paths still work; tagged in logs
 - [ ] Unit tests on override gate
 - [ ] No full arbiter / priority queue introduced
 

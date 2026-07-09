@@ -194,6 +194,39 @@ const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
 /// spell. A *successful* pause is one-shot per spell (no cooldown needed).
 const AUTO_PAUSE_RETRY_COOLDOWN: Duration = Duration::from_secs(15);
 
+/// How long after a successful CLI `tm speed` Zone Hold must not write belt
+/// speed (задача 039). In-memory only — not persisted across daemon restarts.
+const OPERATOR_OVERRIDE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Who initiated a Control Point write (задача 039). Logged on every write so
+/// mid-Hold CLI speed overrides are diagnosable; not a priority arbiter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlSource {
+    Zone,
+    Cli,
+    AutoPause,
+    Restore,
+    DefaultSpeed,
+}
+
+impl ControlSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Zone => "zone",
+            Self::Cli => "cli",
+            Self::AutoPause => "auto_pause",
+            Self::Restore => "restore",
+            Self::DefaultSpeed => "default_speed",
+        }
+    }
+}
+
+/// Pure gate: Zone Hold speed writes are suppressed while operator override
+/// window is open (задача 039).
+fn operator_override_active(now: Instant, until: Option<Instant>) -> bool {
+    until.is_some_and(|u| now < u)
+}
+
 /// How long to wait for the next Heart Rate Measurement notification before
 /// treating the strap as removed/lost (задача 025). A worn H10 sends samples
 /// ~1/s, same cadence as the treadmill's own telemetry; generous margin above
@@ -619,6 +652,8 @@ async fn stream_with_presence(
     let mut zh_phase = ZoneHoldPhase::Off;
     let mut zh_last_correction_at: Option<Instant> = None;
     let mut zh_last_safety_write_at: Option<Instant> = None;
+    // After CLI `tm speed`, suppress zone speed writes for this window (задача 039).
+    let mut operator_override_until: Option<Instant> = None;
     // Backstop poll for queued control commands during quiet stretches; the
     // primary check runs at the end of each telemetry sample below (задача 013).
     let mut command_tick = tokio::time::interval(CONTROL_POLL_INTERVAL);
@@ -885,12 +920,20 @@ async fn stream_with_presence(
                     if auto_pause_due(config.auto_pause, away_for, auto_pause_fired, since_last_attempt) {
                         match tokio::time::timeout(
                             SPEED_RESTORE_TIMEOUT,
-                            execute_control_command(peripheral, ControlCommand::Stop),
+                            execute_control_command(
+                                peripheral,
+                                ControlCommand::Stop,
+                                ControlSource::AutoPause,
+                            ),
                         )
                         .await
                         {
                             Ok(Ok(())) => {
-                                info!(away_s = away_for.as_secs(), "auto-paused idle belt after inactivity threshold");
+                                info!(
+                                    away_s = away_for.as_secs(),
+                                    control_source = ControlSource::AutoPause.as_str(),
+                                    "auto-paused idle belt after inactivity threshold"
+                                );
                                 auto_pause_fired = true;
                                 notify::auto_paused(away_for);
                             }
@@ -937,6 +980,7 @@ async fn stream_with_presence(
                                 &mut zh_last_safety_write_at,
                                 Instant::now(),
                                 state,
+                                operator_override_until,
                             )
                             .await;
                         }
@@ -968,10 +1012,14 @@ async fn stream_with_presence(
                 // connected, so this bounds command latency to ≤1s during an
                 // active session (задача 013). The interval arm below is only a
                 // backstop for quiet stretches.
-                process_control_commands(peripheral, store).await?;
+                if process_control_commands(peripheral, store).await? {
+                    operator_override_until = Some(Instant::now() + OPERATOR_OVERRIDE_WINDOW);
+                }
             }
             _ = command_tick.tick() => {
-                process_control_commands(peripheral, store).await?;
+                if process_control_commands(peripheral, store).await? {
+                    operator_override_until = Some(Instant::now() + OPERATOR_OVERRIDE_WINDOW);
+                }
             }
             _ = config_tick.tick() => {
                 // Reload config only when config.json actually changed on disk —
@@ -1303,12 +1351,14 @@ async fn try_restore_speed(
         return None;
     };
     let target = speed_restore_target(pre_pause, resumed_kmh)?;
+    let source = ControlSource::Restore;
 
     match tokio::time::timeout(SPEED_RESTORE_TIMEOUT, restore_speed(peripheral, target)).await {
         Ok(Ok(())) => {
             info!(
                 from = resumed_kmh,
                 to = target,
+                control_source = source.as_str(),
                 "restored pre-pause belt speed on resume"
             );
             Some(notify::SpeedRestore {
@@ -1317,13 +1367,15 @@ async fn try_restore_speed(
             })
         }
         Ok(Err(err)) => {
-            warn!(%err, target, "failed to restore pre-pause speed — leaving resume toast without the restore line");
+            warn!(%err, target, control_source = source.as_str(), "failed to restore pre-pause speed — leaving resume toast without the restore line");
             None
         }
         Err(_) => {
             warn!(
                 timeout_s = SPEED_RESTORE_TIMEOUT.as_secs(),
-                target, "speed restore timed out (possible CoreBluetooth hang)"
+                target,
+                control_source = source.as_str(),
+                "speed restore timed out (possible CoreBluetooth hang)"
             );
             None
         }
@@ -1387,23 +1439,27 @@ async fn try_apply_default_speed(
     // One attempt per session regardless of the write outcome (a failed write
     // must not loop on a presence flap at the crawl start).
     *applied = true;
+    let source = ControlSource::DefaultSpeed;
     match tokio::time::timeout(SPEED_RESTORE_TIMEOUT, restore_speed(peripheral, target)).await {
         Ok(Ok(())) => {
             info!(
                 from = resumed_kmh,
                 to = target,
+                control_source = source.as_str(),
                 "applied computed default belt speed at workout start"
             );
             Some(target)
         }
         Ok(Err(err)) => {
-            warn!(%err, target, "failed to apply default belt speed at workout start — leaving belt as is");
+            warn!(%err, target, control_source = source.as_str(), "failed to apply default belt speed at workout start — leaving belt as is");
             None
         }
         Err(_) => {
             warn!(
                 timeout_s = SPEED_RESTORE_TIMEOUT.as_secs(),
-                target, "default belt speed write timed out (possible CoreBluetooth hang)"
+                target,
+                control_source = source.as_str(),
+                "default belt speed write timed out (possible CoreBluetooth hang)"
             );
             None
         }
@@ -1593,6 +1649,7 @@ async fn zone_hold_tick(
     last_safety_write_at: &mut Option<Instant>,
     now: Instant,
     state: &mut DaemonState,
+    operator_override_until: Option<Instant>,
 ) {
     // A function that writes to the belt owns the check of its own enable flag
     // (задача 032). The call site gates on this too; both stay, so no future
@@ -1610,6 +1667,8 @@ async fn zone_hold_tick(
     let Some(measured_speed_kmh) = measured_speed_kmh else {
         return;
     };
+
+    let zone_writes_suppressed = operator_override_active(now, operator_override_until);
 
     let correction_interval = Duration::from_secs(config.correction_interval_seconds as u64);
     let correction_due = |last: Option<Instant>| {
@@ -1642,7 +1701,7 @@ async fn zone_hold_tick(
                     warmup,
                 );
                 if (target - measured_speed_kmh).abs() > SPEED_RESTORE_EPSILON_KMH {
-                    apply_zone_hold_speed(peripheral, target).await;
+                    apply_zone_hold_speed(peripheral, target, zone_writes_suppressed).await;
                 }
                 *last_correction_at = Some(now);
             }
@@ -1668,9 +1727,14 @@ async fn zone_hold_tick(
                             hard_stop,
                             "zone hold: safety cap exceeded at min speed — stopping belt"
                         );
+                        // Hard-stop is safety — not suppressed by operator override.
                         let _ = tokio::time::timeout(
                             SPEED_RESTORE_TIMEOUT,
-                            execute_control_command(peripheral, ControlCommand::Stop),
+                            execute_control_command(
+                                peripheral,
+                                ControlCommand::Stop,
+                                ControlSource::Zone,
+                            ),
                         )
                         .await;
                     } else if let Some(target) = zone_hold::safety_force_reduce_target(
@@ -1684,7 +1748,7 @@ async fn zone_hold_tick(
                             target,
                             "zone hold: safety cap exceeded — force-reducing speed"
                         );
-                        apply_zone_hold_speed(peripheral, target).await;
+                        apply_zone_hold_speed(peripheral, target, zone_writes_suppressed).await;
                     }
                     // else: already at min within deadband — no write (задача 041).
                 }
@@ -1703,7 +1767,7 @@ async fn zone_hold_tick(
                         max_speed_kmh: resolved.effective_max_speed_kmh,
                     };
                     if let Some(target) = zone_hold::next_speed(&params, measured_speed_kmh, bpm) {
-                        apply_zone_hold_speed(peripheral, target).await;
+                        apply_zone_hold_speed(peripheral, target, zone_writes_suppressed).await;
                     }
                 }
                 // No bpm this tick (sensor stale/lost) — nothing to correct on;
@@ -1749,16 +1813,36 @@ fn zh_persist_snapshot(
 /// [`restore_speed`]/[`SPEED_RESTORE_TIMEOUT`] round-trip (задачи 007/012). A
 /// failed/timed-out write is logged, not propagated — the same "never tear
 /// down the session over a convenience write" rule as `try_restore_speed`/
-/// `try_apply_default_speed`.
-async fn apply_zone_hold_speed(peripheral: &Peripheral, target_kmh: f32) {
+/// `try_apply_default_speed`. When `suppressed` (operator override window,
+/// задача 039), skip the write and log once at this call site.
+async fn apply_zone_hold_speed(peripheral: &Peripheral, target_kmh: f32, suppressed: bool) {
+    let source = ControlSource::Zone;
+    if suppressed {
+        info!(
+            target = target_kmh,
+            control_source = source.as_str(),
+            "zone hold: suppressed, operator override active"
+        );
+        return;
+    }
     match tokio::time::timeout(SPEED_RESTORE_TIMEOUT, restore_speed(peripheral, target_kmh)).await {
-        Ok(Ok(())) => info!(target = target_kmh, "zone hold: applied speed correction"),
+        Ok(Ok(())) => info!(
+            target = target_kmh,
+            control_source = source.as_str(),
+            "zone hold: applied speed correction"
+        ),
         Ok(Err(err)) => {
-            warn!(%err, target = target_kmh, "zone hold: speed correction write failed")
+            warn!(
+                %err,
+                target = target_kmh,
+                control_source = source.as_str(),
+                "zone hold: speed correction write failed"
+            )
         }
         Err(_) => warn!(
             timeout_s = SPEED_RESTORE_TIMEOUT.as_secs(),
             target = target_kmh,
+            control_source = source.as_str(),
             "zone hold: speed correction timed out (possible CoreBluetooth hang)"
         ),
     }
@@ -1792,6 +1876,9 @@ fn celebrate_reached_goals(store: &Store, step_goals: &[Goal]) -> Result<()> {
 /// Execute at most one pending control command on the live BLE link (задача
 /// 013). Silent on the empty path — this runs ~1/s, so no happy-path log.
 ///
+/// Returns `true` when a successful CLI `Speed` ran (задача 039 — open the
+/// operator-override window so Zone Hold does not immediately overwrite it).
+///
 /// Two safety properties: a *stale* command (queued long ago, or while the
 /// daemon was disconnected) is failed without executing, so it can never fire
 /// a surprise belt change when the daemon reconnects/restarts; and a failed or
@@ -1802,51 +1889,73 @@ fn celebrate_reached_goals(store: &Store, step_goals: &[Goal]) -> Result<()> {
 /// Drains one command per call so a burst cannot block the select loop for
 /// N×[`SPEED_RESTORE_TIMEOUT`] (reused here — the same bounded Control Point
 /// round-trip); the next is picked up on the following tick.
-async fn process_control_commands(peripheral: &Peripheral, store: &Store) -> Result<()> {
+async fn process_control_commands(peripheral: &Peripheral, store: &Store) -> Result<bool> {
     let Some(queued) = store.next_pending_control_command()? else {
-        return Ok(());
+        return Ok(false);
     };
 
     if control_command::is_stale(queued.created_at, Utc::now()) {
         warn!(id = queued.id, command = %queued.command.to_wire(), "control command is stale — failing without executing");
         store.mark_control_command_failed(queued.id, "stale, not executed")?;
-        return Ok(());
+        return Ok(false);
     }
 
+    let source = ControlSource::Cli;
+    let was_speed = matches!(queued.command, ControlCommand::Speed(_));
+    let command_wire = queued.command.to_wire();
     match tokio::time::timeout(
         SPEED_RESTORE_TIMEOUT,
-        execute_control_command(peripheral, queued.command),
+        execute_control_command(peripheral, queued.command, source),
     )
     .await
     {
         Ok(Ok(())) => {
-            info!(id = queued.id, command = %queued.command.to_wire(), "executed queued control command");
+            info!(
+                id = queued.id,
+                command = %command_wire,
+                control_source = source.as_str(),
+                "executed queued control command"
+            );
             store.mark_control_command_done(queued.id)?;
+            Ok(was_speed)
         }
         Ok(Err(err)) => {
-            warn!(%err, id = queued.id, command = %queued.command.to_wire(), "queued control command write failed");
+            warn!(
+                %err,
+                id = queued.id,
+                command = %command_wire,
+                control_source = source.as_str(),
+                "queued control command write failed"
+            );
             store.mark_control_command_failed(queued.id, &err.to_string())?;
+            Ok(false)
         }
         Err(_) => {
             warn!(
                 id = queued.id,
                 timeout_s = SPEED_RESTORE_TIMEOUT.as_secs(),
+                control_source = source.as_str(),
                 "queued control command timed out (possible CoreBluetooth hang)"
             );
             store.mark_control_command_failed(
                 queued.id,
                 "execution timed out (possible CoreBluetooth hang)",
             )?;
+            Ok(false)
         }
     }
-    Ok(())
 }
 
 /// Take FTMS control and run one command. Split out so the whole round-trip can
 /// be wrapped in a single bounded `timeout` by the caller. Reuses the same
 /// take-control path as `restore_speed` and any other Control Point write (see
-/// `control::Controller`).
-async fn execute_control_command(peripheral: &Peripheral, command: ControlCommand) -> Result<()> {
+/// `control::Controller`). `source` is for call-site logging only — this
+/// function does not log (the caller owns success/fail messages).
+async fn execute_control_command(
+    peripheral: &Peripheral,
+    command: ControlCommand,
+    _source: ControlSource,
+) -> Result<()> {
     let controller = Controller::take_control(peripheral).await?;
     match command {
         ControlCommand::Start => controller.start().await,
@@ -2254,6 +2363,17 @@ mod tests {
             HR_NOTIFICATION_TIMEOUT,
             "HR deadline must land exactly at the timeout, not drift with the sibling"
         );
+    }
+
+    #[test]
+    fn operator_override_active_within_window() {
+        let now = Instant::now();
+        assert!(!operator_override_active(now, None));
+        assert!(operator_override_active(now, Some(now + Duration::from_secs(30))));
+        assert!(!operator_override_active(
+            now + Duration::from_secs(61),
+            Some(now + Duration::from_secs(60))
+        ));
     }
 
     #[test]
