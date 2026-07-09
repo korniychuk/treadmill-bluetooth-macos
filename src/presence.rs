@@ -25,6 +25,20 @@ pub enum PresenceState {
     Paused,
 }
 
+impl PresenceState {
+    /// Stable wire label for `daemon_status.presence_state` / widget (задача 047).
+    /// Prefer this over `Debug` so rename of the enum cannot silently change the
+    /// SQLite contract.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::Walking => "Walking",
+            Self::AwayWhileRunning => "AwayWhileRunning",
+            Self::Paused => "Paused",
+        }
+    }
+}
+
 /// Tracks the last seen step count and derives [`PresenceState`] transitions.
 pub struct PresenceTracker {
     state: PresenceState,

@@ -409,7 +409,7 @@ fn run_notify_test() -> Result<()> {
     // table. Sample durations/goals are illustrative — this path never touches
     // BLE or the real presence state.
     let sample_away = std::time::Duration::from_secs(157);
-    let toasts: [(&str, &dyn Fn()); 10] = [
+    let toasts: [(&str, &dyn Fn()); 11] = [
         ("found", &notify::treadmill_found),
         ("lost", &notify::treadmill_lost),
         ("away", &notify::walker_away),
@@ -418,6 +418,10 @@ fn run_notify_test() -> Result<()> {
             &(|| notify::walker_resumed(Some(sample_away))),
         ),
         ("paused", &notify::treadmill_paused),
+        (
+            "auto-paused (idle belt)",
+            &(|| notify::auto_paused(sample_away)),
+        ),
         (
             "resumed (from pause, duration + speed restore)",
             &(|| {
@@ -1846,7 +1850,13 @@ fn widget_state(presence_state: Option<&str>) -> &'static str {
         Some("Walking") => "walking",
         Some("AwayWhileRunning") => "away",
         Some("Paused") => "paused",
-        _ => "unknown",
+        Some("Unknown") | None => "unknown",
+        Some(other) => {
+            // Edge case: schema drift or a writer that skipped `PresenceState::wire`
+            // (задача 047). Log once per call path is fine — widget polls every 2s.
+            tracing::warn!(value = other, "widget: unrecognised presence_state — treating as unknown");
+            "unknown"
+        }
     }
 }
 

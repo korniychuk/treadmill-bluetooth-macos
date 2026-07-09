@@ -230,3 +230,25 @@ fn hex(bytes: &[u8]) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_round_trips_through_parse() {
+        let payload = [0x02, 0x01, 0x19, 0x00];
+        let framed = frame(&payload);
+        assert_eq!(parse_frame(&framed), Some(payload.as_slice()));
+    }
+
+    #[test]
+    fn parse_frame_rejects_bad_xor_and_short() {
+        assert!(parse_frame(&[]).is_none());
+        assert!(parse_frame(&[0x02, 0x01]).is_none());
+        let mut bad = frame(&[0x01, 0x02]);
+        let last = bad.len() - 2;
+        bad[last] ^= 0xff;
+        assert!(parse_frame(&bad).is_none());
+    }
+}

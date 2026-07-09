@@ -807,7 +807,7 @@ async fn stream_with_presence(
                 let prev_state = accumulator.state();
                 if let Some(next_state) = accumulator.observe(Instant::now(), data.speed_kmh, data.steps) {
                     info!(?prev_state, ?next_state, "presence transition");
-                    state.presence_state = Some(format!("{next_state:?}"));
+                    state.presence_state = Some(next_state.wire().to_string());
                     // Belt speed as Zone Hold should see it below: starts as this
                     // sample's raw telemetry (`None` when MORE_DATA omits speed —
                     // never fabricate 0.0, задача 036), but a restore/default-speed
@@ -912,11 +912,17 @@ async fn stream_with_presence(
                     // above that may have just written a default/restored speed —
                     // the raw telemetry sample still reflects the pre-write crawl.
                     let zh_resumed_kmh = zh_effective_speed_kmh;
-                    let zh_default_kmh = default_speed::compute_default_speed(store, goals::load_workout_gap_minutes())
-                        .ok()
-                        .flatten()
-                        .map(|d| d.kmh)
-                        .unwrap_or(config.zone_hold.min_speed_kmh);
+                    // Default-speed DB scan only needed when Zone Hold will engage
+                    // (задача 047) — skip the history query when disabled.
+                    let zh_default_kmh = if config.zone_hold.enabled {
+                        default_speed::compute_default_speed(store, goals::load_workout_gap_minutes())
+                            .ok()
+                            .flatten()
+                            .map(|d| d.kmh)
+                            .unwrap_or(config.zone_hold.min_speed_kmh)
+                    } else {
+                        config.zone_hold.min_speed_kmh
+                    };
                     zone_hold_on_transition(
                         &mut zh_phase,
                         prev_state,

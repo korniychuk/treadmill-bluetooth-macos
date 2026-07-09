@@ -98,7 +98,9 @@ pub fn trimmed_mean_speed(
     if walking.is_empty() {
         return None;
     }
-    walking.sort_by(|a, b| a.partial_cmp(b).expect("belt speeds are never NaN"));
+    // total_cmp is panic-free on NaN (задача 047); external float data must not
+    // be able to crash the default-speed path.
+    walking.sort_by(|a, b| a.total_cmp(b));
 
     let n = walking.len();
     let trim = (n as f32 * trim_fraction).floor() as usize;

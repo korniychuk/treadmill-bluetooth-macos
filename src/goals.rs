@@ -155,13 +155,18 @@ enum GapSetting {
     Unset,
 }
 
+/// One read+parse of the config file (задача 047). Shared by the top-level
+/// key readers so a single widget tick does not open/parse the same path up
+/// to four times with four independent silent-fallback surfaces.
+fn read_config_value(path: &std::path::Path) -> Option<toml::Value> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    toml::from_str(&raw).ok()
+}
+
 /// Read `workout_gap_minutes` from the per-user config. Pure and unit-tested —
 /// the logging/fallback decision lives in [`load_workout_gap_minutes`].
 fn read_workout_gap_minutes(path: &std::path::Path) -> GapSetting {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return GapSetting::Invalid;
-    };
-    let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
+    let Some(value) = read_config_value(path) else {
         return GapSetting::Invalid;
     };
     match value.get("workout_gap_minutes") {
@@ -218,10 +223,7 @@ enum AutoPauseSetting {
 /// Read `auto_pause_minutes` from the per-user config. Pure and unit-tested —
 /// the logging/fallback decision lives in [`load_auto_pause`].
 fn read_auto_pause_minutes(path: &std::path::Path) -> AutoPauseSetting {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return AutoPauseSetting::Invalid;
-    };
-    let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
+    let Some(value) = read_config_value(path) else {
         return AutoPauseSetting::Invalid;
     };
     match value.get("auto_pause_minutes") {
@@ -279,10 +281,7 @@ enum ShowSpeedSetting {
 /// Read `show_speed` from the per-user config. Pure and unit-tested — the
 /// logging/fallback decision lives in [`load_show_speed`].
 fn read_show_speed(path: &std::path::Path) -> ShowSpeedSetting {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return ShowSpeedSetting::Invalid;
-    };
-    let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
+    let Some(value) = read_config_value(path) else {
         return ShowSpeedSetting::Invalid;
     };
     match value.get("show_speed") {
