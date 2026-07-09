@@ -721,6 +721,12 @@ async fn stream_with_presence(
                 if let Some(next_state) = accumulator.observe(Instant::now(), data.speed_kmh, data.steps) {
                     info!(?prev_state, ?next_state, "presence transition");
                     state.presence_state = Some(format!("{next_state:?}"));
+                    // Belt speed as Zone Hold should see it below: starts as this
+                    // sample's raw telemetry, but a restore/default-speed write in
+                    // this very match (below) lands *after* that sample was taken —
+                    // update it whenever one of those writes actually fires, so a
+                    // fresh Ramp doesn't start from the pre-write crawl it just left.
+                    let mut zh_effective_speed_kmh = data.speed_kmh.unwrap_or(0.0);
                     match next_state {
                         PresenceState::AwayWhileRunning => {
                             away_since = Some(Instant::now());
@@ -741,13 +747,19 @@ async fn stream_with_presence(
                                 // A real captured walking speed → restore it (задача 012).
                                 Some(pre) => {
                                     let restore = try_restore_speed(peripheral, Some(pre), resumed_speed).await;
+                                    if let Some(r) = &restore {
+                                        zh_effective_speed_kmh = r.to_kmh;
+                                    }
                                     notify::treadmill_resumed(paused_for, restore);
                                 }
                                 // Nothing to restore → this is a fresh start/reset at the
                                 // device crawl (scenarios 2 & 3, задача 016): apply the
                                 // computed default. Only toasts when it actually applied.
                                 None => match try_apply_default_speed(peripheral, store, resumed_speed, &mut default_speed_applied).await {
-                                    Some(applied) => notify::default_speed_applied(resumed_speed, applied),
+                                    Some(applied) => {
+                                        zh_effective_speed_kmh = applied;
+                                        notify::default_speed_applied(resumed_speed, applied);
+                                    }
                                     None => notify::treadmill_resumed(paused_for, None),
                                 },
                             }
@@ -760,6 +772,7 @@ async fn stream_with_presence(
                             if let Some(applied) =
                                 try_apply_default_speed(peripheral, store, resumed_speed, &mut default_speed_applied).await
                             {
+                                zh_effective_speed_kmh = applied;
                                 notify::default_speed_applied(resumed_speed, applied);
                             }
                         }
@@ -794,7 +807,11 @@ async fn stream_with_presence(
                     // restored by that code, so Zone Hold's grace window starts
                     // from the *restored* speed, not the crawl (task doc §Сход с
                     // ленты: "Zone Hold не дублирует restore — переиспользует его").
-                    let zh_resumed_kmh = data.speed_kmh.unwrap_or(0.0);
+                    // Use `zh_effective_speed_kmh`, not the raw sample: a fresh
+                    // Ramp (first arrival at Walking) engages in the same match
+                    // above that may have just written a default/restored speed —
+                    // the raw telemetry sample still reflects the pre-write crawl.
+                    let zh_resumed_kmh = zh_effective_speed_kmh;
                     let zh_default_kmh = default_speed::compute_default_speed(store, goals::load_workout_gap_minutes())
                         .ok()
                         .flatten()
@@ -1343,7 +1360,14 @@ fn zone_hold_on_transition(
         return;
     }
     match (prev_state, next_state) {
-        (PresenceState::Unknown, PresenceState::Walking) => {
+        // Any first arrival at Walking while still Off engages a fresh warm-up
+        // ramp — not just Unknown→Walking. A freshly (re)connected session
+        // often observes Unknown→Paused (belt not moving yet on the first
+        // sample) before Paused→Walking (first steps), so gating strictly on
+        // `prev_state == Unknown` left Zone Hold permanently stuck at `Off`
+        // for the rest of that session (the periodic config-reload catch-up
+        // only re-engages on an actual on-disk edit, not as a self-heal poll).
+        (_, PresenceState::Walking) if *phase == ZoneHoldPhase::Off => {
             let target = default_kmh.clamp(config.min_speed_kmh, config.max_speed_kmh);
             *phase = ZoneHoldPhase::Ramp {
                 started_at: now,
@@ -1353,9 +1377,7 @@ fn zone_hold_on_transition(
             info!(target, "zone hold: engaged, starting warm-up ramp");
         }
         (PresenceState::Paused, PresenceState::Walking)
-        | (PresenceState::AwayWhileRunning, PresenceState::Walking)
-            if *phase != ZoneHoldPhase::Off =>
-        {
+        | (PresenceState::AwayWhileRunning, PresenceState::Walking) => {
             let grace = Duration::from_secs(config.reentry_grace_seconds as u64);
             *phase = ZoneHoldPhase::Grace { until: now + grace };
             info!(
