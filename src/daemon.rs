@@ -891,7 +891,7 @@ async fn stream_with_presence(
                 // ramp phase ignores anyway and the hold phase treats as
                 // "nothing to correct on" — the freeze behaviour the task doc
                 // asks for, without a separate code path.
-                if zh_phase != ZoneHoldPhase::Off {
+                if should_run_zone_hold(config.zone_hold.enabled, &zh_phase) {
                     match config.zone_hold.resolve_target_zone() {
                         Some(resolved) => {
                             let zh_bpm = state.hr_connected.then_some(state.last_bpm).flatten().map(|b| b as u16);
@@ -913,19 +913,13 @@ async fn stream_with_presence(
                             // Config edited mid-session (e.g. age removed) —
                             // nothing left to compute a target zone from.
                             warn!("zone_hold: target zone no longer resolvable — disengaging");
-                            zh_phase = ZoneHoldPhase::Off;
-                            state.zone_hold_active = false;
-                            state.zone_hold_phase = Some("off".to_string());
-                            state.zone_hold_target_lo = None;
-                            state.zone_hold_target_hi = None;
-                            state.zone_hold_position = None;
+                            disengage_zone_hold(&mut zh_phase, state);
                         }
                     }
-                } else if state.zone_hold_active {
-                    // Just disabled/disengaged — clear the stale snapshot.
-                    state.zone_hold_active = false;
-                    state.zone_hold_phase = Some("off".to_string());
-                    state.zone_hold_position = None;
+                } else if zh_phase != ZoneHoldPhase::Off || state.zone_hold_active {
+                    // Disabled in config while a phase was still live, or simply
+                    // a stale snapshot left behind — park both (задача 032).
+                    disengage_zone_hold(&mut zh_phase, state);
                 }
 
                 // Credit this sample. `Utc::now()` matches the timestamp already
@@ -973,6 +967,14 @@ async fn stream_with_presence(
                     if reloaded_zone_hold != config.zone_hold {
                         info!(enabled = reloaded_zone_hold.enabled, "zone_hold config changed on disk — reloaded without a daemon restart");
                         config.zone_hold = reloaded_zone_hold;
+                    }
+                    // `tm zone off` mid-session must stop the belt corrections
+                    // *now*, not at the next presence transition (задача 032):
+                    // the phase outlives the config edit, and a live `Ramp` kept
+                    // pulling the operator's manual speed back to its target.
+                    if !config.zone_hold.enabled && zh_phase != ZoneHoldPhase::Off {
+                        info!("zone hold: disabled in config — disengaging mid-session");
+                        disengage_zone_hold(&mut zh_phase, state);
                     }
                     // `tm zone on` is routinely run mid-session (as here), not
                     // only before a walk starts. Without this, the phase stays
@@ -1346,6 +1348,29 @@ enum ZoneHoldPhase {
     },
 }
 
+/// Whether Zone Hold may touch the Control Point on this tick (задача 032).
+///
+/// A live phase is *not* enough: `tm zone off` lands mid-session through the
+/// `config.toml` mtime watch (задача 017), and until the next presence
+/// transition the phase still says `Ramp`/`Hold`. Both conditions must hold, so
+/// a disabled Zone Hold can never drive the belt.
+fn should_run_zone_hold(enabled: bool, phase: &ZoneHoldPhase) -> bool {
+    enabled && *phase != ZoneHoldPhase::Off
+}
+
+/// Park Zone Hold: phase to `Off` and clear the `tm status`/widget snapshot
+/// (задача 032). Shared by every disengage path — config disabled mid-session,
+/// target zone no longer resolvable — so none of them can forget a field.
+fn disengage_zone_hold(phase: &mut ZoneHoldPhase, state: &mut DaemonState) {
+    *phase = ZoneHoldPhase::Off;
+    state.zone_hold_active = false;
+    state.zone_hold_phase = Some("off".to_string());
+    state.zone_hold_position = None;
+    state.zone_hold_target_lo = None;
+    state.zone_hold_target_hi = None;
+    state.zone_hold_last_speed = None;
+}
+
 impl ZoneHoldPhase {
     fn label(&self) -> &'static str {
         match self {
@@ -1439,6 +1464,13 @@ async fn zone_hold_tick(
     now: Instant,
     state: &mut DaemonState,
 ) {
+    // A function that writes to the belt owns the check of its own enable flag
+    // (задача 032). The call site gates on this too; both stay, so no future
+    // path can reach a Control Point write with Zone Hold switched off.
+    if !config.enabled {
+        return;
+    }
+
     // Instantaneous Speed is absent from a Treadmill Data frame only when
     // FTMS's "More Data" bit splits it across two notifications (legal per
     // spec, see `ftms.rs`) — rare but real. Guessing 0.0 here would read as
@@ -2227,5 +2259,60 @@ mod tests {
             hr_battery_poll_interval(Some(0)),
             HR_BATTERY_POLL_INTERVAL_LOW
         );
+    }
+
+    /// A live phase alone must never authorise a belt write: `tm zone off`
+    /// reaches the daemon as a config reload, not as a phase change (задача 032).
+    #[test]
+    fn should_run_zone_hold_requires_both_enabled_and_a_live_phase() {
+        let live = ZoneHoldPhase::Hold;
+        assert!(should_run_zone_hold(true, &live));
+        assert!(!should_run_zone_hold(false, &live));
+        assert!(!should_run_zone_hold(true, &ZoneHoldPhase::Off));
+        assert!(!should_run_zone_hold(false, &ZoneHoldPhase::Off));
+    }
+
+    #[test]
+    fn disengage_zone_hold_parks_the_phase_and_clears_the_whole_snapshot() {
+        let mut state = DaemonState::new(true);
+        state.zone_hold_active = true;
+        state.zone_hold_phase = Some("ramp".to_string());
+        state.zone_hold_position = Some("below".to_string());
+        state.zone_hold_target_lo = Some(90);
+        state.zone_hold_target_hi = Some(110);
+        state.zone_hold_last_speed = Some(3.0);
+        let mut phase = ZoneHoldPhase::Ramp {
+            started_at: Instant::now(),
+            start_speed_kmh: 2.5,
+            target_speed_kmh: 3.0,
+        };
+
+        disengage_zone_hold(&mut phase, &mut state);
+
+        assert_eq!(phase, ZoneHoldPhase::Off);
+        assert!(!state.zone_hold_active);
+        assert_eq!(state.zone_hold_phase.as_deref(), Some("off"));
+        assert_eq!(state.zone_hold_position, None);
+        assert_eq!(state.zone_hold_target_lo, None);
+        assert_eq!(state.zone_hold_target_hi, None);
+        assert_eq!(state.zone_hold_last_speed, None);
+    }
+
+    /// The disabled-config path in `zone_hold_on_transition` is the *third*
+    /// guard; this pins the contract it has always promised.
+    #[test]
+    fn zone_hold_on_transition_never_engages_while_disabled() {
+        let mut phase = ZoneHoldPhase::Hold;
+        let config = zone_hold::ZoneHoldConfig::disabled_default();
+        zone_hold_on_transition(
+            &mut phase,
+            PresenceState::Paused,
+            PresenceState::Walking,
+            &config,
+            2.5,
+            3.0,
+            Instant::now(),
+        );
+        assert_eq!(phase, ZoneHoldPhase::Off);
     }
 }
