@@ -1432,14 +1432,13 @@ fn format_doctor_report(
                 (false, _) => "no-link",
             };
             out.push_str(&format!("  contact (inferred): {contact}\n"));
-            if s.hr_connected {
-                if let Some(age) = hr_age
-                    && age > hr_stale_s
-                {
-                    out.push_str(
-                        "  WARN: hr_connected=true but last bpm is stale — link may be silent\n",
-                    );
-                }
+            if s.hr_connected
+                && let Some(age) = hr_age
+                && age > hr_stale_s
+            {
+                out.push_str(
+                    "  WARN: hr_connected=true but last bpm is stale — link may be silent\n",
+                );
             }
 
             out.push_str("\nzone hold\n");
