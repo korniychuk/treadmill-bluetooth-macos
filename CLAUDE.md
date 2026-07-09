@@ -26,13 +26,32 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
   задача 026) — только Read (Polar не шлёт notify по заряду).
   `ContactTracker`/`Contact` (задача 033) — **контакт с телом ≠ BLE-линк**:
   снятый H10 держит линк и продолжает слать ~1 кадр/с с **замороженным**
-  последним bpm, без `bpm==0` и без contact-битов (`flags` схлопывается
-  `0x10`→`0x00`). Единственный сигнал — исчезновение RR-интервалов, поэтому
-  `observe(&m)` даёт `Lost` при `contact == Some(false)` сразу либо после
-  `CONTACT_LOST_FRAMES` (3) подряд RR-less кадров от датчика, который RR
-  когда-либо слал (capability учится из потока, не хардкодится по вендору).
-  Датчик без RR и без contact-битов детектировать нечем — остаётся `Live` до
-  линк-таймаута (честная деградация). Чистый, без времени и BLE.
+  последним bpm, без `bpm==0` и без contact-битов. `observe(&m, ts_ms)` (время
+  инъекцией, как `presence.rs`) даёт `Lost` по трём сигналам, в порядке
+  надёжности: (1) `contact == Some(false)` — сразу; (2) **bpm не менялся
+  бит-в-бит** `CONTACT_FROZEN_BPM_MS` (60с) — решающий; (3) `CONTACT_LOST_FRAMES`
+  (3) подряд RR-less кадров от датчика, который RR когда-либо слал (capability
+  учится из потока, не хардкодится по вендору) — быстрый, ~3с.
+  RR-правила **недостаточно**: снятый H10 перемежает RR-несущие кадры
+  (`10 6F FB 17`) с `00 6F` и вечно обнуляет счётчик; поэтому frozen-bpm стоит
+  **выше** RR в `observe` — присутствие RR не ручается за показание,
+  не менявшееся минуту. Порог 60с выбран по данным: самая длинная константная
+  серия у надетого страпа — 16с, у снятого — 26 мин.
+  `reset_link()` (задача 034) чистит только link-scoped улики (RR-capability,
+  счётчик), но **не** часы заморозки — сердце не перезапускается вместе с
+  BLE-линком. Датчик без RR и без contact-битов, но с живым (дрожащим) bpm
+  детектировать нечем — остаётся `Live` до линк-таймаута (честная деградация).
+  Чистый, без BLE.
+- `src/recompute_hr.rs` — команда `recompute-hr [--dry-run]` (задача 034):
+  проигрывает `hr_samples.raw_frame` через тот же продовый `ContactTracker` и
+  удаляет сэмплы, записанные со снятого датчика (они травили `hr_summary_for` —
+  наблюдалось `♥ 111/111` на целой тренировке). Шире живого демона: тот обязан
+  выждать 60с окна, а replay видит будущее и хоронит **весь** константный
+  прогон, включая его начало. `plan_to_fixpoint` крутит план до пустого прохода:
+  удаление замороженного прогона **смыкает** соседние прогоны другого bpm, и
+  объединённый может пробить порог там, где ни одна половина не пробивала (на
+  живой базе сошлось за 3 прохода). Read-only по BLE, трогает только
+  `hr_samples`.
 - `src/control.rs` — FTMS Control Point (start/stop/speed).
 - `src/control_command.rs` — `ControlCommand` тип (`start`/`stop`/`speed:<kmh>`),
   парс/формат и staleness-проверка для очереди команд (задача 013).
@@ -129,7 +148,8 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
   `hr_summary_for(from, to)`: `♥ avg/max` = trimmed-mean (переиспользует
   `default_speed::trimmed_mean_speed`) / p95 (устойчив к единичному спайку).
   `None` при < 10 сэмплов в окне. Плюс `hr_battery_pct` в `daemon_status`
-  (задача 026, `Option<i64>`, ALTER-колонка).
+  (задача 026, `Option<i64>`, ALTER-колонка). Плюс `hr_samples_ordered` +
+  `delete_hr_samples` (задача 034) — ground-truth для `recompute-hr`.
 - `src/zone_hold.rs` — **Zone Hold** (задача 027): HR-адаптивная подстройка
   скорости под целевую пульсовую зону. Чистый модуль, без BLE/времени внутри:
   `hrmax_tanaka`, `resolve_zone_bpm` (`hrmax`/`karvonen`, не смешиваются),
@@ -233,6 +253,7 @@ cargo run -- daemon    # фоновый режим: авто-коннект + pr
 cargo run -- stats     # статистика за сегодня; `stats --all` — за все дни
 cargo run -- widget    # компактный TSV текущей тренировки для status-bar виджета; пусто если дорожка off (см. docs/tasks/009)
 cargo run -- recompute-segments  # пересобрать activity_segments из raw_samples (без BLE, идемпотентно; docs/tasks/015)
+cargo run -- recompute-hr        # вычистить hr_samples, записанные со снятого датчика (без BLE, --dry-run; docs/tasks/034)
 cargo run -- default-speed  # показать расчётную дефолтную скорость на старте тренировки (без BLE; docs/tasks/016)
 cargo run -- hr        # диагностика: подключиться к HR-датчику, печатать заряд + live bpm (docs/tasks/025,026)
 cargo run -- zone      # Zone Hold: статус (без аргумента) или on/off/setup/limits/target/list/add/edit/remove/mode (docs/tasks/027)
