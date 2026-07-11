@@ -192,7 +192,7 @@ mod tests {
     use chrono::{Duration, Utc};
     use rusqlite::params;
 
-    use super::super::memory_store;
+    use super::super::{Store, memory_store};
 
     #[test]
     fn prune_status_events_drops_rows_older_than_retention() {
@@ -225,5 +225,178 @@ mod tests {
             .query_row("SELECT ts_ms FROM status_events", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, fresh_ms);
+    }
+
+    /// Deterministic dump of tables, columns (type/notnull/default), and named
+    /// `idx_*` indexes after a fresh migrate — catches schema drift.
+    fn dump_schema(store: &Store) -> String {
+        let mut out = String::new();
+        let table_names: Vec<String> = store
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type='table' AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        for table in &table_names {
+            out.push_str(&format!("TABLE {table}\n"));
+            let mut stmt = store
+                .conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let cols = stmt
+                .query_map([], |row| {
+                    let name: String = row.get(1)?;
+                    let col_type: String = row.get(2)?;
+                    let notnull: i64 = row.get(3)?;
+                    let dflt: Option<String> = row.get(4)?;
+                    let dflt = dflt.unwrap_or_default();
+                    Ok(format!(
+                        "  {table}.{name}:{col_type}:notnull={notnull}:default={dflt}"
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            for line in cols {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+
+        let indexes: Vec<(String, String, String)> = store
+            .conn
+            .prepare(
+                "SELECT name, tbl_name, sql FROM sqlite_master
+                 WHERE type='index' AND name LIKE 'idx_%'
+                 ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for (name, tbl, sql) in indexes {
+            out.push_str(&format!("INDEX {name} ON {tbl}\n"));
+            out.push_str(&format!("  {sql}\n"));
+        }
+
+        out
+    }
+
+    /// Golden schema after `migrate()` on an empty DB. Update deliberately when
+    /// adding columns/tables/indexes — do not silently accept drift.
+    const EXPECTED_SCHEMA: &str = "\
+TABLE activity_segments
+  activity_segments.id:INTEGER:notnull=0:default=
+  activity_segments.started_at:TEXT:notnull=1:default=
+  activity_segments.ended_at:TEXT:notnull=1:default=
+  activity_segments.date:TEXT:notnull=1:default=
+  activity_segments.distance_m:INTEGER:notnull=1:default=0
+  activity_segments.steps:INTEGER:notnull=1:default=0
+  activity_segments.walking_time_s:INTEGER:notnull=1:default=0
+TABLE control_commands
+  control_commands.id:INTEGER:notnull=0:default=
+  control_commands.created_at:TEXT:notnull=1:default=
+  control_commands.command:TEXT:notnull=1:default=
+  control_commands.status:TEXT:notnull=1:default=
+  control_commands.executed_at:TEXT:notnull=0:default=
+  control_commands.error:TEXT:notnull=0:default=
+TABLE daemon_status
+  daemon_status.id:INTEGER:notnull=0:default=
+  daemon_status.connected:INTEGER:notnull=1:default=
+  daemon_status.presence_state:TEXT:notnull=0:default=
+  daemon_status.last_connected_at:TEXT:notnull=0:default=
+  daemon_status.last_disconnected_at:TEXT:notnull=0:default=
+  daemon_status.power_mode:TEXT:notnull=1:default=
+  daemon_status.power_mode_since:TEXT:notnull=1:default=
+  daemon_status.updated_at:TEXT:notnull=1:default=
+  daemon_status.config_goals:TEXT:notnull=0:default=
+  daemon_status.config_auto_pause_secs:INTEGER:notnull=0:default=
+  daemon_status.config_loaded_at:TEXT:notnull=0:default=
+  daemon_status.hr_connected:INTEGER:notnull=1:default=0
+  daemon_status.last_bpm:INTEGER:notnull=0:default=
+  daemon_status.last_bpm_ts:INTEGER:notnull=0:default=
+  daemon_status.hr_battery_pct:INTEGER:notnull=0:default=
+  daemon_status.zone_hold_active:INTEGER:notnull=1:default=0
+  daemon_status.zone_hold_target_lo:INTEGER:notnull=0:default=
+  daemon_status.zone_hold_target_hi:INTEGER:notnull=0:default=
+  daemon_status.zone_hold_last_speed:REAL:notnull=0:default=
+  daemon_status.zone_hold_phase:TEXT:notnull=0:default=
+  daemon_status.zone_hold_position:TEXT:notnull=0:default=
+  daemon_status.last_speed_kmh:REAL:notnull=0:default=
+  daemon_status.last_speed_ts:INTEGER:notnull=0:default=
+TABLE daily_stats
+  daily_stats.date:TEXT:notnull=0:default=
+  daily_stats.distance_m:INTEGER:notnull=1:default=0
+  daily_stats.steps:INTEGER:notnull=1:default=0
+  daily_stats.walking_time_s:INTEGER:notnull=1:default=0
+TABLE device_baseline
+  device_baseline.id:INTEGER:notnull=0:default=
+  device_baseline.last_steps:INTEGER:notnull=0:default=
+  device_baseline.last_distance_m:INTEGER:notnull=0:default=
+  device_baseline.last_elapsed_s:INTEGER:notnull=0:default=
+TABLE goal_celebrations
+  goal_celebrations.date:TEXT:notnull=1:default=
+  goal_celebrations.threshold:INTEGER:notnull=1:default=
+  goal_celebrations.celebrated_at:TEXT:notnull=1:default=
+TABLE hr_samples
+  hr_samples.id:INTEGER:notnull=0:default=
+  hr_samples.session_id:INTEGER:notnull=0:default=
+  hr_samples.ts_ms:INTEGER:notnull=1:default=
+  hr_samples.bpm:INTEGER:notnull=1:default=
+  hr_samples.rr_ms:BLOB:notnull=0:default=
+  hr_samples.raw_frame:BLOB:notnull=1:default=
+TABLE raw_samples
+  raw_samples.id:INTEGER:notnull=0:default=
+  raw_samples.session_id:INTEGER:notnull=1:default=
+  raw_samples.ts_ms:INTEGER:notnull=1:default=
+  raw_samples.speed_centikmh:INTEGER:notnull=0:default=
+  raw_samples.avg_speed_centikmh:INTEGER:notnull=0:default=
+  raw_samples.distance_m:INTEGER:notnull=0:default=
+  raw_samples.energy_kcal:INTEGER:notnull=0:default=
+  raw_samples.elapsed_s:INTEGER:notnull=0:default=
+  raw_samples.steps:INTEGER:notnull=0:default=
+  raw_samples.raw_frame:BLOB:notnull=1:default=
+TABLE sessions
+  sessions.id:INTEGER:notnull=0:default=
+  sessions.started_at:TEXT:notnull=1:default=
+  sessions.ended_at:TEXT:notnull=0:default=
+TABLE status_events
+  status_events.id:INTEGER:notnull=0:default=
+  status_events.session_id:INTEGER:notnull=1:default=
+  status_events.ts_ms:INTEGER:notnull=1:default=
+  status_events.event_code:INTEGER:notnull=1:default=
+  status_events.raw_frame:BLOB:notnull=1:default=
+INDEX idx_activity_segments_date ON activity_segments
+  CREATE INDEX idx_activity_segments_date ON activity_segments(date)
+INDEX idx_control_commands_status ON control_commands
+  CREATE INDEX idx_control_commands_status ON control_commands(status, id)
+INDEX idx_hr_samples_ts ON hr_samples
+  CREATE INDEX idx_hr_samples_ts ON hr_samples(ts_ms)
+INDEX idx_raw_samples_session ON raw_samples
+  CREATE INDEX idx_raw_samples_session ON raw_samples(session_id)
+INDEX idx_raw_samples_ts ON raw_samples
+  CREATE INDEX idx_raw_samples_ts ON raw_samples(ts_ms)
+INDEX idx_status_events_session ON status_events
+  CREATE INDEX idx_status_events_session ON status_events(session_id)
+INDEX idx_status_events_ts ON status_events
+  CREATE INDEX idx_status_events_ts ON status_events(ts_ms)
+";
+
+    #[test]
+    fn schema_snapshot_matches_migrate() {
+        let store = memory_store();
+        let actual = dump_schema(&store);
+        assert_eq!(
+            actual, EXPECTED_SCHEMA,
+            "schema drift detected — update EXPECTED_SCHEMA only with intentional migrations"
+        );
     }
 }
