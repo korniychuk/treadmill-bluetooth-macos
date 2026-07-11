@@ -19,6 +19,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 
 use crate::presence::{PresenceState, PresenceTracker};
+use crate::speed::CentiKmh;
 use crate::store::{RawDeltas, Store};
 
 /// Distance/time accrued since the last confirmed step, held back from
@@ -72,10 +73,10 @@ impl ActivityAccumulator {
     pub fn observe(
         &mut self,
         now: Instant,
-        speed_kmh: Option<f32>,
+        speed: Option<CentiKmh>,
         steps: Option<u32>,
     ) -> Option<PresenceState> {
-        let transition = self.presence.observe(now, speed_kmh, steps);
+        let transition = self.presence.observe(now, speed, steps);
         if let Some(next) = transition
             && next != PresenceState::Walking
         {

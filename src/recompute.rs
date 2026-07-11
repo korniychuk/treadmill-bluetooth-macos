@@ -132,7 +132,7 @@ fn replay(rows: &[RawSample]) -> Result<ReplayOutcome> {
             }
         };
 
-        accumulator.observe(now, row.speed_kmh, row.steps);
+        accumulator.observe(now, row.speed, row.steps);
         accumulator.credit(&mut scratch, credit_now, deltas)?;
     }
 
@@ -179,7 +179,7 @@ mod tests {
         RawSample {
             session_id,
             ts_ms,
-            speed_kmh,
+            speed: speed_kmh.and_then(crate::speed::CentiKmh::from_kmh_f32),
             distance_m,
             elapsed_s,
             steps,

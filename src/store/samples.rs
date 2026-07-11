@@ -7,6 +7,7 @@ use rusqlite::params;
 use crate::default_speed::trimmed_mean_speed;
 use crate::ftms::TreadmillData;
 use crate::hr::HrMeasurement;
+use crate::speed::CentiKmh;
 
 use super::Store;
 
@@ -19,7 +20,7 @@ use super::Store;
 pub struct RawSample {
     pub session_id: i64,
     pub ts_ms: i64,
-    pub speed_kmh: Option<f32>,
+    pub speed: Option<CentiKmh>,
     pub distance_m: Option<u32>,
     pub elapsed_s: Option<u16>,
     pub steps: Option<u32>,
@@ -102,8 +103,8 @@ impl Store {
                 params![
                     session_id,
                     ts_ms,
-                    sample.speed_kmh.map(|v| (v * 100.0).round() as i64),
-                    sample.avg_speed_kmh.map(|v| (v * 100.0).round() as i64),
+                    sample.speed.map(|s| i64::from(s.to_wire())),
+                    sample.avg_speed.map(|s| i64::from(s.to_wire())),
                     sample.total_distance_m.map(|v| v as i64),
                     sample.total_energy_kcal.map(|v| v as i64),
                     sample.elapsed_s.map(|v| v as i64),
@@ -295,9 +296,9 @@ impl Store {
                 Ok(RawSample {
                     session_id: row.get(0)?,
                     ts_ms: row.get(1)?,
-                    // Stored as centi-km/h (0.01 km/h) integer — mirror the
-                    // encode in `insert_raw_sample`.
-                    speed_kmh: speed_centikmh.map(|c| c as f32 / 100.0),
+                    // Stored as centi-km/h wire integer — lossless via CentiKmh.
+                    speed: speed_centikmh
+                        .and_then(|c| u16::try_from(c).ok().map(CentiKmh::from_wire)),
                     distance_m: distance_m.map(|v| v as u32),
                     elapsed_s: elapsed_s.map(|v| v as u16),
                     steps: steps.map(|v| v as u32),

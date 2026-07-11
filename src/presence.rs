@@ -9,6 +9,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::speed::CentiKmh;
+
 /// How long the belt can run without a step-count increase before the
 /// operator is considered to have left the treadmill.
 pub const AWAY_THRESHOLD: Duration = Duration::from_secs(10);
@@ -67,7 +69,7 @@ impl PresenceTracker {
     pub fn observe(
         &mut self,
         now: Instant,
-        speed_kmh: Option<f32>,
+        speed: Option<CentiKmh>,
         steps: Option<u32>,
     ) -> Option<PresenceState> {
         if let Some(steps) = steps
@@ -82,12 +84,12 @@ impl PresenceTracker {
         // `AWAY_THRESHOLD`. Without this, resuming after a long pause would
         // immediately read as `AwayWhileRunning` instead of `Walking`, since
         // `last_step_change` would still be stale from before the pause.
-        if speed_kmh.is_some_and(|speed| speed <= 0.0) {
+        if speed == Some(CentiKmh::ZERO) {
             self.last_step_change = Some(now);
         }
 
-        let next = match speed_kmh {
-            Some(speed) if speed <= 0.0 => PresenceState::Paused,
+        let next = match speed {
+            Some(s) if s == CentiKmh::ZERO => PresenceState::Paused,
             Some(_) => match self.last_step_change {
                 Some(last_change) if now.duration_since(last_change) >= AWAY_THRESHOLD => {
                     PresenceState::AwayWhileRunning
@@ -122,6 +124,10 @@ impl Default for PresenceTracker {
 mod tests {
     use super::*;
 
+    fn c(kmh: f32) -> CentiKmh {
+        CentiKmh::from_kmh_f32(kmh).expect("test speed")
+    }
+
     #[test]
     fn starts_unknown() {
         let tracker = PresenceTracker::new();
@@ -131,7 +137,7 @@ mod tests {
     #[test]
     fn walking_when_speed_and_steps_present() {
         let mut tracker = PresenceTracker::new();
-        let transition = tracker.observe(Instant::now(), Some(2.5), Some(10));
+        let transition = tracker.observe(Instant::now(), Some(c(2.5)), Some(10));
         assert_eq!(transition, Some(PresenceState::Walking));
         assert_eq!(tracker.state(), PresenceState::Walking);
     }
@@ -139,16 +145,16 @@ mod tests {
     #[test]
     fn paused_when_speed_zero() {
         let mut tracker = PresenceTracker::new();
-        tracker.observe(Instant::now(), Some(2.5), Some(10));
-        let transition = tracker.observe(Instant::now(), Some(0.0), Some(10));
+        tracker.observe(Instant::now(), Some(c(2.5)), Some(10));
+        let transition = tracker.observe(Instant::now(), Some(CentiKmh::ZERO), Some(10));
         assert_eq!(transition, Some(PresenceState::Paused));
     }
 
     #[test]
     fn no_transition_reported_when_state_unchanged() {
         let mut tracker = PresenceTracker::new();
-        tracker.observe(Instant::now(), Some(2.5), Some(10));
-        let transition = tracker.observe(Instant::now(), Some(2.5), Some(11));
+        tracker.observe(Instant::now(), Some(c(2.5)), Some(10));
+        let transition = tracker.observe(Instant::now(), Some(c(2.5)), Some(11));
         assert_eq!(transition, None);
         assert_eq!(tracker.state(), PresenceState::Walking);
     }
@@ -156,19 +162,19 @@ mod tests {
     #[test]
     fn away_after_threshold_without_step_change() {
         let mut tracker = PresenceTracker::new();
-        tracker.observe(Instant::now(), Some(2.5), Some(10));
+        tracker.observe(Instant::now(), Some(c(2.5)), Some(10));
         // Simulate the threshold elapsing without any step increase by
         // back-dating last_step_change directly (no real sleep in tests).
         tracker.last_step_change = Some(Instant::now() - AWAY_THRESHOLD - Duration::from_secs(1));
-        let transition = tracker.observe(Instant::now(), Some(2.5), Some(10));
+        let transition = tracker.observe(Instant::now(), Some(c(2.5)), Some(10));
         assert_eq!(transition, Some(PresenceState::AwayWhileRunning));
     }
 
     #[test]
     fn resuming_after_a_long_pause_reads_as_walking_not_away() {
         let mut tracker = PresenceTracker::new();
-        tracker.observe(Instant::now(), Some(2.5), Some(10));
-        let paused = tracker.observe(Instant::now(), Some(0.0), Some(10));
+        tracker.observe(Instant::now(), Some(c(2.5)), Some(10));
+        let paused = tracker.observe(Instant::now(), Some(CentiKmh::ZERO), Some(10));
         assert_eq!(paused, Some(PresenceState::Paused));
 
         // Back-date last_step_change to simulate a pause far longer than
@@ -178,9 +184,9 @@ mod tests {
         tracker.last_step_change = Some(Instant::now() - AWAY_THRESHOLD - Duration::from_secs(60));
         // One more paused sample, as would arrive from a real long pause,
         // must re-pin the clock before resuming.
-        tracker.observe(Instant::now(), Some(0.0), Some(10));
+        tracker.observe(Instant::now(), Some(CentiKmh::ZERO), Some(10));
 
-        let resumed = tracker.observe(Instant::now(), Some(2.5), Some(10));
+        let resumed = tracker.observe(Instant::now(), Some(c(2.5)), Some(10));
         assert_eq!(resumed, Some(PresenceState::Walking));
     }
 }

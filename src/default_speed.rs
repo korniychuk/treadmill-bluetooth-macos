@@ -192,7 +192,7 @@ mod tests {
     /// path only reads `speed_centikmh`), via the public store API.
     fn insert_speed(store: &Store, ts_ms: i64, kmh: f32) {
         let sample = TreadmillData {
-            speed_kmh: Some(kmh),
+            speed: crate::speed::CentiKmh::from_kmh_f32(kmh),
             ..Default::default()
         };
         store.insert_raw_sample(1, ts_ms, &sample, &[0]).unwrap();

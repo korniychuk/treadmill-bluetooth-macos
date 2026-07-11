@@ -44,8 +44,12 @@ impl WorkoutLogger {
         // Hand-rolled JSON keeps the dependency surface small; all fields are
         // numeric or fixed-format strings, so no escaping is needed.
         let mut line = format!("{{\"ts\":\"{ts}\"");
-        push_num(&mut line, "speed_kmh", data.speed_kmh);
-        push_num(&mut line, "avg_speed_kmh", data.avg_speed_kmh);
+        push_num(&mut line, "speed_kmh", data.speed.map(|s| s.to_kmh_f32()));
+        push_num(
+            &mut line,
+            "avg_speed_kmh",
+            data.avg_speed.map(|s| s.to_kmh_f32()),
+        );
         push_num(&mut line, "incline_percent", data.incline_percent);
         push_num(&mut line, "distance_m", data.total_distance_m);
         push_num(&mut line, "energy_kcal", data.total_energy_kcal);
