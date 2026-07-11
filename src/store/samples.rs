@@ -297,8 +297,19 @@ impl Store {
                     session_id: row.get(0)?,
                     ts_ms: row.get(1)?,
                     // Stored as centi-km/h wire integer — lossless via CentiKmh.
-                    speed: speed_centikmh
-                        .and_then(|c| u16::try_from(c).ok().map(CentiKmh::from_wire)),
+                    speed: speed_centikmh.and_then(|c| match u16::try_from(c) {
+                        Ok(wire) => Some(CentiKmh::from_wire(wire)),
+                        Err(_) => {
+                            // Unreachable via our write paths (always u16 wire);
+                            // a corrupt/legacy row must not vanish silently
+                            // (054 review).
+                            tracing::warn!(
+                                speed_centikmh = c,
+                                "raw_samples speed outside u16 wire range — treating as absent"
+                            );
+                            None
+                        }
+                    }),
                     distance_m: distance_m.map(|v| v as u32),
                     elapsed_s: elapsed_s.map(|v| v as u16),
                     steps: steps.map(|v| v as u32),

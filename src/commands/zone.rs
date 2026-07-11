@@ -1,6 +1,6 @@
 //! `zone` CLI command (Zone Hold config).
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 
 use crate::ZoneAction;
 use crate::commands::common::{highlight_config, zone_hold_config_path};
@@ -8,6 +8,7 @@ use crate::commands::zone_prompts::{
     prompt_age, prompt_line, prompt_optional_max_speed, prompt_optional_resting_hr,
     prompt_zone_bounds, prompt_zone_id,
 };
+use crate::speed::CentiKmh;
 use crate::store;
 use crate::zone_hold;
 
@@ -75,12 +76,23 @@ pub(crate) fn zone_onboarding_prompt() -> Result<()> {
 /// `tm zone limits <max> [<min>]` / `tm zone limits --min <min>` (задача 027,
 /// §Min/max) — writes the *global* `max_speed`/`min_speed` keys; per-zone
 /// overrides stay a manual config edit.
+///
+/// Input is quantized through [`CentiKmh`] *before* it reaches the TOML
+/// (054 review): raw `f32::to_string` let `tm zone limits nan` write a
+/// capitalized `NaN` — invalid TOML that broke the whole config file.
 pub(crate) fn zone_limits(max: Option<f32>, min: Option<f32>) -> Result<()> {
     if max.is_none() && min.is_none() {
         bail!(
             "specify at least a max speed, e.g. `tm zone limits 5` or `tm zone limits --min 2.5`"
         );
     }
+    let quantize = |label: &str, kmh: f32| -> Result<CentiKmh> {
+        CentiKmh::from_kmh_f32(kmh)
+            .filter(|c| *c > CentiKmh::ZERO)
+            .ok_or_else(|| anyhow!("{label} speed {kmh} km/h is not a plausible belt speed"))
+    };
+    let max = max.map(|v| quantize("max", v)).transpose()?;
+    let min = min.map(|v| quantize("min", v)).transpose()?;
     let mut updates = Vec::new();
     if let Some(max) = max {
         updates.push(("max_speed", max.to_string()));

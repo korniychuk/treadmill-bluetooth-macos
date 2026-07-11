@@ -209,9 +209,20 @@ pub(super) fn parse_zone_def(value: &toml::Value) -> Result<ZoneDef, String> {
     let max_speed_kmh = value
         .get("max_speed")
         .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|n| n as f64)))
-        .map(|n| n as f32)
-        .filter(|&n| n > 0.0)
-        .and_then(CentiKmh::from_kmh_f32);
+        .and_then(|n| {
+            let quantized = CentiKmh::from_kmh_f32(n as f32).filter(|&c| c > CentiKmh::ZERO);
+            // Same invalid→WARN convention as `positive_centi_or`: a dropped
+            // override silently falls back to the global cap otherwise
+            // (054 review — e.g. a `700` typo for `7.0`).
+            if quantized.is_none() {
+                warn!(
+                    zone = %name,
+                    max_speed = n,
+                    "per-zone max_speed not a plausible speed — using the global cap"
+                );
+            }
+            quantized
+        });
 
     let bounds = if let (Some(min_bpm), Some(max_bpm)) = (
         value.get("min_bpm").and_then(|v| v.as_integer()),
