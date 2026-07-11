@@ -6,6 +6,7 @@ pub(crate) mod diag;
 pub(crate) mod stats;
 pub(crate) mod status;
 pub(crate) mod zone;
+pub(crate) mod zone_prompts;
 
 pub(crate) use belt::run_control;
 pub(crate) use common::refuse_if_daemon_live;
