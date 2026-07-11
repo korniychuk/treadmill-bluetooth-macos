@@ -25,6 +25,7 @@ mod recompute_hr;
 mod scan;
 mod sniff;
 mod store;
+mod treadmill_link;
 mod widget;
 mod zone_hold;
 

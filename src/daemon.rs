@@ -68,7 +68,6 @@
 //!    [`SCAN_WEDGED_EXIT_CODE`]. Healthy outcomes ("no FTMS treadmill found")
 //!    reset both counters — never recycle/exit on a merely powered-off belt.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -99,17 +98,12 @@ use crate::power::{self, PowerEvent};
 use crate::presence::PresenceState;
 use crate::scan;
 use crate::store::{DaemonStatus, Store};
+use crate::treadmill_link::{TreadmillLink, NOTIFICATION_TIMEOUT};
 use crate::zone_hold;
 
 /// Delay before retrying discovery after a scan/connect failure, so a
 /// transient Bluetooth hiccup does not spin the CPU in a tight loop.
 const RETRY_DELAY: Duration = Duration::from_secs(5);
-
-/// How long to wait for the next Treadmill Data sample before treating the
-/// link as lost. The device streams ~1/s even while stationary, so this
-/// leaves generous margin above normal jitter while still catching a hard
-/// power-off well before a human would otherwise notice.
-const NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How often the idle loop refreshes `daemon_status.updated_at` (and touches the
 /// watchdog) while nothing else is happening, so a quiet-but-healthy stretch
@@ -165,18 +159,6 @@ const SPEED_RESTORE_TIMEOUT: Duration = Duration::from_secs(15);
 /// toast) when the machine did not actually slow down on resume.
 const SPEED_RESTORE_EPSILON_KMH: f32 = 0.05;
 
-/// How much of the speed history just before a pause to ignore when estimating
-/// the walking ("cruising") speed to restore. The belt ramps itself down to a
-/// stop over a couple of seconds when paused (measured ~2-3s on the W2 Pro;
-/// margin to 10s), so those trailing samples are the deceleration, not the
-/// speed the operator was actually walking at. Without this we would capture
-/// the ~0.6 km/h tail instead of the real 2.5 (see задача 012 follow-up).
-const SPEED_CRUISE_DECEL_SKIP: Duration = Duration::from_secs(10);
-
-/// Samples slower than this are ramp/idle, not walking, and are excluded from
-/// the cruising estimate (the belt minimum sits around 0.5 km/h).
-const SPEED_CRUISE_FLOOR_KMH: f32 = 0.8;
-
 /// Ceiling on the resumed belt speed for applying the computed default at a
 /// workout start (задача 016): apply only when the belt is at/below the device's
 /// factory crawl (~0.5), i.e. it just (re)started/reset and sits at its useless
@@ -184,11 +166,6 @@ const SPEED_CRUISE_FLOOR_KMH: f32 = 0.8;
 /// a daemon restart landed mid-walk) — never override it. Same value as the
 /// cruise floor: below it is not real walking.
 const DEFAULT_SPEED_APPLY_CEILING_KMH: f32 = 0.8;
-
-/// How long to retain recent speed samples for the cruising estimate. Covers
-/// the decel-skip plus a useful averaging window before it; older samples are
-/// pruned every telemetry tick so the buffer stays tiny.
-const SPEED_HISTORY_RETENTION: Duration = Duration::from_secs(45);
 
 /// Exit code used when the watchdog kills the process on a detected hang —
 /// distinct from panics/normal errors so `launchctl print` / log forensics
@@ -875,28 +852,13 @@ async fn stream_with_presence(
     // threshold). This is the *same* engine the offline replay runs — see
     // `crate::activity` and `docs/tasks/015`.
     let mut accumulator = ActivityAccumulator::new();
-    // When the current pause spell began, for the return toast (задача 010).
-    // Away-spell + auto-pause latch live in `AutoPause` (задача 053).
-    // `Instant` on macOS does not advance across sleep, but a session that
-    // sleeps mid-away drops the BLE link and re-enters here fresh anyway.
-    let mut paused_since: Option<Instant> = None;
     // Idle-belt auto-pause (задача 020): threshold in `config.auto_pause`
     // (hot-reloaded); spell state in `AutoPause` (задача 053).
     let mut auto_pause = AutoPause::new();
-    // Recent (timestamp, belt speed) samples, used to estimate the walking
-    // ("cruising") speed to restore on resume — snapshotted when a pause begins.
-    // The machine resets the belt to a crawl (~0.5 km/h) after a pause, and it
-    // also ramps *itself* down over a couple of seconds before the pause, so we
-    // cannot just take the last non-zero sample (that is the decel tail). See
-    // `cruising_speed` (задача 012 follow-up). `last_walking_speed` is the plain
-    // last-non-zero fallback for a session too short to have a cruising window.
-    let mut speed_history: VecDeque<(Instant, f32)> = VecDeque::new();
-    let mut last_walking_speed: Option<f32> = None;
-    let mut pre_pause_speed: Option<f32> = None;
-    // Whether the computed default speed has already been applied (or attempted)
-    // this session (задача 016). Fresh per BLE session, so each physical
-    // (re)start of the treadmill gets one attempt; reconnect/new session resets it.
-    let mut default_speed_applied = false;
+    // Telemetry silence + speed memory for pause/resume/default (задача 053).
+    // Seeded now so the (possibly slow) subscribe above does not count against
+    // the silence arm; pairs with `watchdog.touch_telemetry()` above.
+    let mut link = TreadmillLink::new(tokio::time::Instant::now());
     // Zone Hold (задача 027): per-session controller phase + correction
     // timers. Fresh per BLE session, same reasoning as `default_speed_applied` —
     // a reconnect starts from `Off` and re-engages on the next Walking entry.
@@ -942,11 +904,9 @@ async fn stream_with_presence(
     let mut hr_contact_tracker = hr::ContactTracker::default();
     let mut hr_contact = hr::Contact::Live;
 
-    // Deadline anchor for the telemetry-silence arm below (задача 031); advanced
-    // only by a decoded `0x2ACD` frame, never by HR/control/config activity.
-    let mut last_telemetry_at = tokio::time::Instant::now();
     // Consecutive per-sample DB persist failures (backlog 010) — reset on the
-    // first successful persist.
+    // first successful persist. Deliberately NOT part of `TreadmillLink`: the
+    // counter tracks DB health, which outlives any single BLE session.
     let mut db_persist_failures: u32 = 0;
     // Absolute HR-silence deadline (задача 035), advanced only by a received
     // `0x2A37` frame or when a new HR stream is installed — never by sibling arms.
@@ -994,7 +954,7 @@ async fn stream_with_presence(
             // reset by whichever sibling arm completes first — and `command_tick`
             // fires every second. `sleep_until` survives the rebuild because the
             // deadline is a point in time, not a duration (задача 031).
-            _ = tokio::time::sleep_until(last_telemetry_at + NOTIFICATION_TIMEOUT) => {
+            _ = tokio::time::sleep_until(link.silence_deadline()) => {
                 warn!(timeout_s = NOTIFICATION_TIMEOUT.as_secs(), "no telemetry received — treating as disconnected");
                 break;
             }
@@ -1024,7 +984,9 @@ async fn stream_with_presence(
                     warn!(bytes = ?notification.value, "undecodable treadmill frame");
                     continue;
                 };
-                last_telemetry_at = tokio::time::Instant::now();
+                let now = Instant::now();
+                let tokio_now = tokio::time::Instant::now();
+                link.on_telemetry(data.speed_kmh, now, tokio_now);
                 watchdog.touch_telemetry();
                 logger.log(&data)?;
                 // A failed per-sample persist must not tear down a healthy BLE
@@ -1059,29 +1021,12 @@ async fn stream_with_presence(
                     }
                 };
 
-                // Record the belt speed so it can be restored after a pause (the
-                // machine resets the belt to a crawl on resume — задача 012).
-                // Keep a short rolling history for the cruising estimate, plus the
-                // plain last-non-zero value as a fallback.
+                // Live speed snapshot for `tm widget` (задача 029) — every sample
+                // with speed, unconditionally (unlike `last_walking_speed` on the
+                // link, which only tracks non-zero cruising speed).
                 if let Some(speed) = data.speed_kmh {
-                    // Live speed snapshot for `tm widget` (задача 029) — every
-                    // sample, unconditionally (unlike `last_walking_speed`
-                    // below, which only tracks non-zero cruising speed).
                     state.last_speed_kmh = Some(speed as f64);
                     state.last_speed_ts = Some(Utc::now().timestamp_millis());
-
-                    let now = Instant::now();
-                    speed_history.push_back((now, speed));
-                    while let Some(&(t, _)) = speed_history.front() {
-                        if now.saturating_duration_since(t) > SPEED_HISTORY_RETENTION {
-                            speed_history.pop_front();
-                        } else {
-                            break;
-                        }
-                    }
-                    if speed > 0.0 {
-                        last_walking_speed = Some(speed);
-                    }
                 }
 
                 let prev_state = accumulator.state();
@@ -1105,34 +1050,32 @@ async fn stream_with_presence(
                             notify::walker_resumed(auto_pause.on_return(Instant::now()));
                         }
                         PresenceState::Walking if prev_state == PresenceState::Paused => {
-                            let paused_for = paused_since.take().map(|since| since.elapsed());
+                            let resume = link.on_resume(Instant::now());
                             // Speed-dependent restore/default only when measured.
                             if let Some(resumed_speed) = data.speed_kmh {
-                                match pre_pause_speed.take() {
+                                match resume.pre_pause_speed {
                                     // A real captured walking speed → restore it (задача 012).
                                     Some(pre) => {
                                         let restore = try_restore_speed(peripheral, Some(pre), resumed_speed).await;
                                         if let Some(r) = &restore {
                                             zh_effective_speed_kmh = Some(r.to_kmh);
                                         }
-                                        notify::treadmill_resumed(paused_for, restore);
+                                        notify::treadmill_resumed(resume.paused_for, restore);
                                     }
                                     // Nothing to restore → this is a fresh start/reset at the
                                     // device crawl (scenarios 2 & 3, задача 016): apply the
                                     // computed default. Only toasts when it actually applied.
-                                    None => match try_apply_default_speed(peripheral, store, resumed_speed, &mut default_speed_applied).await {
+                                    None => match try_apply_default_speed(peripheral, store, resumed_speed, &mut link).await {
                                         Some(applied) => {
                                             zh_effective_speed_kmh = Some(applied);
                                             notify::default_speed_applied(resumed_speed, applied);
                                         }
-                                        None => notify::treadmill_resumed(paused_for, None),
+                                        None => notify::treadmill_resumed(resume.paused_for, None),
                                     },
                                 }
                             } else {
-                                // Drop stale pre-pause so a later sample does not
-                                // restore against a different walking spell.
-                                pre_pause_speed.take();
-                                notify::treadmill_resumed(paused_for, None);
+                                // pre_pause already taken by on_resume — no second take.
+                                notify::treadmill_resumed(resume.paused_for, None);
                             }
                         }
                         // Connected with the belt already moving (scenario 1, задача 016).
@@ -1144,7 +1087,7 @@ async fn stream_with_presence(
                                     peripheral,
                                     store,
                                     resumed_speed,
-                                    &mut default_speed_applied,
+                                    &mut link,
                                 )
                                 .await
                             {
@@ -1156,12 +1099,7 @@ async fn stream_with_presence(
                         // starts Unknown, so a treadmill discovered already stopped
                         // must not immediately toast "paused".
                         PresenceState::Paused if prev_state != PresenceState::Unknown => {
-                            paused_since = Some(Instant::now());
-                            // Estimate the walking speed from before the belt began
-                            // ramping down, not the decel tail; fall back to the
-                            // last non-zero sample for a too-short session.
-                            pre_pause_speed =
-                                cruising_speed(speed_history.make_contiguous(), Instant::now()).or(last_walking_speed);
+                            link.on_pause(Instant::now());
                             // Suppress the generic "Paused" toast when this pause
                             // is our own auto-pause: the belt going to 0 after our
                             // Stop transitions AwayWhileRunning→Paused, and the
@@ -1342,7 +1280,7 @@ async fn stream_with_presence(
                             config,
                             &mut zh_phase,
                             state,
-                            last_walking_speed,
+                            link.last_walking_speed(),
                             store,
                         );
                     }
@@ -1536,39 +1474,6 @@ async fn stream_with_presence(
     Ok(())
 }
 
-/// Estimate the walking ("cruising") speed to restore on resume from recent
-/// `(timestamp, speed)` samples, ignoring the deceleration tail in the last
-/// [`SPEED_CRUISE_DECEL_SKIP`] before the pause and any sub-[`SPEED_CRUISE_FLOOR_KMH`]
-/// ramp/idle samples. Returns the median of the qualifying "walking" samples;
-/// if the session was too short to have any (everything is inside the decel
-/// window), falls back to the fastest walking sample seen (the belt only ramps
-/// *down* into a pause, so the peak is the cruising speed). `None` only when no
-/// sample reached the floor at all — the caller then uses its own fallback.
-/// Pure and unit-tested; the buffer plumbing lives in the daemon loop.
-fn cruising_speed(samples: &[(Instant, f32)], pause_at: Instant) -> Option<f32> {
-    let mut walking: Vec<f32> = samples
-        .iter()
-        .filter(|(t, kmh)| {
-            *kmh >= SPEED_CRUISE_FLOOR_KMH
-                && pause_at.saturating_duration_since(*t) >= SPEED_CRUISE_DECEL_SKIP
-        })
-        .map(|(_, kmh)| *kmh)
-        .collect();
-
-    if walking.is_empty() {
-        // Too short for a cruising window — use the peak walking speed instead
-        // of the decel tail (the belt only slows down going into a pause).
-        return samples
-            .iter()
-            .map(|(_, kmh)| *kmh)
-            .filter(|kmh| *kmh >= SPEED_CRUISE_FLOOR_KMH)
-            .fold(None, |acc, kmh| Some(acc.map_or(kmh, |m: f32| m.max(kmh))));
-    }
-
-    walking.sort_by(|a, b| a.partial_cmp(b).expect("belt speeds are never NaN"));
-    Some(walking[walking.len() / 2])
-}
-
 /// The pre-pause walking speed to re-send on resume, or `None` when there is
 /// nothing worth restoring: the machine did not actually slow down (resumed at
 /// the pre-pause speed or faster, within [`SPEED_RESTORE_EPSILON_KMH`]). Pure
@@ -1648,9 +1553,9 @@ async fn try_apply_default_speed(
     peripheral: &Peripheral,
     store: &Store,
     resumed_kmh: f32,
-    applied: &mut bool,
+    link: &mut TreadmillLink,
 ) -> Option<f32> {
-    if *applied {
+    if link.default_speed_applied() {
         return None;
     }
     if resumed_kmh > DEFAULT_SPEED_APPLY_CEILING_KMH {
@@ -1668,7 +1573,7 @@ async fn try_apply_default_speed(
                 "no qualifying prior workout (≥30m walking) — leaving belt at its device default speed"
             );
             // Nothing to apply; don't recompute on every Walking flap this session.
-            *applied = true;
+            link.mark_default_speed_applied();
             return None;
         }
         Err(err) => {
@@ -1680,7 +1585,7 @@ async fn try_apply_default_speed(
 
     // One attempt per session regardless of the write outcome (a failed write
     // must not loop on a presence flap at the crawl start).
-    *applied = true;
+    link.mark_default_speed_applied();
     let source = ControlSource::DefaultSpeed;
     match tokio::time::timeout(SPEED_RESTORE_TIMEOUT, restore_speed(peripheral, target)).await {
         Ok(Ok(())) => {
@@ -2660,14 +2565,15 @@ mod tests {
     /// `timeout(NOTIFICATION_TIMEOUT, ...)` forever.
     #[tokio::test(start_paused = true)]
     async fn telemetry_deadline_fires_despite_a_faster_sibling_arm() {
-        let last_telemetry_at = tokio::time::Instant::now();
+        let link = TreadmillLink::new(tokio::time::Instant::now());
+        let deadline = link.silence_deadline();
         let mut sibling = tokio::time::interval(Duration::from_secs(1));
         let mut ticks = 0u32;
 
         let fired = loop {
             tokio::select! {
                 biased;
-                _ = tokio::time::sleep_until(last_telemetry_at + NOTIFICATION_TIMEOUT) => break true,
+                _ = tokio::time::sleep_until(link.silence_deadline()) => break true,
                 _ = sibling.tick() => {
                     ticks += 1;
                     // Guard against an infinite loop if the deadline never lands.
@@ -2680,9 +2586,18 @@ mod tests {
 
         assert!(fired, "telemetry deadline never fired");
         assert_eq!(
-            last_telemetry_at.elapsed(),
+            deadline.elapsed(),
+            Duration::ZERO,
+            "deadline must land exactly at silence_deadline, not drift with the sibling"
+        );
+        assert_eq!(
+            link.silence_deadline().elapsed(),
+            Duration::ZERO,
+        );
+        // Elapsed since construction equals the timeout when the arm fires.
+        assert_eq!(
+            (deadline - NOTIFICATION_TIMEOUT).elapsed(),
             NOTIFICATION_TIMEOUT,
-            "deadline must land exactly at the timeout, not drift with the sibling"
         );
     }
 
@@ -2808,59 +2723,6 @@ mod tests {
         assert_eq!(speed_restore_target(2.5, 3.0), None);
         // Within epsilon → treated as no change.
         assert_eq!(speed_restore_target(2.5, 2.48), None);
-    }
-
-    #[test]
-    fn cruising_speed_ignores_the_deceleration_tail() {
-        // arr — steady 2.5 walk, then the belt ramps itself down over the last
-        // ~3s into the pause (the real W2 Pro pattern from the logs).
-        let pause = Instant::now();
-        let mut samples: Vec<(Instant, f32)> = Vec::new();
-        for secs_ago in 11..=40 {
-            samples.push((pause - Duration::from_secs(secs_ago), 2.5)); // cruising, before decel
-        }
-        samples.push((pause - Duration::from_secs(3), 1.8)); // decel tail — inside the skip window
-        samples.push((pause - Duration::from_secs(2), 1.0));
-        samples.push((pause - Duration::from_secs(1), 0.6));
-
-        // act / assert — the tail is excluded, so we get the real walking speed.
-        assert_eq!(cruising_speed(&samples, pause), Some(2.5));
-    }
-
-    #[test]
-    fn cruising_speed_takes_the_median_of_varied_walking() {
-        let pause = Instant::now();
-        let samples = [
-            (pause - Duration::from_secs(30), 2.0),
-            (pause - Duration::from_secs(25), 2.5),
-            (pause - Duration::from_secs(20), 3.0),
-        ];
-        assert_eq!(cruising_speed(&samples, pause), Some(2.5));
-    }
-
-    #[test]
-    fn cruising_speed_falls_back_to_peak_for_a_short_session() {
-        // Every sample is inside the decel-skip window (walked only ~5s), so the
-        // median path finds nothing and we take the fastest walking sample seen —
-        // never the decel tail.
-        let pause = Instant::now();
-        let samples = [
-            (pause - Duration::from_secs(5), 2.5),
-            (pause - Duration::from_secs(2), 1.2),
-            (pause - Duration::from_secs(1), 0.6),
-        ];
-        assert_eq!(cruising_speed(&samples, pause), Some(2.5));
-    }
-
-    #[test]
-    fn cruising_speed_is_none_without_any_walking_sample() {
-        // Belt never got above the floor (pure idle/ramp) → caller must fall back.
-        let pause = Instant::now();
-        let samples = [
-            (pause - Duration::from_secs(20), 0.5),
-            (pause - Duration::from_secs(2), 0.6),
-        ];
-        assert_eq!(cruising_speed(&samples, pause), None);
     }
 
     #[test]
