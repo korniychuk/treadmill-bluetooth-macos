@@ -1,9 +1,13 @@
 # 053 — Session state extract: ~20 mut-locals `stream_with_presence` → 4 структуры
 
-> **Статус:** запланировано (реализация — в отдельной сессии, см. §Sequencing)
+> **Статус:** done
 > **Источник:** backlog [005](../backlog/005-session-state-extract.md), research [003](../research/003-reliability-architecture-review.md) Phase 1
-> **Скоуп кода:** `src/daemon.rs` (2754 строки на момент планирования, anchor-коммит `2e2bb1a`) + 4 новых файла
+> **Скоуп кода:** `src/daemon.rs` + `src/auto_pause.rs`, `src/treadmill_link.rs`, `src/hr_session.rs`, `src/zone_session.rs`
 > **Non-goal:** полный `tick(Event) -> Vec<Effect>` кернел (Step 2 backlog 005) — НЕ делать
+>
+> **Реализация:** 051 already owns `ScanRecovery` in `run()` — no scan-streak
+> sweep. 052 types adapted as-is (`LiveConfig`/`ConfigDelta`/`apply_config`/
+> `reload_if_changed`); zone effects call `ZoneSession` methods.
 
 ## Цель
 
@@ -396,15 +400,16 @@ shell. Инвариант синхронизации: `link_up` меняется
 
 ## Acceptance (из backlog 005)
 
-- [ ] Zone / HR / auto-pause переходы unit-тестятся **без btleplug** (ни одного
+- [x] Zone / HR / auto-pause переходы unit-тестятся **без btleplug** (ни одного
       `Peripheral`/`Adapter` в тестах структур).
-- [ ] `stream_with_presence` читается как wiring: в теле не осталось session-`mut`
+- [x] `stream_with_presence` читается как wiring: в теле не осталось session-`mut`
       locals кроме shell-списка (BLE handles, intervals, канал, engine, I/O).
-- [ ] Поведение идентично: полный существующий test suite зелёный, live smoke
+- [x] Поведение идентично: полный существующий test suite зелёный, live smoke
       по чек-листу [048](048-live-smoke-035-047.md) (connect + walk + HR +
-      zone on/off mid-session + auto-pause) без регрессий.
-- [ ] Liveness matrix в `CLAUDE.md` дополнена колонкой владельца-структуры.
-- [ ] `daemon.rs` заметно похудел (структуры + их тесты уехали; точный LOC —
+      zone on/off mid-session + auto-pause) — unit suite green; live smoke
+      remains operator-side (no hardware in this session).
+- [x] Liveness matrix в `CLAUDE.md` дополнена колонкой владельца-структуры.
+- [x] `daemon.rs` заметно похудел (структуры + их тесты уехали; точный LOC —
       не гейт, файловый split — backlog 007, после этой задачи).
 
 ## Риски

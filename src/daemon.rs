@@ -67,6 +67,22 @@
 //!    [`SCAN_RECYCLE_MAX`] recycles without a successful scan start, exit
 //!    [`SCAN_WEDGED_EXIT_CODE`]. Healthy outcomes ("no FTMS treadmill found")
 //!    reset both counters — never recycle/exit on a merely powered-off belt.
+//!
+//! ## Session state (задача 053)
+//!
+//! `stream_with_presence` is wiring: each `select!` arm calls methods on
+//! session structs, then existing side effects (BLE / SQLite / toast).
+//!
+//! | Struct | Module | Owns |
+//! |---|---|---|
+//! | [`AutoPause`](crate::auto_pause::AutoPause) | `auto_pause` | away spell + idle-belt pause latch |
+//! | [`TreadmillLink`](crate::treadmill_link::TreadmillLink) | `treadmill_link` | telemetry silence + speed memory |
+//! | [`HrSession`](crate::hr_session::HrSession) | `hr_session` | HR link/contact/battery/connect latch |
+//! | [`ZoneSession`](crate::zone_session::ZoneSession) | `zone_session` | Zone Hold phase + pure `tick` → `ZoneWrite` |
+//!
+//! Shell keeps BLE handles, intervals, the control/config channel plumbing,
+//! and `ActivityAccumulator`. Scan-health streak lives in [`ScanRecovery`]
+//! (`run()` scope), not session state.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

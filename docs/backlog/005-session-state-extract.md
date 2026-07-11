@@ -1,6 +1,6 @@
 # 005 — Session state extract (лёгкий kernel)
 
-**Status:** backlog  
+**Status:** Step 1 done (задача [053](../tasks/053-session-state-extract.md)); Step 2 still optional  
 **Depends on:** Phase 0 tasks [035](../tasks/035-hr-relative-timeout-in-select.md)–[038](../tasks/038-tm-doctor-liveness-matrix.md) ideally landed first  
 **Source:** [research/003](../research/003-reliability-architecture-review.md) Phase 1
 

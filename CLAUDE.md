@@ -95,18 +95,30 @@ This file is read by two different agents. Follow the branch that matches who yo
   — строго календарный, не тронут. Старая таблица `workouts` оставлена архивом
   (сид сегментов из неё одноразовый, ничто в неё больше не пишет).
 - `src/daemon.rs` — фоновый цикл (LaunchAgent): авто-скан/коннект/реконнект +
-  presence + toast; открывает/продлевает **сегмент** активности на зачтённом
-  шаге и закрывает его (in-memory `current_segment=None`) в presence-переходе
-  при уходе из `Walking` (задача 014); на resume после паузы авто-восстанавливает
-  pre-pause скорость ленты через `control.rs` (bounded BLE-write, см. `docs/tasks/012`).
+  presence + toast; `stream_with_presence` — thin wiring (задача 053): arm →
+  метод session-структуры → side-effect (BLE/SQLite/toast). Открывает/продлевает
+  **сегмент** активности на зачтённом шаге и закрывает его (in-memory
+  `current_segment=None`) в presence-переходе при уходе из `Walking` (задача 014);
+  на resume после паузы авто-восстанавливает pre-pause скорость ленты через
+  `control.rs` (bounded BLE-write, см. `docs/tasks/012`).
   Единственный владелец BLE-линка: команды управления (`tm speed`/`start`/`stop`)
   от CLI идут через SQLite-очередь `control_commands` и исполняются здесь на живом
   подключении (задача 013). CLI напрямую открывает BLE только если демон не держит линк.
   Авто-пауза простаивающей ленты (задача 020): если `AwayWhileRunning` длится
   дольше `auto_pause_minutes` (дефолт 5, `0` — выкл.), демон шлёт `Stop` (тот же
   bounded Control-Point round-trip), лента гаснет своим встроенным shutoff'ом;
-  чистое решение `auto_pause_due`, одна попытка на away-spell + ретрай через
-  cooldown при сбое.
+  решение в `AutoPause` (`due` / spell latch), shell пишет Control Point.
+- `src/auto_pause.rs` — `AutoPause` (задача 053/020): away-spell, one-shot fire,
+  retry cooldown; время инъекцией.
+- `src/treadmill_link.rs` — `TreadmillLink` (задача 053): silence clock
+  (`silence_deadline` / absolute `sleep_until`), speed history + cruising,
+  pause/resume memory, once-per-session default-speed flag.
+- `src/hr_session.rs` — `HrSession` (задача 053/025/033): HR link + contact +
+  battery + connect latch; `link_up` paired with shell `hr_notifications`;
+  invariant `hr_connected=false ⇒ last_bpm=None`.
+- `src/zone_session.rs` — `ZoneSession` (задача 053/027): phase machine,
+  pure `tick` → `ZoneWrite` (decision/effect split), override window, snapshot;
+  config-reload effects as method receivers of `ConfigDelta` (задача 052).
   Пульс (задача 025): второй, независимый BLE-линк (HR-датчик, напр. Polar
   H10). Коннект/реконнект — best-effort на **отдельной spawned-таске**
   (`spawn_hr_connect_attempt`), чтобы скан (до 15с, нормальный исход когда
@@ -241,17 +253,19 @@ This file is read by two different agents. Follow the branch that matches who yo
   обычным цветом состояния, `kmh` — приглушённым, как день-тотал у
   остальных метрик.
 
-## Liveness matrix (инвариант, задачи 031/035/038)
+## Liveness matrix (инвариант, задачи 031/035/038/053)
 
-Не смешивать эти «живости» — каждый сигнал кормит свой контур:
+Не смешивать эти «живости» — каждый сигнал кормит свой контур и имеет
+**своего** владельца-структуру (задача 053), чтобы новая фича не переиспользовала
+чужой сброс таймера:
 
-| Сигнал | Что значит | Кормит |
-|---|---|---|
-| Event-loop progress | `persist()` / любой arm | `Watchdog::touch` (hang → exit) |
-| Treadmill telemetry | decoded `0x2ACD` | `connected`, `touch_telemetry`, widget speed |
-| HR BLE link | stream open | reconnect / battery |
-| HR body contact | meaningful bpm | `hr_samples`, widget ♥, zone bpm input |
-| Config intent | `enabled` flags | phase machines (zone, auto-pause) |
+| Сигнал | Что значит | Кормит | Владелец |
+|---|---|---|---|
+| Event-loop progress | `persist()` / любой arm | `Watchdog::touch` (hang → exit) | Shell + `Watchdog` |
+| Treadmill telemetry | decoded `0x2ACD` | `connected`, `touch_telemetry`, widget speed | `TreadmillLink` |
+| HR BLE link | stream open | reconnect / battery | `HrSession` |
+| HR body contact | meaningful bpm | `hr_samples`, widget ♥, zone bpm input | `HrSession` (отдельно от link) |
+| Config intent | `enabled` flags | phase machines (zone, auto-pause) | `ZoneSession` / `AutoPause` (+ `config_apply`) |
 
 Правила: absolute `sleep_until` для silence в `select!` (не relative `timeout`);
 `hr_connected=false` ⇒ `last_bpm=None`; Zone Hold bpm только если sample fresh
