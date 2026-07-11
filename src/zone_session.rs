@@ -571,30 +571,33 @@ mod tests {
         z.phase = ZoneHoldPhase::Hold;
         z.note_cli_speed(t0);
 
-        // Force a correction: bpm well below zone with band tracking should step up.
-        // Ensure correction is due (no last_correction).
+        // Force a correction: bpm=60 is far below any default zone for age 30
+        // (hrmax 187), so band tracking must step up by max_step (2.0 → 2.3) —
+        // deterministic, and the override window must downgrade it to Suppressed.
         let w = z.tick(&config, &resolved, Some(2.0), Some(60), t0 + Duration::from_secs(1));
-        // May be Suppressed or None depending on next_speed — if Some, must be Suppressed.
-        if let Some(w) = w {
-            assert!(
-                matches!(w, ZoneWrite::Suppressed { .. }),
-                "expected Suppressed, got {w:?}"
-            );
-        }
+        assert!(
+            matches!(w, Some(ZoneWrite::Suppressed { .. })),
+            "expected Suppressed correction under override, got {w:?}"
+        );
 
-        // Safety hard-stop path: at min speed with bpm above hard stop.
-        // Build config with low min and force safety via high bpm.
-        // Harder to hit Stop without knowing hrmax — pin override doesn't suppress Stop
-        // by construction in speed_write vs Stop branch.
+        // Safety hard-stop: at min speed (1.0) with bpm=200 above both the
+        // safety cap and the 85%-hrmax hard stop (~159 for age 30). Override is
+        // active — Stop must NOT be suppressed (задача 039).
         let mut z2 = ZoneSession::new();
         z2.phase = ZoneHoldPhase::Hold;
         z2.note_cli_speed(t0);
-        // Directly verify Stop is not produced via speed_write helper path:
-        assert!(!matches!(
-            speed_write(2.0, true),
-            ZoneWrite::Stop
-        ));
-        assert_eq!(ZoneWrite::Stop, ZoneWrite::Stop);
+        let w = z2.tick(
+            &config,
+            &resolved,
+            Some(config.min_speed_kmh),
+            Some(200),
+            t0 + Duration::from_secs(1),
+        );
+        assert_eq!(
+            w,
+            Some(ZoneWrite::Stop),
+            "safety hard-stop must fire unsuppressed under operator override"
+        );
     }
 
     #[test]
