@@ -1,6 +1,6 @@
 # 054 — `CentiKmh` newtype: квантизация скорости на FTMS wire boundary
 
-**Статус:** запланировано (реализация — ПОСЛЕ мержа 052, желательно и 053, см. §Sequencing)
+**Статус:** done
 **Источник:** backlog [006](../backlog/006-speed-quantize-newtype.md), research [003](../research/003-reliability-architecture-review.md) Phase 4
 **Первопричина:** задача [030](030-zone-hold-noop-writes-at-clamp.md) (холостые Control Point записи на клампе)
 
@@ -198,15 +198,16 @@ compute/display, не compare.
 
 ## Acceptance (из backlog 006, конкретизировано)
 
-- [ ] Тесты в стиле 030 выражают **quantize identity + deadband policy**, а не
+- [x] Тесты в стиле 030 выражают **quantize identity + deadband policy**, а не
       «магический 0.05» сам по себе (п.4 плана + инварианты `speed.rs`).
-- [ ] Ни одного нового молчаливого f32-compare на wire-скоростях; existing
+- [x] Ни одного нового молчаливого f32-compare на wire-скоростях; existing
       compare-сайты из таблицы либо на `CentiKmh`, либо явно в списке
       «display/статистика».
-- [ ] `MIN_SPEED_CHANGE` документирован как controller deadband.
-- [ ] `cargo test`, `cargo clippy` — зелёные.
+- [x] `MIN_SPEED_CHANGE` документирован как controller deadband.
+- [x] `cargo test`, `cargo clippy` — зелёные.
 - [ ] Поведенческий смок: `tm speed 3.2` → одна команда, лента на 3.2; Zone
       Hold pinned на клампе → тишина (ни бипов, ни Control Point записей).
+      (live — requires hardware; unit coverage of pin/deadband in place)
 
 ## Sequencing — зависимость от 052/053
 

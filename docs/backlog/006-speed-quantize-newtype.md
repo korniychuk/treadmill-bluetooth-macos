@@ -1,6 +1,6 @@
 # 006 — `SpeedKmh` / centi quantize at decode boundary
 
-**Status:** backlog  
+**Status:** done → [054](../tasks/054-speed-centi-newtype.md)  
 **Depends on:** [030](../tasks/030-zone-hold-noop-writes-at-clamp.md) (epsilon exists); better after state extract  
 **Source:** [research/003](../research/003-reliability-architecture-review.md) Phase 4
 

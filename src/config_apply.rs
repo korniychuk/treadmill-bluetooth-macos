@@ -689,7 +689,7 @@ mod tests {
         let mut config = live(zh_enabled());
         let mut new_zh = config.zone_hold.clone();
         new_zh.deadband_bpm = 12;
-        new_zh.min_speed_kmh = 2.5;
+        new_zh.min_speed_kmh = crate::speed::CentiKmh::from_wire(250);
         new_zh.safety_cap_percent = 90.0;
         let effects = apply_config(
             &mut config,

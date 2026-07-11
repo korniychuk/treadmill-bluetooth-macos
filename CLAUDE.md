@@ -65,12 +65,17 @@ This file is read by two different agents. Follow the branch that matches who yo
   объединённый может пробить порог там, где ни одна половина не пробивала (на
   живой базе сошлось за 3 прохода). Read-only по BLE, трогает только
   `hr_samples`.
-- `src/control.rs` — FTMS Control Point (start/stop/speed).
+- `src/speed.rs` — `CentiKmh(u16)` newtype: скорость в FTMS wire-единицах
+  (0.01 km/h). Квантизация на decode/конфиг/CLI (`from_wire` / `from_kmh_f32`);
+  compare/clamp — integer (`Eq`/`Ord`). Display — человекочитаемые km/h
+  (`"3.2"`). Задача 054 / backlog 006; устраняет float-gap задачи 030.
+- `src/control.rs` — FTMS Control Point (start/stop/speed); `set_speed(CentiKmh)`.
 - `src/control_command.rs` — `ControlCommand` тип (`start`/`stop`/`speed:<kmh>`),
-  парс/формат и staleness-проверка для очереди команд (задача 013).
+  `Speed(CentiKmh)`; текстовый wire-формат очереди без изменений (задача 013/054).
 - `src/presence.rs` — детекция присутствия: лента крутится, но шаги не растут →
-  `AwayWhileRunning`. `observe(now, speed, steps)` — время инъектируется (демон
-  даёт `Instant::now()`, replay — синтез из `ts_ms`), единый источник 10с-away-порога.
+  `AwayWhileRunning`. `observe(now, speed: Option<CentiKmh>, steps)` — время
+  инъектируется (демон даёт `Instant::now()`, replay — синтез из `ts_ms`),
+  единый источник 10с-away-порога; belt stopped = `CentiKmh::ZERO`.
 - `src/activity.rs` — общий движок presence+credit+сегменты (`ActivityAccumulator`,
   `credit_or_hold`), которым гоняют **и** живой демон, **и** replay (задача 015) —
   сегментация идентична by construction, не форкается.
@@ -215,22 +220,13 @@ This file is read by two different agents. Follow the branch that matches who yo
   пишущая в Control Point, проверяет свой enable-флаг сама).
   `tm widget` — поле `HR_ZONE` (below/in/above/пусто, красится только в
   `walking` при активном контроллере); `tm status` — строка Zone Hold.
-  `next_speed` сравнивает target с измеренной скоростью через
-  `MIN_SPEED_CHANGE_KMH` (0.05 км/ч), не на точное равенство (задача
-  030) — на клампе (min/max) телеметрия (`raw as f32 * 0.01` в
-  `ftms.rs`) и клампованный target (из конфиг-парсинга) никогда не
-  совпадают побитово (наблюдался фиксированный разрыв ~2e-7, не шум —
-  проверено сырыми сэмплами, скорость была абсолютно константной),
-  точное сравнение давало холостые Control Point записи
-  (RequestControl+SetSpeed, двойной бип ленты) каждые ~20с без реального
-  изменения скорости, пока ЧСС вне зоны. Порог на порядки выше этого
-  разрыва и wire-точности FTMS (0.01 км/ч), ниже `max_step_kmh` —
-  настоящие коррекции не глушатся. `zone_hold_tick` (`daemon.rs`)
-  принимает скорость как `Option<f32>` (было `f32` с `unwrap_or(0.0)`
-  на call site) и молча пропускает тик, если в конкретном
-  FTMS-фрейме скорости нет (легитимный `MORE_DATA`-сплит, `ftms.rs`) —
-  подстановка `0.0` читалась бы как "лента встала" и могла обвалить
-  команду до `min_speed_kmh` на живой скорости.
+  `next_speed` / clamp-сравнения — на `CentiKmh` (задача 054): wire-скорости
+  сравниваются integer'ом; representation gap задачи 030 устранён by
+  construction. `MIN_SPEED_CHANGE = CentiKmh(5)` (0.05 км/ч) остаётся
+  **controller deadband** (политика «не дёргай ленту из-за мелочи»), не
+  float-glue. `ZoneSession::tick` принимает `Option<CentiKmh>` и молча
+  пропускает тик, если в FTMS-фрейме скорости нет (легитимный
+  `MORE_DATA`-сплит) — подстановка нуля читалась бы как «лента встала».
 - `src/goals.rs` (доп., задача 029) — `load_show_speed()` (top-level
   `show_speed`, тот же absent-тихо/invalid-WARN стиль, дефолт `false`) +
   `upsert_top_level_key(path, key, value)` — line-based апдейт **top-level**
