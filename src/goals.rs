@@ -21,16 +21,49 @@ use std::time::{Duration, SystemTime};
 
 use tracing::{info, warn};
 
+/// Bound on symlink-chain resolution in [`write_atomic`] — a config path is a
+/// hand-made link (usually one hop into a dotfiles repo), so anything deeper
+/// smells like a loop; we stop and write at the last resolved path.
+const MAX_SYMLINK_HOPS: usize = 8;
+
+/// Follow `path` through symlinks to the file the write must land in.
+///
+/// `fs::canonicalize` is not usable here: it fails on a dangling link (the
+/// target may not exist yet — reviving it by creating the target is exactly
+/// what we want) and on a not-yet-existing plain path.
+fn resolve_symlinks(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let Ok(link) = std::fs::read_link(&current) else {
+            return current;
+        };
+        current = if link.is_absolute() {
+            link
+        } else {
+            // A relative link target is relative to the link's directory.
+            current.parent().map_or(link.clone(), |dir| dir.join(&link))
+        };
+    }
+    warn!(path = %path.display(), hops = MAX_SYMLINK_HOPS, "symlink chain too deep — writing at last resolved path");
+    current
+}
+
 /// Write `contents` to `path` via same-directory temp + rename (задача 037).
 ///
 /// `std::fs::write` truncates first: a crash between truncate and complete write
 /// permanently wipes the operator's `config.toml`. Writing a sibling `*.tmp`
 /// then `rename(2)` keeps the old file intact until the new body is durable
 /// (same FS, atomic replace on macOS).
+///
+/// Symlinks are resolved first (задача 056): `rename(2)` replaces the *link
+/// itself* with the temp file, silently detaching a config kept as a symlink
+/// into a dotfiles repo. Writing at the resolved target keeps the link alive
+/// and lands the content where the operator tracks it.
 pub(crate) fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
-    let tmp = path.with_extension("toml.tmp");
+    let target = resolve_symlinks(path);
+    let tmp = target.with_extension("toml.tmp");
     std::fs::write(&tmp, contents.as_ref())?;
-    std::fs::rename(&tmp, path)?;
+    std::fs::rename(&tmp, &target)?;
     Ok(())
 }
 
@@ -694,6 +727,68 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn write_atomic_preserves_symlink_and_writes_through_to_target() {
+        let dir = std::env::temp_dir().join(format!("tm-atomic-link-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("dotfiles")).unwrap();
+        let target = dir.join("dotfiles/config.toml");
+        std::fs::write(&target, "goals = [8000]\n").unwrap();
+        let link = dir.join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        write_atomic(&link, "goals = [9000]\n").unwrap();
+
+        // The link must survive the write and the content must land in the target.
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "goals = [9000]\n"
+        );
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "goals = [9000]\n");
+        assert!(!target.with_extension("toml.tmp").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_atomic_revives_dangling_symlink_by_creating_the_target() {
+        let dir = std::env::temp_dir().join(format!("tm-atomic-dangling-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("dotfiles")).unwrap();
+        let target = dir.join("dotfiles/config.toml");
+        let link = dir.join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        write_atomic(&link, "goals = [7000]\n").unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "goals = [7000]\n"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_atomic_follows_relative_symlink_from_the_link_directory() {
+        let dir = std::env::temp_dir().join(format!("tm-atomic-rel-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("dotfiles")).unwrap();
+        let target = dir.join("dotfiles/config.toml");
+        std::fs::write(&target, "goals = [8000]\n").unwrap();
+        let link = dir.join("config.toml");
+        std::os::unix::fs::symlink("dotfiles/config.toml", &link).unwrap();
+
+        write_atomic(&link, "goals = [6000]\n").unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "goals = [6000]\n"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
