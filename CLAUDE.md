@@ -334,6 +334,14 @@ scripts/build-icon.sh        # перегенерировать macos/AppIcon.ic
 scripts/release.sh 0.2.0     # выпустить релиз: бамп версии + дата CHANGELOG + коммит + тег + пуш → Release-workflow (задача 024)
 ```
 
+## CI / Release
+
+GitHub Actions, оба на `macos-latest`: `ci.yml` (gate на push→main и PR;
+`test`-джоб fail-fast: `fmt --all --check` → `clippy --all-targets -D warnings` →
+`build` → `test`) и `release.yml` (на тег `v*`). Перед `git push` прогнать локальный
+mirror того же порядка — **fmt валится чаще всего** и скипает остальное. Полная
+карта (шаги, watch-команды, пакетирование релиза): **[docs/ci.md](docs/ci.md)**.
+
 Короткий алиас `tm` — симлинк на release-бинарь в `~/.bin` (в `PATH`), чтобы
 звать `tm stats` / `tm status` откуда угодно. Его **создаёт/обновляет
 `install-daemon.sh` и снимает `uninstall-daemon.sh`** (переопределяется через
