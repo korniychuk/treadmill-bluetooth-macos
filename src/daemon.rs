@@ -86,6 +86,7 @@ use tracing::{error, info, warn};
 use crate::activity::ActivityAccumulator;
 use crate::auto_pause::AutoPause;
 use crate::config_apply::{self, LiveConfig};
+use crate::hr_session::{HrFrameAction, HrReconnect, HrSession, HR_NOTIFICATION_TIMEOUT};
 use crate::control::Controller;
 use crate::control_command::{self, ControlCommand};
 use crate::default_speed;
@@ -363,23 +364,12 @@ fn operator_override_active(now: Instant, until: Option<Instant>) -> bool {
     until.is_some_and(|u| now < u)
 }
 
-/// How long to wait for the next Heart Rate Measurement notification before
-/// treating the strap as removed/lost (задача 025). A worn H10 sends samples
-/// ~1/s, same cadence as the treadmill's own telemetry; generous margin above
-/// jitter while still catching a removed strap quickly.
-///
-/// Must be an **absolute** `sleep_until` deadline in `select!` (задача 035), not
-/// a relative `timeout` around `stream.next()` — sibling arms (command_tick 1s,
-/// treadmill frames) rebuild every arm and would reset a relative timeout forever
-/// (same class as задача 031 for treadmill telemetry).
-const HR_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Max age of `last_bpm` before Zone Hold treats bpm as absent (задача 035
 /// defense-in-depth). Matches widget/`tm status` HR freshness (15s): the control
 /// path must not feed a frozen bpm into speed corrections when notify has gone
-/// silent but the BLE link is still up. Slightly above [`HR_NOTIFICATION_TIMEOUT`]
-/// so silence-detection reconnects first when the absolute deadline works; this
-/// gate still protects if that path lags.
+/// silent but the BLE link is still up. Slightly above
+/// [`HR_NOTIFICATION_TIMEOUT`] so silence-detection reconnects first when the
+/// absolute deadline works; this gate still protects if that path lags.
 const ZH_BPM_MAX_AGE: Duration = Duration::from_secs(15);
 
 /// How often the daemon retries finding/connecting an HR sensor while one
@@ -388,35 +378,12 @@ const ZH_BPM_MAX_AGE: Duration = Duration::from_secs(15);
 /// (not everyone wears the strap every walk), so this must not spam scans.
 const HR_RECONNECT_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Max time an HR connect attempt may stay "in flight" before the latch is
-/// cleared and another attempt is allowed (задача 042). Scan is up to 15s plus
-/// connect/subscribe margin; without this a vanished spawned task leaves
-/// `hr_connect_in_flight=true` forever and reconnect dies for the session.
-const HR_CONNECT_ATTEMPT_DEADLINE: Duration = Duration::from_secs(60);
-
 /// How often to check whether it's time to re-read the HR sensor's battery
 /// level (задача 026) — a cheap in-memory elapsed-time check, same pattern as
 /// `CONFIG_RELOAD_INTERVAL`'s mtime check. The actual re-read cadence is
-/// [`hr_battery_poll_interval`]; this just bounds how promptly a newly-crossed
-/// threshold is noticed.
+/// owned by [`HrSession::battery_read_due`]; this just bounds how promptly a
+/// newly-crossed threshold is noticed.
 const HR_BATTERY_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
-
-/// Default re-read cadence for the HR sensor's battery level. Deliberately
-/// coarse: the percentage barely moves hour to hour, and (unlike e.g. the
-/// treadmill's own telemetry) re-reading more often would not meaningfully
-/// extend the sensor's battery life either — a single-byte GATT read is
-/// negligible next to the H10's ~400h battery budget. This is purely about
-/// not doing pointless work, not about conserving the sensor.
-const HR_BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
-
-/// Tighter re-read cadence once the last known level is at/below
-/// [`HR_BATTERY_LOW_THRESHOLD_PCT`] — so a "getting low" warning doesn't sit
-/// stale for a whole hour while the strap approaches empty.
-const HR_BATTERY_POLL_INTERVAL_LOW: Duration = Duration::from_secs(30 * 60);
-
-/// Battery level at/below which [`HR_BATTERY_POLL_INTERVAL_LOW`] applies, and
-/// (in the tmux widget's own presentation logic) a low-battery glyph is shown.
-const HR_BATTERY_LOW_THRESHOLD_PCT: u8 = 20;
 
 /// Minimum gap between repeated Zone Hold safety-cap writes (задача 027) — the
 /// bpm condition is checked every telemetry sample (~1/s) for responsiveness,
@@ -430,17 +397,6 @@ const ZONE_HOLD_SAFETY_COOLDOWN: Duration = Duration::from_secs(5);
 /// belt outright instead of merely force-reducing (task doc §Safety: "ниже
 /// AHA-85% ... консервативно для unsupervised low-intensity").
 const ZONE_HOLD_HARD_STOP_PERCENT: f32 = 85.0;
-
-/// How often to re-read the HR sensor's battery level, given the last known
-/// level (`None` = never read yet, so due immediately). Pure/unit-tested —
-/// see module docs on why this is about avoiding pointless work, not battery
-/// conservation.
-fn hr_battery_poll_interval(last_known_pct: Option<u8>) -> Duration {
-    match last_known_pct {
-        Some(pct) if pct <= HR_BATTERY_LOW_THRESHOLD_PCT => HR_BATTERY_POLL_INTERVAL_LOW,
-        _ => HR_BATTERY_POLL_INTERVAL,
-    }
-}
 
 /// A live notification stream from an HR peripheral (matches the type
 /// `btleplug::api::Peripheral::notifications` returns).
@@ -884,33 +840,17 @@ async fn stream_with_presence(
     // this loop's telemetry handling.
     let (hr_tx, mut hr_rx) = tokio::sync::mpsc::unbounded_channel::<HrConnectOutcome>();
     let mut hr_peripheral: Option<Peripheral> = None;
+    // BLE stream handle — must stay in sync with `hr.link_up()` (задача 053).
+    // Flips only alongside `HrSession::on_connected` / `on_link_lost`.
     let mut hr_notifications: Option<HrNotificationStream> = None;
-    let mut hr_connect_in_flight = true;
-    let mut hr_connect_started_at = Instant::now();
+    let mut hr = HrSession::new_connecting(Instant::now(), tokio::time::Instant::now());
     spawn_hr_connect_attempt(adapter.clone(), hr_tx.clone());
     let mut hr_reconnect_tick = tokio::time::interval(HR_RECONNECT_INTERVAL);
-    // Battery level (задача 026): last known percentage + when it was read,
-    // so the adaptive re-read cadence (`hr_battery_poll_interval`) can decide
-    // whether a fresh read is due. Reset alongside the rest of the HR state
-    // whenever the link is lost — a stale percentage from a removed strap
-    // must not linger in `daemon_status`.
-    let mut hr_battery_pct: Option<u8> = None;
-    let mut hr_battery_last_read: Option<Instant> = None;
     let mut hr_battery_check_tick = tokio::time::interval(HR_BATTERY_CHECK_INTERVAL);
-    // Contact state, tracked separately from the BLE link (задача 033): a strap
-    // taken off keeps notifying with a frozen bpm, so the link says "connected"
-    // while the reading is meaningless. The tracker is per-link — reset with the
-    // rest of the HR state whenever the link dies.
-    let mut hr_contact_tracker = hr::ContactTracker::default();
-    let mut hr_contact = hr::Contact::Live;
-
     // Consecutive per-sample DB persist failures (backlog 010) — reset on the
     // first successful persist. Deliberately NOT part of `TreadmillLink`: the
     // counter tracks DB health, which outlives any single BLE session.
     let mut db_persist_failures: u32 = 0;
-    // Absolute HR-silence deadline (задача 035), advanced only by a received
-    // `0x2A37` frame or when a new HR stream is installed — never by sibling arms.
-    let mut last_hr_at = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -1295,21 +1235,19 @@ async fn stream_with_presence(
             // is the routine case (no strap worn) — just let the reconnect
             // tick below try again later.
             outcome = hr_rx.recv() => {
-                hr_connect_in_flight = false;
+                hr.on_connect_finished();
                 match outcome {
                     Some(HrConnectOutcome::Connected(peripheral, stream, battery_pct)) => {
                         info!(?battery_pct, "HR sensor connected and streaming");
-                        state.hr_connected = true;
-                        // Fresh link ⇒ fresh contact evidence (задача 033).
-                        hr_contact_tracker = hr::ContactTracker::default();
-                        hr_contact = hr::Contact::Live;
+                        // Keep link_up ↔ hr_notifications in lockstep (задача 053).
                         hr_notifications = Some(stream);
-                        // Give the first frame the full silence window (задача 035).
-                        last_hr_at = tokio::time::Instant::now();
+                        hr.on_connected(
+                            battery_pct,
+                            Instant::now(),
+                            tokio::time::Instant::now(),
+                            state,
+                        );
                         hr_peripheral = Some(peripheral);
-                        hr_battery_pct = battery_pct;
-                        hr_battery_last_read = Some(Instant::now());
-                        state.hr_battery_pct = battery_pct.map(|p| p as i64);
                         state.persist(store, watchdog)?;
                     }
                     Some(HrConnectOutcome::NotFound) => {}
@@ -1332,67 +1270,39 @@ async fn stream_with_presence(
             } => {
                 match hr_notification {
                     Some(notification) if notification.uuid == hr::HEART_RATE_MEASUREMENT => {
-                        // Any frame advances the silence clock — including
-                        // contact-Lost frozen bpm — so partial silence still
-                        // uses the absolute deadline, not contact logic.
-                        last_hr_at = tokio::time::Instant::now();
+                        let tokio_now = tokio::time::Instant::now();
                         if let Some(m) = hr::parse_hr_measurement(&notification.value) {
-                            // Contact, not link (задача 033). A strap off the
-                            // body still notifies ~1/s with the last bpm frozen;
-                            // storing those samples poisons `hr_summary_for`
-                            // (a whole workout once read `♥ 111/111`).
                             let frame_ts_ms = Utc::now().timestamp_millis();
-                            let contact = hr_contact_tracker.observe(&m, frame_ts_ms);
-                            let changed = contact != hr_contact;
-                            hr_contact = contact;
-                            match contact {
-                                hr::Contact::Live => {
-                                    if changed {
-                                        info!(bpm = m.bpm, "HR sensor contact regained");
-                                    }
-                                    let ts_ms = frame_ts_ms;
-                                    store.insert_hr_sample(session_id, ts_ms, &m, &notification.value)?;
-                                    state.hr_connected = true;
-                                    state.last_bpm = Some(m.bpm as i64);
-                                    state.last_bpm_ts = Some(ts_ms);
+                            match hr.on_frame(&m, frame_ts_ms, tokio_now, state) {
+                                HrFrameAction::Store { ts_ms } => {
+                                    store.insert_hr_sample(
+                                        session_id,
+                                        ts_ms,
+                                        &m,
+                                        &notification.value,
+                                    )?;
                                     state.persist(store, watchdog)?;
                                 }
-                                hr::Contact::Lost => {
-                                    // Log the transition, not every frame: the
-                                    // strap can sit on the desk for hours.
-                                    if changed {
-                                        warn!(
-                                            frozen_bpm = m.bpm,
-                                            "HR sensor lost skin contact — dropping samples, keeping the BLE link"
-                                        );
-                                        // The link stays up on purpose: putting
-                                        // the strap back on recovers instantly,
-                                        // with no 15s rescan. Battery (задача
-                                        // 026) is a property of the link, so it
-                                        // survives too.
-                                        state.hr_connected = false;
-                                        state.last_bpm = None;
-                                        state.last_bpm_ts = None;
+                                HrFrameAction::Drop { state_changed } => {
+                                    if state_changed {
                                         state.persist(store, watchdog)?;
                                     }
                                 }
                             }
+                        } else {
+                            // Undecodable: still advances silence (any frame activity).
+                            hr.on_link_activity(tokio_now);
                         }
                     }
                     Some(_) => {
                         // Non-HR characteristic; still counts as link activity.
-                        last_hr_at = tokio::time::Instant::now();
+                        hr.on_link_activity(tokio::time::Instant::now());
                     }
                     None => {
                         warn!("HR notification stream ended — sensor likely removed");
-                        clear_hr_link_state(
-                            &mut hr_notifications,
-                            &mut hr_contact_tracker,
-                            &mut hr_contact,
-                            &mut hr_battery_pct,
-                            &mut hr_battery_last_read,
-                            state,
-                        );
+                        // Keep link_up ↔ hr_notifications in lockstep (задача 053).
+                        hr_notifications = None;
+                        hr.on_link_lost(state);
                         state.persist(store, watchdog)?;
                         if let Some(p) = hr_peripheral.take() {
                             scan::disconnect_best_effort(&p).await;
@@ -1402,20 +1312,15 @@ async fn stream_with_presence(
             }
             // Absolute HR silence deadline (задача 035) — same pattern as the
             // treadmill telemetry arm above (задача 031).
-            _ = tokio::time::sleep_until(last_hr_at + HR_NOTIFICATION_TIMEOUT),
-                if hr_notifications.is_some() => {
+            _ = tokio::time::sleep_until(hr.silence_deadline()),
+                if hr.link_up() => {
                 warn!(
                     timeout_s = HR_NOTIFICATION_TIMEOUT.as_secs(),
                     "no HR telemetry received — treating sensor as removed"
                 );
-                clear_hr_link_state(
-                    &mut hr_notifications,
-                    &mut hr_contact_tracker,
-                    &mut hr_contact,
-                    &mut hr_battery_pct,
-                    &mut hr_battery_last_read,
-                    state,
-                );
+                // Keep link_up ↔ hr_notifications in lockstep (задача 053).
+                hr_notifications = None;
+                hr.on_link_lost(state);
                 state.persist(store, watchdog)?;
                 if let Some(p) = hr_peripheral.take() {
                     scan::disconnect_best_effort(&p).await;
@@ -1425,41 +1330,32 @@ async fn stream_with_presence(
             // periodically rather than hammering CoreBluetooth. Also recovers a
             // stuck in-flight latch if the spawn vanished without posting
             // (задача 042).
-            _ = hr_reconnect_tick.tick(), if hr_notifications.is_none() => {
-                if hr_connect_in_flight {
-                    if hr_connect_started_at.elapsed() <= HR_CONNECT_ATTEMPT_DEADLINE {
-                        continue;
+            _ = hr_reconnect_tick.tick(), if !hr.link_up() => {
+                match hr.reconnect_decision(Instant::now()) {
+                    HrReconnect::Skip => continue,
+                    HrReconnect::Spawn => {
+                        spawn_hr_connect_attempt(adapter.clone(), hr_tx.clone());
                     }
-                    warn!(
-                        deadline_s = HR_CONNECT_ATTEMPT_DEADLINE.as_secs(),
-                        "HR connect attempt vanished — resetting latch"
-                    );
                 }
-                hr_connect_in_flight = true;
-                hr_connect_started_at = Instant::now();
-                spawn_hr_connect_attempt(adapter.clone(), hr_tx.clone());
             }
             // Battery re-read (задача 026): a cheap tick that only acts once
             // the adaptive interval has actually elapsed. Bounded inline read
             // (like the treadmill's own Control Point writes) — fine to block
             // this loop briefly given how rarely it's due (≥30 min).
             _ = hr_battery_check_tick.tick(), if hr_peripheral.is_some() => {
-                let due = hr_battery_last_read
-                    .is_none_or(|since| since.elapsed() >= hr_battery_poll_interval(hr_battery_pct));
-                if due {
+                let now = Instant::now();
+                if hr.battery_read_due(now) {
                     let peripheral = hr_peripheral.as_ref().expect("guarded by hr_peripheral.is_some()");
                     let read = scan::read_hr_battery(peripheral).await;
-                    hr_battery_last_read = Some(Instant::now());
                     if read.is_some() {
                         info!(battery_pct = ?read, "re-read HR sensor battery level");
-                        hr_battery_pct = read;
-                        state.hr_battery_pct = read.map(|p| p as i64);
+                    }
+                    // Failed read keeps last known pct; still stamps last_read
+                    // so a wedged sensor is not hammered every tick.
+                    hr.on_battery_read(read, Instant::now(), state);
+                    if read.is_some() {
                         state.persist(store, watchdog)?;
                     }
-                    // A failed read keeps the last known percentage (better a
-                    // slightly stale value than flashing to unknown), but still
-                    // stamps `hr_battery_last_read` so a persistently failing
-                    // sensor doesn't get hammered every tick.
                 }
             }
         }
@@ -1667,28 +1563,6 @@ fn zh_bpm_if_fresh(
         return None;
     }
     u16::try_from(bpm).ok()
-}
-
-/// Tear down HR *link*-scoped state after stream end or silence (задача 035).
-/// Clears bpm snapshot so `hr_connected=false` always implies `last_bpm=None`.
-/// Contact-Lost keeps the BLE stream and battery — that path does not call this.
-fn clear_hr_link_state(
-    hr_notifications: &mut Option<HrNotificationStream>,
-    hr_contact_tracker: &mut hr::ContactTracker,
-    hr_contact: &mut hr::Contact,
-    hr_battery_pct: &mut Option<u8>,
-    hr_battery_last_read: &mut Option<Instant>,
-    state: &mut DaemonState,
-) {
-    *hr_notifications = None;
-    state.hr_connected = false;
-    state.last_bpm = None;
-    state.last_bpm_ts = None;
-    *hr_contact_tracker = hr::ContactTracker::default();
-    *hr_contact = hr::Contact::Live;
-    *hr_battery_pct = None;
-    *hr_battery_last_read = None;
-    state.hr_battery_pct = None;
 }
 
 /// Park Zone Hold: phase to `Off` and clear the `tm status`/widget snapshot
@@ -2224,47 +2098,47 @@ async fn execute_control_command(
 /// rebuilt and upserted on every transition the daemon observes, so a
 /// separate `status` CLI invocation can read current state without racing
 /// the daemon for the BLE adapter.
-struct DaemonState {
-    connected: bool,
-    presence_state: Option<String>,
-    last_connected_at: Option<String>,
-    last_disconnected_at: Option<String>,
-    power_mode: &'static str,
-    power_mode_since: DateTime<Utc>,
+pub(crate) struct DaemonState {
+    pub(crate) connected: bool,
+    pub(crate) presence_state: Option<String>,
+    pub(crate) last_connected_at: Option<String>,
+    pub(crate) last_disconnected_at: Option<String>,
+    pub(crate) power_mode: &'static str,
+    pub(crate) power_mode_since: DateTime<Utc>,
     // Snapshot of the config the daemon currently holds, surfaced by `tm status`
     // (задача 022): comma-joined goals, auto-pause threshold in seconds (`None` =
     // disabled), and when the config file was last read. Updated by `set_config`
     // at startup and on each mtime-triggered reload.
-    config_goals: Option<String>,
-    config_auto_pause_secs: Option<i64>,
-    config_loaded_at: Option<String>,
+    pub(crate) config_goals: Option<String>,
+    pub(crate) config_auto_pause_secs: Option<i64>,
+    pub(crate) config_loaded_at: Option<String>,
     // Heart-rate snapshot (задача 025) — same reasoning as the rest of this
     // struct: mirrors what the daemon just observed so `tm status`/`widget`/
     // `stats` can read it without racing the daemon for BLE.
-    hr_connected: bool,
-    last_bpm: Option<i64>,
-    last_bpm_ts: Option<i64>,
+    pub(crate) hr_connected: bool,
+    pub(crate) last_bpm: Option<i64>,
+    pub(crate) last_bpm_ts: Option<i64>,
     /// HR sensor battery level, 0-100% (задача 026). `None` until read at
     /// least once this link.
-    hr_battery_pct: Option<i64>,
+    pub(crate) hr_battery_pct: Option<i64>,
     /// Zone Hold snapshot (задача 027) — mirrors `ZoneHoldPhase`/the resolved
     /// target zone so `tm status`/`tm widget` can read it without racing the
     /// daemon for BLE. See `zh_persist_snapshot`.
-    zone_hold_active: bool,
-    zone_hold_target_lo: Option<i64>,
-    zone_hold_target_hi: Option<i64>,
-    zone_hold_last_speed: Option<f64>,
-    zone_hold_phase: Option<String>,
-    zone_hold_position: Option<String>,
+    pub(crate) zone_hold_active: bool,
+    pub(crate) zone_hold_target_lo: Option<i64>,
+    pub(crate) zone_hold_target_hi: Option<i64>,
+    pub(crate) zone_hold_last_speed: Option<f64>,
+    pub(crate) zone_hold_phase: Option<String>,
+    pub(crate) zone_hold_position: Option<String>,
     /// Live belt-speed snapshot (задача 029) — updated on every telemetry
     /// sample regardless of Zone Hold, same reasoning as `last_bpm`/
     /// `last_bpm_ts` above. `last_speed_ts` is Unix millis.
-    last_speed_kmh: Option<f64>,
-    last_speed_ts: Option<i64>,
+    pub(crate) last_speed_kmh: Option<f64>,
+    pub(crate) last_speed_ts: Option<i64>,
 }
 
 impl DaemonState {
-    fn new(on_ac: bool) -> Self {
+    pub(crate) fn new(on_ac: bool) -> Self {
         Self {
             connected: false,
             presence_state: None,
@@ -2606,14 +2480,14 @@ mod tests {
     /// `stream.next()` never ages while a 1s sibling completes every pass.
     #[tokio::test(start_paused = true)]
     async fn hr_silence_deadline_fires_despite_a_faster_sibling_arm() {
-        let last_hr_at = tokio::time::Instant::now();
+        let hr = HrSession::new_connecting(Instant::now(), tokio::time::Instant::now());
         let mut sibling = tokio::time::interval(Duration::from_secs(1));
         let mut ticks = 0u32;
 
         let fired = loop {
             tokio::select! {
                 biased;
-                _ = tokio::time::sleep_until(last_hr_at + HR_NOTIFICATION_TIMEOUT) => break true,
+                _ = tokio::time::sleep_until(hr.silence_deadline()) => break true,
                 _ = sibling.tick() => {
                     ticks += 1;
                     if ticks > HR_NOTIFICATION_TIMEOUT.as_secs() as u32 * 2 {
@@ -2625,54 +2499,10 @@ mod tests {
 
         assert!(fired, "HR silence deadline never fired");
         assert_eq!(
-            last_hr_at.elapsed(),
+            (hr.silence_deadline() - HR_NOTIFICATION_TIMEOUT).elapsed(),
             HR_NOTIFICATION_TIMEOUT,
             "HR deadline must land exactly at the timeout, not drift with the sibling"
         );
-    }
-
-    #[test]
-    fn hr_connect_latch_stale_when_past_deadline() {
-        // Pure predicate mirror of the reconnect-tick recovery (задача 042).
-        let started = Instant::now();
-        assert!(
-            started
-                .elapsed()
-                .checked_sub(HR_CONNECT_ATTEMPT_DEADLINE)
-                .is_none()
-        );
-        // Document the constant is strictly above a full scan window.
-        assert!(HR_CONNECT_ATTEMPT_DEADLINE > Duration::from_secs(15));
-        assert!(HR_CONNECT_ATTEMPT_DEADLINE.as_secs() >= 45);
-    }
-
-    #[test]
-    fn clear_hr_link_state_clears_bpm_with_connected_flag() {
-        // After link loss helper, invariant holds (задача 035/042).
-        let mut state = DaemonState::new(true);
-        state.hr_connected = true;
-        state.last_bpm = Some(120);
-        state.last_bpm_ts = Some(1);
-        state.hr_battery_pct = Some(80);
-        let mut notifications: Option<HrNotificationStream> = None;
-        let mut tracker = hr::ContactTracker::default();
-        let mut contact = hr::Contact::Live;
-        let mut battery = Some(80u8);
-        let mut battery_read = Some(Instant::now());
-        clear_hr_link_state(
-            &mut notifications,
-            &mut tracker,
-            &mut contact,
-            &mut battery,
-            &mut battery_read,
-            &mut state,
-        );
-        assert!(!state.hr_connected);
-        assert!(state.last_bpm.is_none());
-        assert!(state.last_bpm_ts.is_none());
-        assert!(state.hr_battery_pct.is_none());
-        assert!(battery.is_none());
-        assert!(notifications.is_none());
     }
 
     #[test]
@@ -2738,31 +2568,6 @@ mod tests {
         state.set_power_mode(false);
         assert_eq!(state.power_mode, "battery_idle");
         assert!(state.power_mode_since >= since_before);
-    }
-
-    #[test]
-    fn hr_battery_poll_interval_is_generous_when_unknown_or_healthy() {
-        assert_eq!(hr_battery_poll_interval(None), HR_BATTERY_POLL_INTERVAL);
-        assert_eq!(
-            hr_battery_poll_interval(Some(100)),
-            HR_BATTERY_POLL_INTERVAL
-        );
-        assert_eq!(
-            hr_battery_poll_interval(Some(HR_BATTERY_LOW_THRESHOLD_PCT + 1)),
-            HR_BATTERY_POLL_INTERVAL
-        );
-    }
-
-    #[test]
-    fn hr_battery_poll_interval_tightens_at_and_below_the_low_threshold() {
-        assert_eq!(
-            hr_battery_poll_interval(Some(HR_BATTERY_LOW_THRESHOLD_PCT)),
-            HR_BATTERY_POLL_INTERVAL_LOW
-        );
-        assert_eq!(
-            hr_battery_poll_interval(Some(0)),
-            HR_BATTERY_POLL_INTERVAL_LOW
-        );
     }
 
     /// A live phase alone must never authorise a belt write: `tm zone off`

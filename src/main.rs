@@ -16,6 +16,7 @@ mod fitshow;
 mod ftms;
 mod goals;
 mod hr;
+mod hr_session;
 mod logger;
 mod notify;
 mod power;
