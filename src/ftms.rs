@@ -10,6 +10,8 @@
 
 use uuid::Uuid;
 
+use crate::speed::CentiKmh;
+
 /// Fitness Machine Service — `0x1826`.
 pub const FITNESS_MACHINE_SERVICE: Uuid = Uuid::from_u128(0x00001826_0000_1000_8000_00805f9b34fb);
 
@@ -68,10 +70,10 @@ pub fn describe_status_event(event_code: u8) -> &'static str {
 /// present; more fields can be added incrementally as they are observed.
 #[derive(Debug, Clone, Default)]
 pub struct TreadmillData {
-    /// Instantaneous speed, km/h.
-    pub speed_kmh: Option<f32>,
-    /// Average speed, km/h.
-    pub avg_speed_kmh: Option<f32>,
+    /// Instantaneous speed in FTMS wire units (0.01 km/h).
+    pub speed: Option<CentiKmh>,
+    /// Average speed in FTMS wire units (0.01 km/h).
+    pub avg_speed: Option<CentiKmh>,
     /// Instantaneous incline, percent.
     pub incline_percent: Option<f32>,
     /// Total distance, meters.
@@ -123,14 +125,13 @@ pub fn parse_treadmill_data(payload: &[u8]) -> Option<TreadmillData> {
     // Instantaneous Speed is present unless the "More Data" bit is set.
     if flags & flags::MORE_DATA == 0 {
         let raw = read_u16(payload, &mut cursor)?;
-        // Unit: 0.01 km/h.
-        data.speed_kmh = Some(raw as f32 * 0.01);
+        // Unit: 0.01 km/h — keep as wire integer (задача 054).
+        data.speed = Some(CentiKmh::from_wire(raw));
     }
 
     if flags & flags::AVG_SPEED_PRESENT != 0 {
         let raw = read_u16(payload, &mut cursor)?;
-        // Unit: 0.01 km/h.
-        data.avg_speed_kmh = Some(raw as f32 * 0.01);
+        data.avg_speed = Some(CentiKmh::from_wire(raw));
     }
 
     if flags & flags::TOTAL_DISTANCE_PRESENT != 0 {
@@ -230,7 +231,7 @@ mod tests {
         // flags = 0 (speed present, nothing else), speed = 500 -> 5.00 km/h.
         let payload = [0x00, 0x00, 0xf4, 0x01];
         let data = parse_treadmill_data(&payload).expect("should parse");
-        assert_eq!(data.speed_kmh, Some(5.0));
+        assert_eq!(data.speed, Some(CentiKmh::from_wire(500)));
         assert_eq!(data.total_distance_m, None);
     }
 
@@ -243,7 +244,7 @@ mod tests {
         payload.extend_from_slice(&[0x1e, 0x00]); // incline 3.0 %
         payload.extend_from_slice(&[0x00, 0x00]); // ramp angle
         let data = parse_treadmill_data(&payload).expect("should parse");
-        assert_eq!(data.speed_kmh, Some(5.0));
+        assert_eq!(data.speed, Some(CentiKmh::from_wire(500)));
         assert_eq!(data.total_distance_m, Some(100));
         assert_eq!(data.incline_percent, Some(3.0));
     }
@@ -269,9 +270,8 @@ mod tests {
             0xf3, 0x0d, 0x00, // steps 3571
         ];
         let data = parse_treadmill_data(&payload).expect("should parse");
-        assert_eq!(data.speed_kmh, Some(2.5));
-        let avg = data.avg_speed_kmh.expect("avg speed present");
-        assert!((avg - 2.17).abs() < 1e-4, "avg speed {avg} != ~2.17");
+        assert_eq!(data.speed, Some(CentiKmh::from_wire(250)));
+        assert_eq!(data.avg_speed, Some(CentiKmh::from_wire(217)));
         assert_eq!(data.total_distance_m, Some(1446));
         assert_eq!(data.total_energy_kcal, Some(85));
         assert_eq!(data.elapsed_s, Some(2391));
