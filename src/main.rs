@@ -25,6 +25,7 @@ mod recompute;
 mod recompute_hr;
 mod scan;
 mod sniff;
+mod speed;
 mod store;
 mod treadmill_link;
 mod widget;
@@ -287,7 +288,9 @@ async fn main() -> Result<()> {
         return run_control(ControlCommand::Stop).await;
     }
     if let Commands::Speed { kmh } = command {
-        return run_control(ControlCommand::Speed(kmh)).await;
+        let speed = crate::speed::CentiKmh::from_kmh_f32(kmh)
+            .ok_or_else(|| anyhow::anyhow!("speed {kmh} km/h out of range"))?;
+        return run_control(ControlCommand::Speed(speed)).await;
     }
 
     let adapter = scan::first_adapter().await?;
