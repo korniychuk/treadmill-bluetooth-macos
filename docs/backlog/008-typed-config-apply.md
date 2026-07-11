@@ -1,6 +1,6 @@
 # 008 — Typed config apply (`ConfigDelta` → session effects)
 
-**Status:** backlog  
+**Status:** done → [052](../tasks/052-typed-config-apply.md)  
 **Depends on:** [032](../tasks/032-zone-hold-off-still-drives-speed.md) (partial ad-hoc fix); [005](005-session-state-extract.md) for a home for `apply_config`  
 **Source:** [research/003](../research/003-reliability-architecture-review.md) Phase 3
 
@@ -25,3 +25,5 @@ Atomic write of TOML is **not** this task — see [037](../tasks/037-atomic-conf
 ## Acceptance
 
 Table-driven tests for the matrix above; no silent field copy without apply.
+
+Implemented in `src/config_apply.rs` + reload-branch executor in `daemon.rs` (задача 052).

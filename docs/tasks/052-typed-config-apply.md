@@ -1,6 +1,6 @@
 # 052 — Typed config apply: `ConfigDelta` → session effects
 
-**Статус:** запланировано (2026-07-11)
+**Статус:** сделано (2026-07-11)
 **Источник:** backlog [008](../backlog/008-typed-config-apply.md) ← research [003](../research/003-reliability-architecture-review.md) Phase 3
 **Зависимости:** задача [032](032-zone-hold-off-still-drives-speed.md) (ad-hoc фикс, который этот таск обобщает), [017](017-config-hot-reload.md) (mtime watch), [027](027-zone-hold.md) (Zone Hold), [037] (atomic TOML write — уже сделан, **не** этот таск).
 

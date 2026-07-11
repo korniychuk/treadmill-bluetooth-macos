@@ -5,6 +5,7 @@
 
 mod activity;
 mod commands;
+mod config_apply;
 mod control;
 mod control_command;
 mod daemon;

@@ -85,6 +85,7 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use crate::activity::ActivityAccumulator;
+use crate::config_apply::{self, LiveConfig};
 use crate::control::Controller;
 use crate::control_command::{self, ControlCommand};
 use crate::default_speed;
@@ -438,19 +439,6 @@ fn hr_battery_poll_interval(last_known_pct: Option<u8>) -> Duration {
         Some(pct) if pct <= HR_BATTERY_LOW_THRESHOLD_PCT => HR_BATTERY_POLL_INTERVAL_LOW,
         _ => HR_BATTERY_POLL_INTERVAL,
     }
-}
-
-/// The two hot-reloadable config values, bundled so they thread through the
-/// session loop as one `&mut`: they share a lifecycle — loaded together in
-/// [`run`], reloaded together on the `config.json` mtime watch, and snapshotted
-/// together for `tm status` (задачи 017/020/022). Keeps the config as one
-/// cohesive unit rather than two parallel parameters.
-struct LiveConfig {
-    goals: Vec<Goal>,
-    auto_pause: Option<Duration>,
-    /// Zone Hold config (задача 027), reloaded on the same mtime watch as
-    /// `goals`/`auto_pause` — they share the one config file.
-    zone_hold: zone_hold::ZoneHoldConfig,
 }
 
 /// A live notification stream from an HR peripheral (matches the type
@@ -1270,67 +1258,31 @@ async fn stream_with_presence(
                 }
             }
             _ = config_tick.tick() => {
-                // Reload config only when config.json actually changed on disk —
-                // one cheap `stat`, re-read/re-log only on a real edit (задача 017).
-                let now_mtime = goals::config_mtime();
-                if now_mtime != goals_mtime {
-                    goals_mtime = now_mtime;
-                    let reloaded = goals::load_goals();
-                    if reloaded != config.goals {
-                        info!(goals = ?reloaded, "goals config changed on disk — reloaded without a daemon restart");
-                        config.goals = reloaded;
-                    }
-                    // Same mtime gate reloads the idle-belt auto-pause threshold
-                    // (задача 020) — an edit takes effect without a restart.
-                    let reloaded_auto_pause = goals::load_auto_pause();
-                    if reloaded_auto_pause != config.auto_pause {
-                        info!(?reloaded_auto_pause, "auto-pause threshold changed on disk — reloaded without a daemon restart");
-                        config.auto_pause = reloaded_auto_pause;
-                    }
-                    // Same mtime gate reloads the Zone Hold config (задача 027) —
-                    // an edit (e.g. `tm zone` writing new limits) takes effect
-                    // without a restart.
-                    let reloaded_zone_hold = zone_hold::load_zone_hold_config();
-                    if reloaded_zone_hold != config.zone_hold {
-                        info!(enabled = reloaded_zone_hold.enabled, "zone_hold config changed on disk — reloaded without a daemon restart");
-                        config.zone_hold = reloaded_zone_hold;
-                    }
-                    // `tm zone off` mid-session must stop the belt corrections
-                    // *now*, not at the next presence transition (задача 032):
-                    // the phase outlives the config edit, and a live `Ramp` kept
-                    // pulling the operator's manual speed back to its target.
-                    if !config.zone_hold.enabled && zh_phase != ZoneHoldPhase::Off {
-                        info!("zone hold: disabled in config — disengaging mid-session");
-                        disengage_zone_hold(&mut zh_phase, state);
-                    }
-                    // `tm zone on` is routinely run mid-session (as here), not
-                    // only before a walk starts. Without this, the phase stays
-                    // `Off` until the next presence transition — which on a
-                    // long session may never come — leaving "on (not currently
-                    // engaged)" stuck for the rest of the workout. Engage the
-                    // same way a fresh Unknown→Walking transition would.
-                    if zh_phase == ZoneHoldPhase::Off && accumulator.state() == PresenceState::Walking {
-                        // Prefer last measured walking speed; min_speed only as
-                        // engage seed when we have *some* observation (задача 036
-                        // forbids inventing 0.0, not a known min floor).
-                        let zh_resumed_kmh = last_walking_speed.or(Some(config.zone_hold.min_speed_kmh));
-                        let zh_default_kmh = default_speed::compute_default_speed(store, goals::load_workout_gap_minutes())
-                            .ok()
-                            .flatten()
-                            .map(|d| d.kmh)
-                            .unwrap_or(config.zone_hold.min_speed_kmh);
-                        zone_hold_on_transition(
+                // Typed hot-reload (задача 052): mtime gate → ConfigDelta →
+                // apply_config → effect executor. No silent field copies.
+                if let Some(delta) =
+                    config_apply::reload_if_changed(&mut goals_mtime, config)
+                {
+                    // Empty delta (mtime moved, content identical): still refresh
+                    // the status snapshot below; no effects, no change logs.
+                    if !delta.is_empty() {
+                        let snap = config_apply::SessionSnapshot {
+                            phase: zh_phase.kind(),
+                            walking: accumulator.state() == PresenceState::Walking,
+                        };
+                        let effects = config_apply::apply_config(config, delta, &snap);
+                        execute_config_effects(
+                            &effects,
+                            config,
                             &mut zh_phase,
-                            PresenceState::Unknown,
-                            PresenceState::Walking,
-                            &config.zone_hold,
-                            zh_resumed_kmh,
-                            zh_default_kmh,
-                            Instant::now(),
+                            state,
+                            last_walking_speed,
+                            store,
                         );
                     }
                     // Refresh the loaded-config snapshot + last-read time shown by
-                    // `tm status` (задача 022): the file was actually re-read here.
+                    // `tm status` (задача 022): the file was actually re-read here
+                    // even when the delta is empty (mtime moved, content identical).
                     state.set_config(&config.goals, config.auto_pause);
                     state.persist(store, watchdog)?;
                 }
@@ -1828,6 +1780,113 @@ impl ZoneHoldPhase {
             ZoneHoldPhase::Hold => "hold",
             ZoneHoldPhase::Frozen => "frozen",
             ZoneHoldPhase::Grace { .. } => "grace",
+        }
+    }
+
+    /// Flat phase kind for pure config-apply decisions (задача 052) — no
+    /// `Instant` payload crosses the module boundary.
+    fn kind(&self) -> config_apply::PhaseKind {
+        match self {
+            ZoneHoldPhase::Off => config_apply::PhaseKind::Off,
+            ZoneHoldPhase::Ramp { .. } => config_apply::PhaseKind::Ramp,
+            ZoneHoldPhase::Hold => config_apply::PhaseKind::Hold,
+            ZoneHoldPhase::Frozen => config_apply::PhaseKind::Frozen,
+            ZoneHoldPhase::Grace { .. } => config_apply::PhaseKind::Grace,
+        }
+    }
+}
+
+/// Execute session effects from a config hot-reload (задача 052). Each effect
+/// produces exactly one log line; field values are already applied by
+/// [`config_apply::apply_config`].
+fn execute_config_effects(
+    effects: &[config_apply::ConfigEffect],
+    config: &LiveConfig,
+    zh_phase: &mut ZoneHoldPhase,
+    state: &mut DaemonState,
+    last_walking_speed: Option<f32>,
+    store: &Store,
+) {
+    use config_apply::{ConfigEffect, DisengageReason};
+
+    for effect in effects {
+        match effect {
+            ConfigEffect::GoalsChanged => {
+                info!(
+                    goals = ?config.goals,
+                    "goals config changed on disk — reloaded without a daemon restart"
+                );
+            }
+            ConfigEffect::AutoPauseChanged => {
+                info!(
+                    auto_pause = ?config.auto_pause,
+                    "auto-pause threshold changed on disk — reloaded without a daemon restart"
+                );
+            }
+            ConfigEffect::ZoneDisengage(DisengageReason::DisabledInConfig) => {
+                info!("zone hold: disabled in config — disengaging mid-session");
+                disengage_zone_hold(zh_phase, state);
+            }
+            ConfigEffect::ZoneDisengage(DisengageReason::TargetUnresolvable) => {
+                warn!(
+                    "zone hold: target zone no longer resolvable after config reload — disengaging"
+                );
+                disengage_zone_hold(zh_phase, state);
+            }
+            ConfigEffect::ZoneEngage => {
+                // Prefer last measured walking speed; min_speed only as
+                // engage seed when we have *some* observation (задача 036
+                // forbids inventing 0.0, not a known min floor).
+                let zh_resumed_kmh =
+                    last_walking_speed.or(Some(config.zone_hold.min_speed_kmh));
+                let zh_default_kmh =
+                    default_speed::compute_default_speed(store, goals::load_workout_gap_minutes())
+                        .ok()
+                        .flatten()
+                        .map(|d| d.kmh)
+                        .unwrap_or(config.zone_hold.min_speed_kmh);
+                zone_hold_on_transition(
+                    zh_phase,
+                    PresenceState::Unknown,
+                    PresenceState::Walking,
+                    &config.zone_hold,
+                    zh_resumed_kmh,
+                    zh_default_kmh,
+                    Instant::now(),
+                );
+            }
+            ConfigEffect::ZoneReResolve => {
+                match config.zone_hold.resolve_target_zone() {
+                    Some(resolved) => {
+                        info!(
+                            lo = resolved.low_bpm,
+                            hi = resolved.high_bpm,
+                            zone = %resolved.name,
+                            "zone hold: re-resolved target zone after config reload"
+                        );
+                        state.zone_hold_target_lo = Some(i64::from(resolved.low_bpm));
+                        state.zone_hold_target_hi = Some(i64::from(resolved.high_bpm));
+                    }
+                    None => {
+                        // apply_config emits Disengage instead of ReResolve when
+                        // unresolvable; keep defense in depth.
+                        warn!(
+                            "zone hold: re-resolve failed after config reload — disengaging"
+                        );
+                        disengage_zone_hold(zh_phase, state);
+                    }
+                }
+            }
+            ConfigEffect::ZoneWarmupRetarget {
+                old_minutes,
+                new_minutes,
+            } => {
+                info!(
+                    old_minutes,
+                    new_minutes,
+                    "zone hold: warmup_minutes changed mid-ramp — retargeting without restart"
+                );
+            }
         }
     }
 }
