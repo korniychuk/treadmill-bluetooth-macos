@@ -11,8 +11,10 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
+
+use crate::speed::CentiKmh;
 
 /// How old a queued command may get before the daemon refuses to execute it.
 ///
@@ -27,21 +29,22 @@ pub const CONTROL_STALE_THRESHOLD: Duration = Duration::from_secs(30);
 /// A one-shot FTMS control command routed through the queue. `Incline` is
 /// intentionally absent — the daemon has no incline path and this device
 /// rejects it anyway (see `docs/tasks/003`); `tm incline` stays direct-BLE.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlCommand {
     Start,
     Stop,
-    Speed(f32),
+    Speed(CentiKmh),
 }
 
 impl ControlCommand {
     /// Compact string persisted in `control_commands.command`: `start`,
-    /// `stop`, or `speed:<kmh>` (e.g. `speed:2.5`).
+    /// `stop`, or `speed:<kmh>` (e.g. `speed:2.5`). Human-readable km/h
+    /// outside; [`CentiKmh`] inside.
     pub fn to_wire(self) -> String {
         match self {
             Self::Start => "start".to_string(),
             Self::Stop => "stop".to_string(),
-            Self::Speed(kmh) => format!("speed:{kmh}"),
+            Self::Speed(speed) => format!("speed:{speed}"),
         }
     }
 
@@ -53,13 +56,16 @@ impl ControlCommand {
             "start" => Ok(Self::Start),
             "stop" => Ok(Self::Stop),
             other => {
-                let kmh = other
+                let raw = other
                     .strip_prefix("speed:")
                     .with_context(|| format!("unknown control command wire form: {other:?}"))?;
-                let kmh: f32 = kmh
+                let kmh: f32 = raw
                     .parse()
                     .with_context(|| format!("unparseable speed in {other:?}"))?;
-                Ok(Self::Speed(kmh))
+                let Some(speed) = CentiKmh::from_kmh_f32(kmh) else {
+                    bail!("speed out of range in {other:?}");
+                };
+                Ok(Self::Speed(speed))
             }
         }
     }
@@ -83,7 +89,7 @@ mod tests {
         for cmd in [
             ControlCommand::Start,
             ControlCommand::Stop,
-            ControlCommand::Speed(2.5),
+            ControlCommand::Speed(CentiKmh::from_wire(250)),
         ] {
             let parsed = ControlCommand::parse(&cmd.to_wire()).expect("round-trips");
             assert_eq!(parsed, cmd);
@@ -92,7 +98,10 @@ mod tests {
 
     #[test]
     fn speed_wire_form_is_human_readable() {
-        assert_eq!(ControlCommand::Speed(2.5).to_wire(), "speed:2.5");
+        assert_eq!(
+            ControlCommand::Speed(CentiKmh::from_wire(250)).to_wire(),
+            "speed:2.5"
+        );
         assert_eq!(ControlCommand::Start.to_wire(), "start");
         assert_eq!(ControlCommand::Stop.to_wire(), "stop");
     }

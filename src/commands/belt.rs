@@ -10,6 +10,7 @@ use crate::commands::common::{daemon_process_alive, daemon_status_fresh};
 use crate::control;
 use crate::control_command::ControlCommand;
 use crate::scan;
+use crate::speed::CentiKmh;
 use crate::store;
 
 /// How long the CLI waits for the daemon to run an enqueued command before
@@ -38,7 +39,7 @@ pub(crate) async fn run_control(command: ControlCommand) -> Result<()> {
     let mapped = match command {
         ControlCommand::Start => Command::Start,
         ControlCommand::Stop => Command::Stop,
-        ControlCommand::Speed(kmh) => Command::Speed(kmh),
+        ControlCommand::Speed(speed) => Command::Speed(speed),
     };
     run_command(&adapter, mapped).await?;
     println!("{}", describe_control_success(&command));
@@ -100,7 +101,7 @@ pub(crate) fn describe_control_success(command: &ControlCommand) -> String {
     match command {
         ControlCommand::Start => "belt started".to_string(),
         ControlCommand::Stop => "belt stopped".to_string(),
-        ControlCommand::Speed(kmh) => format!("speed set to {kmh} km/h"),
+        ControlCommand::Speed(speed) => format!("speed set to {speed} km/h"),
     }
 }
 
@@ -108,7 +109,7 @@ pub(crate) fn describe_control_success(command: &ControlCommand) -> String {
 pub(crate) enum Command {
     Start,
     Stop,
-    Speed(f32),
+    Speed(CentiKmh),
     Incline(f32),
 }
 
@@ -118,7 +119,7 @@ pub(crate) async fn run_command(adapter: &Adapter, command: Command) -> Result<(
     match command {
         Command::Start => controller.start().await?,
         Command::Stop => controller.stop().await?,
-        Command::Speed(kmh) => controller.set_speed(kmh).await?,
+        Command::Speed(speed) => controller.set_speed(speed).await?,
         Command::Incline(percent) => controller.set_incline(percent).await?,
     }
     Ok(())

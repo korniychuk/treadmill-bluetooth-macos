@@ -14,6 +14,7 @@ use tracing::{info, warn};
 use crate::config_apply;
 use crate::daemon::DaemonState;
 use crate::presence::PresenceState;
+use crate::speed::CentiKmh;
 use crate::zone_hold::{self, ResolvedZone, ZoneHoldConfig};
 
 /// Max age of `last_bpm` before Zone Hold treats bpm as absent (задача 035).
@@ -29,27 +30,27 @@ const ZONE_HOLD_SAFETY_COOLDOWN: Duration = Duration::from_secs(5);
 const ZONE_HOLD_HARD_STOP_PERCENT: f32 = 85.0;
 
 /// Control-Point intent from a pure tick (shell executes).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZoneWrite {
     SetSpeed {
-        target_kmh: f32,
+        target: CentiKmh,
     },
     /// Suppressed by operator-override window (задача 039) — shell logs, no write.
     Suppressed {
-        target_kmh: f32,
+        target: CentiKmh,
     },
     /// Safety hard-stop — never suppressed by override (current behaviour).
     Stop,
 }
 
 /// Zone Hold controller phase for the current session (задача 027).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZoneHoldPhase {
     Off,
     Ramp {
         started_at: Instant,
-        start_speed_kmh: f32,
-        target_speed_kmh: f32,
+        start_speed: CentiKmh,
+        target_speed: CentiKmh,
     },
     Hold,
     /// Presence left Walking — HR ignored until return.
@@ -145,14 +146,14 @@ impl ZoneSession {
 
     /// Engage/freeze/grace on a presence transition (задача 027).
     ///
-    /// `resumed_kmh` `None` skips Ramp engage (задача 036 — never seed 0.0).
+    /// `resumed` `None` skips Ramp engage (задача 036 — never seed 0.0).
     pub fn on_presence_transition(
         &mut self,
         prev_state: PresenceState,
         next_state: PresenceState,
         config: &ZoneHoldConfig,
-        resumed_kmh: Option<f32>,
-        default_kmh: f32,
+        resumed: Option<CentiKmh>,
+        default_speed: CentiKmh,
         now: Instant,
     ) {
         if !config.enabled || config.resolve_target_zone().is_none() {
@@ -161,16 +162,16 @@ impl ZoneSession {
         }
         match (prev_state, next_state) {
             (_, PresenceState::Walking) if self.phase == ZoneHoldPhase::Off => {
-                let Some(start_speed_kmh) = resumed_kmh else {
+                let Some(start_speed) = resumed else {
                     return;
                 };
-                let target = default_kmh.clamp(config.min_speed_kmh, config.max_speed_kmh);
+                let target = default_speed.clamp(config.min_speed_kmh, config.max_speed_kmh);
                 self.phase = ZoneHoldPhase::Ramp {
                     started_at: now,
-                    start_speed_kmh,
-                    target_speed_kmh: target,
+                    start_speed,
+                    target_speed: target,
                 };
-                info!(target, "zone hold: engaged, starting warm-up ramp");
+                info!(%target, "zone hold: engaged, starting warm-up ramp");
             }
             (PresenceState::Paused, PresenceState::Walking)
             | (PresenceState::AwayWhileRunning, PresenceState::Walking) => {
@@ -200,14 +201,14 @@ impl ZoneSession {
         &mut self,
         config: &ZoneHoldConfig,
         resolved: &ResolvedZone,
-        measured_speed_kmh: Option<f32>,
+        measured: Option<CentiKmh>,
         bpm: Option<u16>,
         now: Instant,
     ) -> Option<ZoneWrite> {
         if !config.enabled {
             return None;
         }
-        let measured_speed_kmh = measured_speed_kmh?;
+        let measured = measured?;
 
         let zone_writes_suppressed = operator_override_active(now, self.operator_override_until);
         let correction_interval = Duration::from_secs(config.correction_interval_seconds as u64);
@@ -227,8 +228,8 @@ impl ZoneSession {
             }
             ZoneHoldPhase::Ramp {
                 started_at,
-                start_speed_kmh,
-                target_speed_kmh,
+                start_speed,
+                target_speed,
             } => {
                 let elapsed = now.saturating_duration_since(started_at);
                 let warmup = Duration::from_secs(config.warmup_minutes as u64 * 60);
@@ -236,13 +237,9 @@ impl ZoneSession {
                     self.phase = ZoneHoldPhase::Hold;
                     info!("zone hold: warm-up ramp complete — starting closed-loop correction");
                 } else if correction_due(self.last_correction_at) {
-                    let target = zone_hold::warmup_target_speed(
-                        start_speed_kmh,
-                        target_speed_kmh,
-                        elapsed,
-                        warmup,
-                    );
-                    if (target - measured_speed_kmh).abs() > zone_hold::MIN_SPEED_CHANGE_KMH {
+                    let target =
+                        zone_hold::warmup_target_speed(start_speed, target_speed, elapsed, warmup);
+                    if target.abs_diff(measured) > zone_hold::MIN_SPEED_CHANGE.to_wire() {
                         write = Some(speed_write(target, zone_writes_suppressed));
                     }
                     self.last_correction_at = Some(now);
@@ -263,10 +260,11 @@ impl ZoneSession {
                                 zone_hold::safety_cap_bpm(hrmax, ZONE_HOLD_HARD_STOP_PERCENT)
                             })
                             .unwrap_or(u16::MAX);
-                        if measured_speed_kmh
-                            <= config.min_speed_kmh + zone_hold::MIN_SPEED_CHANGE_KMH
-                            && bpm > hard_stop
-                        {
+                        let at_min = measured
+                            <= config
+                                .min_speed_kmh
+                                .saturating_add_centi(zone_hold::MIN_SPEED_CHANGE.to_wire());
+                        if at_min && bpm > hard_stop {
                             warn!(
                                 bpm,
                                 safety_cap,
@@ -276,14 +274,14 @@ impl ZoneSession {
                             // Hard-stop is safety — not suppressed by operator override.
                             write = Some(ZoneWrite::Stop);
                         } else if let Some(target) = zone_hold::safety_force_reduce_target(
-                            measured_speed_kmh,
+                            measured,
                             config.max_step_kmh,
                             config.min_speed_kmh,
                         ) {
                             warn!(
                                 bpm,
                                 safety_cap,
-                                target,
+                                %target,
                                 "zone hold: safety cap exceeded — force-reducing speed"
                             );
                             write = Some(speed_write(target, zone_writes_suppressed));
@@ -304,9 +302,7 @@ impl ZoneSession {
                             min_speed_kmh: config.min_speed_kmh,
                             max_speed_kmh: resolved.effective_max_speed_kmh,
                         };
-                        if let Some(target) =
-                            zone_hold::next_speed(&params, measured_speed_kmh, bpm)
-                        {
+                        if let Some(target) = zone_hold::next_speed(&params, measured, bpm) {
                             write = Some(speed_write(target, zone_writes_suppressed));
                         }
                     }
@@ -328,13 +324,13 @@ impl ZoneSession {
         state: &mut DaemonState,
         resolved: &ResolvedZone,
         bpm: Option<u16>,
-        measured_speed_kmh: f32,
+        measured: CentiKmh,
     ) {
         state.zone_hold_active = !matches!(self.phase, ZoneHoldPhase::Off);
         state.zone_hold_phase = Some(self.phase.label().to_string());
         state.zone_hold_target_lo = Some(i64::from(resolved.low_bpm));
         state.zone_hold_target_hi = Some(i64::from(resolved.high_bpm));
-        state.zone_hold_last_speed = Some(f64::from(measured_speed_kmh));
+        state.zone_hold_last_speed = Some(f64::from(measured.to_kmh_f32()));
         state.zone_hold_position = match (self.phase, bpm) {
             (ZoneHoldPhase::Hold, Some(bpm)) => Some(
                 zone_hold::classify_position(bpm, resolved.low_bpm, resolved.high_bpm)
@@ -350,26 +346,26 @@ impl ZoneSession {
     pub fn on_config_engaged(
         &mut self,
         config: &ZoneHoldConfig,
-        resumed_kmh: Option<f32>,
-        default_kmh: f32,
+        resumed: Option<CentiKmh>,
+        default_speed: CentiKmh,
         now: Instant,
     ) {
         self.on_presence_transition(
             PresenceState::Unknown,
             PresenceState::Walking,
             config,
-            resumed_kmh,
-            default_kmh,
+            resumed,
+            default_speed,
             now,
         );
     }
 }
 
-fn speed_write(target_kmh: f32, suppressed: bool) -> ZoneWrite {
+fn speed_write(target: CentiKmh, suppressed: bool) -> ZoneWrite {
     if suppressed {
-        ZoneWrite::Suppressed { target_kmh }
+        ZoneWrite::Suppressed { target }
     } else {
-        ZoneWrite::SetSpeed { target_kmh }
+        ZoneWrite::SetSpeed { target }
     }
 }
 
@@ -403,17 +399,21 @@ pub fn bpm_if_fresh(
 mod tests {
     use super::*;
 
+    fn c(kmh: f32) -> CentiKmh {
+        CentiKmh::from_kmh_f32(kmh).expect("test speed in range")
+    }
+
     fn enabled_config() -> ZoneHoldConfig {
-        let mut c = ZoneHoldConfig::disabled_default();
-        c.enabled = true;
-        c.age = Some(30);
-        c.warmup_minutes = 1;
-        c.reentry_grace_seconds = 10;
-        c.correction_interval_seconds = 20;
-        c.min_speed_kmh = 1.0;
-        c.max_speed_kmh = 6.0;
-        c.max_step_kmh = 0.3;
-        c
+        let mut cfg = ZoneHoldConfig::disabled_default();
+        cfg.enabled = true;
+        cfg.age = Some(30);
+        cfg.warmup_minutes = 1;
+        cfg.reentry_grace_seconds = 10;
+        cfg.correction_interval_seconds = 20;
+        cfg.min_speed_kmh = c(1.0);
+        cfg.max_speed_kmh = c(6.0);
+        cfg.max_step_kmh = c(0.3);
+        cfg
     }
 
     fn resolved(cfg: &ZoneHoldConfig) -> ResolvedZone {
@@ -443,8 +443,8 @@ mod tests {
         let mut z = ZoneSession::new();
         z.phase = ZoneHoldPhase::Ramp {
             started_at: Instant::now(),
-            start_speed_kmh: 2.5,
-            target_speed_kmh: 3.0,
+            start_speed: c(2.5),
+            target_speed: c(3.0),
         };
         z.disengage(&mut state);
         assert!(z.is_off());
@@ -465,8 +465,8 @@ mod tests {
             PresenceState::Paused,
             PresenceState::Walking,
             &config,
-            Some(2.5),
-            3.0,
+            Some(c(2.5)),
+            c(3.0),
             Instant::now(),
         );
         assert!(z.is_off());
@@ -481,7 +481,7 @@ mod tests {
             PresenceState::Walking,
             &config,
             None,
-            3.0,
+            c(3.0),
             Instant::now(),
         );
         assert!(z.is_off());
@@ -497,8 +497,8 @@ mod tests {
             PresenceState::Unknown,
             PresenceState::Walking,
             &config,
-            Some(2.0),
-            3.0,
+            Some(c(2.0)),
+            c(3.0),
             t0,
         );
         assert!(matches!(z.phase, ZoneHoldPhase::Ramp { .. }));
@@ -506,7 +506,7 @@ mod tests {
         let w = z.tick(
             &config,
             &resolved,
-            Some(2.5),
+            Some(c(2.5)),
             Some(100),
             t0 + Duration::from_secs(60),
         );
@@ -525,8 +525,8 @@ mod tests {
             PresenceState::Walking,
             PresenceState::Paused,
             &config,
-            Some(2.5),
-            3.0,
+            Some(c(2.5)),
+            c(3.0),
             t0,
         );
         assert_eq!(z.phase, ZoneHoldPhase::Frozen);
@@ -534,15 +534,15 @@ mod tests {
             PresenceState::Paused,
             PresenceState::Walking,
             &config,
-            Some(2.5),
-            3.0,
+            Some(c(2.5)),
+            c(3.0),
             t0,
         );
         assert!(matches!(z.phase, ZoneHoldPhase::Grace { .. }));
         let _ = z.tick(
             &config,
             &resolved,
-            Some(2.5),
+            Some(c(2.5)),
             Some(100),
             t0 + Duration::from_secs(config.reentry_grace_seconds as u64),
         );
@@ -569,7 +569,7 @@ mod tests {
         let resolved = resolved(&config);
         config.enabled = false;
         assert!(
-            z.tick(&config, &resolved, Some(3.0), Some(120), Instant::now())
+            z.tick(&config, &resolved, Some(c(3.0)), Some(120), Instant::now())
                 .is_none()
         );
     }
@@ -589,7 +589,7 @@ mod tests {
         let w = z.tick(
             &config,
             &resolved,
-            Some(2.0),
+            Some(c(2.0)),
             Some(60),
             t0 + Duration::from_secs(1),
         );
@@ -667,7 +667,7 @@ mod tests {
         let config = enabled_config();
         let resolved = resolved(&config);
         let mut state = DaemonState::new(true);
-        z.persist_snapshot(&mut state, &resolved, Some(100), 3.5);
+        z.persist_snapshot(&mut state, &resolved, Some(100), c(3.5));
         assert!(state.zone_hold_active);
         assert_eq!(state.zone_hold_phase.as_deref(), Some("hold"));
         assert_eq!(state.zone_hold_last_speed, Some(3.5));
@@ -679,7 +679,7 @@ mod tests {
     fn catchup_engage_mid_session() {
         let mut z = ZoneSession::new();
         let config = enabled_config();
-        z.on_config_engaged(&config, Some(2.5), 3.0, Instant::now());
+        z.on_config_engaged(&config, Some(c(2.5)), c(3.0), Instant::now());
         assert!(matches!(z.phase, ZoneHoldPhase::Ramp { .. }));
     }
 }

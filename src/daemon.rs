@@ -114,6 +114,7 @@ use crate::notify;
 use crate::power::{self, PowerEvent};
 use crate::presence::PresenceState;
 use crate::scan;
+use crate::speed::CentiKmh;
 use crate::store::{DaemonStatus, Store};
 use crate::treadmill_link::{NOTIFICATION_TIMEOUT, TreadmillLink};
 use crate::zone_hold;
@@ -172,18 +173,19 @@ const STREAMING_STALE_THRESHOLD: Duration = Duration::from_secs(30);
 /// so a slow-but-legitimate restore never trips the watchdog.
 const SPEED_RESTORE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Minimum km/h by which the pre-pause speed must exceed the resumed speed to
-/// bother restoring — avoids a redundant Control Point write (and a misleading
-/// toast) when the machine did not actually slow down on resume.
-const SPEED_RESTORE_EPSILON_KMH: f32 = 0.05;
+/// Minimum amount by which the pre-pause speed must exceed the resumed speed
+/// to bother restoring — avoids a redundant Control Point write (and a
+/// misleading toast) when the machine did not actually slow down on resume.
+/// Same deadband magnitude as [`zone_hold::MIN_SPEED_CHANGE`] (5 centi).
+const SPEED_RESTORE_EPSILON: CentiKmh = CentiKmh::from_wire(5);
 
 /// Ceiling on the resumed belt speed for applying the computed default at a
 /// workout start (задача 016): apply only when the belt is at/below the device's
 /// factory crawl (~0.5), i.e. it just (re)started/reset and sits at its useless
 /// default. A belt already moving faster means the operator chose that speed (or
 /// a daemon restart landed mid-walk) — never override it. Same value as the
-/// cruise floor: below it is not real walking.
-const DEFAULT_SPEED_APPLY_CEILING_KMH: f32 = 0.8;
+/// cruise floor: below it is not real walking (0.8 km/h).
+const DEFAULT_SPEED_APPLY_CEILING: CentiKmh = CentiKmh::from_wire(80);
 
 /// Exit code used when the watchdog kills the process on a detected hang —
 /// distinct from panics/normal errors so `launchctl print` / log forensics
@@ -989,17 +991,18 @@ async fn stream_with_presence(
                 // Speed memory feeds resume-restore and Zone Hold ramp seeding —
                 // only persisted samples count (pre-refactor behavior): a
                 // restored belt speed must not depend on samples skipped above.
-                link.record_speed(data.speed_kmh, now);
+                // Cruising stats stay f32 (estimate domain); convert at the edge.
+                link.record_speed(data.speed.map(|s| s.to_kmh_f32()), now);
                 // Live speed snapshot for `tm widget` (задача 029) — every sample
                 // with speed, unconditionally (unlike `last_walking_speed` on the
                 // link, which only tracks non-zero cruising speed).
-                if let Some(speed) = data.speed_kmh {
-                    state.last_speed_kmh = Some(speed as f64);
+                if let Some(speed) = data.speed {
+                    state.last_speed_kmh = Some(f64::from(speed.to_kmh_f32()));
                     state.last_speed_ts = Some(Utc::now().timestamp_millis());
                 }
 
                 let prev_state = accumulator.state();
-                if let Some(next_state) = accumulator.observe(Instant::now(), data.speed_kmh, data.steps) {
+                if let Some(next_state) = accumulator.observe(Instant::now(), data.speed, data.steps) {
                     info!(?prev_state, ?next_state, "presence transition");
                     state.presence_state = Some(next_state.wire().to_string());
                     // Belt speed as Zone Hold should see it below: starts as this
@@ -1008,7 +1011,7 @@ async fn stream_with_presence(
                     // write in this very match (below) lands *after* that sample
                     // was taken — update it whenever one of those writes actually
                     // fires, so a fresh Ramp doesn't start from the pre-write crawl.
-                    let mut zh_effective_speed_kmh = data.speed_kmh;
+                    let mut zh_effective = data.speed;
                     match next_state {
                         PresenceState::AwayWhileRunning => {
                             // Arm a fresh auto-pause spell (задача 020 / 053).
@@ -1021,23 +1024,35 @@ async fn stream_with_presence(
                         PresenceState::Walking if prev_state == PresenceState::Paused => {
                             let resume = link.on_resume(Instant::now());
                             // Speed-dependent restore/default only when measured.
-                            if let Some(resumed_speed) = data.speed_kmh {
+                            if let Some(resumed_speed) = data.speed {
                                 match resume.pre_pause_speed {
                                     // A real captured walking speed → restore it (задача 012).
-                                    Some(pre) => {
-                                        let restore = try_restore_speed(peripheral, Some(pre), resumed_speed).await;
+                                    Some(pre_f32) => {
+                                        let pre = CentiKmh::from_kmh_f32(pre_f32);
+                                        let restore =
+                                            try_restore_speed(peripheral, pre, resumed_speed).await;
                                         if let Some(r) = &restore {
-                                            zh_effective_speed_kmh = Some(r.to_kmh);
+                                            zh_effective = CentiKmh::from_kmh_f32(r.to_kmh);
                                         }
                                         notify::treadmill_resumed(resume.paused_for, restore);
                                     }
                                     // Nothing to restore → this is a fresh start/reset at the
                                     // device crawl (scenarios 2 & 3, задача 016): apply the
                                     // computed default. Only toasts when it actually applied.
-                                    None => match try_apply_default_speed(peripheral, store, resumed_speed, &mut link).await {
+                                    None => match try_apply_default_speed(
+                                        peripheral,
+                                        store,
+                                        resumed_speed,
+                                        &mut link,
+                                    )
+                                    .await
+                                    {
                                         Some(applied) => {
-                                            zh_effective_speed_kmh = Some(applied);
-                                            notify::default_speed_applied(resumed_speed, applied);
+                                            zh_effective = Some(applied);
+                                            notify::default_speed_applied(
+                                                resumed_speed.to_kmh_f32(),
+                                                applied.to_kmh_f32(),
+                                            );
                                         }
                                         None => notify::treadmill_resumed(resume.paused_for, None),
                                     },
@@ -1051,7 +1066,7 @@ async fn stream_with_presence(
                         // Apply the computed default only if the belt is at its device
                         // crawl (guarded inside `try_apply_default_speed`).
                         PresenceState::Walking if prev_state == PresenceState::Unknown => {
-                            if let Some(resumed_speed) = data.speed_kmh
+                            if let Some(resumed_speed) = data.speed
                                 && let Some(applied) = try_apply_default_speed(
                                     peripheral,
                                     store,
@@ -1060,8 +1075,11 @@ async fn stream_with_presence(
                                 )
                                 .await
                             {
-                                zh_effective_speed_kmh = Some(applied);
-                                notify::default_speed_applied(resumed_speed, applied);
+                                zh_effective = Some(applied);
+                                notify::default_speed_applied(
+                                    resumed_speed.to_kmh_f32(),
+                                    applied.to_kmh_f32(),
+                                );
                             }
                         }
                         // Skip the very first sample after connecting: PresenceState
@@ -1090,18 +1108,18 @@ async fn stream_with_presence(
                     // restored by that code, so Zone Hold's grace window starts
                     // from the *restored* speed, not the crawl (task doc §Сход с
                     // ленты: "Zone Hold не дублирует restore — переиспользует его").
-                    // Use `zh_effective_speed_kmh`, not the raw sample: a fresh
+                    // Use `zh_effective`, not the raw sample: a fresh
                     // Ramp (first arrival at Walking) engages in the same match
                     // above that may have just written a default/restored speed —
                     // the raw telemetry sample still reflects the pre-write crawl.
-                    let zh_resumed_kmh = zh_effective_speed_kmh;
+                    let zh_resumed = zh_effective;
                     // Default-speed DB scan only needed when Zone Hold will engage
                     // (задача 047) — skip the history query when disabled.
-                    let zh_default_kmh = if config.zone_hold.enabled {
+                    let zh_default = if config.zone_hold.enabled {
                         default_speed::compute_default_speed(store, goals::load_workout_gap_minutes())
                             .ok()
                             .flatten()
-                            .map(|d| d.kmh)
+                            .and_then(|d| CentiKmh::from_kmh_f32(d.kmh))
                             .unwrap_or(config.zone_hold.min_speed_kmh)
                     } else {
                         config.zone_hold.min_speed_kmh
@@ -1110,8 +1128,8 @@ async fn stream_with_presence(
                         prev_state,
                         next_state,
                         &config.zone_hold,
-                        zh_resumed_kmh,
-                        zh_default_kmh,
+                        zh_resumed,
+                        zh_default,
                         Instant::now(),
                     );
                 }
@@ -1177,13 +1195,13 @@ async fn stream_with_presence(
                             let write = zone.tick(
                                 &config.zone_hold,
                                 &resolved,
-                                data.speed_kmh,
+                                data.speed,
                                 zh_bpm,
                                 now,
                             );
                             // Persist before write when we have measured speed
                             // (same gate as pre-053 tick early-return).
-                            if let Some(measured) = data.speed_kmh {
+                            if let Some(measured) = data.speed {
                                 zone.persist_snapshot(state, &resolved, zh_bpm, measured);
                             }
                             if let Some(w) = write {
@@ -1407,10 +1425,14 @@ async fn stream_with_presence(
 
 /// The pre-pause walking speed to re-send on resume, or `None` when there is
 /// nothing worth restoring: the machine did not actually slow down (resumed at
-/// the pre-pause speed or faster, within [`SPEED_RESTORE_EPSILON_KMH`]). Pure
+/// the pre-pause speed or faster, within [`SPEED_RESTORE_EPSILON`]). Pure
 /// and unit-tested — the BLE write lives in [`restore_speed`].
-fn speed_restore_target(pre_pause_kmh: f32, resumed_kmh: f32) -> Option<f32> {
-    (pre_pause_kmh > resumed_kmh + SPEED_RESTORE_EPSILON_KMH).then_some(pre_pause_kmh)
+fn speed_restore_target(pre_pause: CentiKmh, resumed: CentiKmh) -> Option<CentiKmh> {
+    (pre_pause.to_wire()
+        > resumed
+            .to_wire()
+            .saturating_add(SPEED_RESTORE_EPSILON.to_wire()))
+    .then_some(pre_pause)
 }
 
 /// Best-effort restore of the pre-pause belt speed on a pause→walk resume
@@ -1420,38 +1442,38 @@ fn speed_restore_target(pre_pause_kmh: f32, resumed_kmh: f32) -> Option<f32> {
 /// leave the session running, never crash it.
 async fn try_restore_speed(
     peripheral: &Peripheral,
-    pre_pause: Option<f32>,
-    resumed_kmh: f32,
+    pre_pause: Option<CentiKmh>,
+    resumed: CentiKmh,
 ) -> Option<notify::SpeedRestore> {
     let Some(pre_pause) = pre_pause else {
         // Daemon started already paused, or the pause preceded any walking.
         warn!("resume without a captured pre-pause speed — skipping speed restore");
         return None;
     };
-    let target = speed_restore_target(pre_pause, resumed_kmh)?;
+    let target = speed_restore_target(pre_pause, resumed)?;
     let source = ControlSource::Restore;
 
     match tokio::time::timeout(SPEED_RESTORE_TIMEOUT, restore_speed(peripheral, target)).await {
         Ok(Ok(())) => {
             info!(
-                from = resumed_kmh,
-                to = target,
+                from = %resumed,
+                to = %target,
                 control_source = source.as_str(),
                 "restored pre-pause belt speed on resume"
             );
             Some(notify::SpeedRestore {
-                from_kmh: resumed_kmh,
-                to_kmh: target,
+                from_kmh: resumed.to_kmh_f32(),
+                to_kmh: target.to_kmh_f32(),
             })
         }
         Ok(Err(err)) => {
-            warn!(%err, target, control_source = source.as_str(), "failed to restore pre-pause speed — leaving resume toast without the restore line");
+            warn!(%err, %target, control_source = source.as_str(), "failed to restore pre-pause speed — leaving resume toast without the restore line");
             None
         }
         Err(_) => {
             warn!(
                 timeout_s = SPEED_RESTORE_TIMEOUT.as_secs(),
-                target,
+                %target,
                 control_source = source.as_str(),
                 "speed restore timed out (possible CoreBluetooth hang)"
             );
@@ -1462,17 +1484,17 @@ async fn try_restore_speed(
 
 /// Take FTMS control and set the target speed. Split from [`try_restore_speed`]
 /// so the whole round-trip can be wrapped in one bounded `timeout` there.
-async fn restore_speed(peripheral: &Peripheral, target_kmh: f32) -> Result<()> {
+async fn restore_speed(peripheral: &Peripheral, target: CentiKmh) -> Result<()> {
     let controller = Controller::take_control(peripheral).await?;
-    controller.set_speed(target_kmh).await
+    controller.set_speed(target).await
 }
 
 /// Apply the computed default belt speed at a workout start (задача 016), when
-/// there is no pre-pause speed to restore. Returns the applied km/h for the
-/// toast, or `None` when nothing was applied. Guards, in order:
+/// there is no pre-pause speed to restore. Returns the applied speed, or `None`
+/// when nothing was applied. Guards, in order:
 /// - once per session (`applied`) — one attempt per (re)start, no retry storm on
 ///   a presence flap at the crawl;
-/// - the belt must be at/below the device crawl ([`DEFAULT_SPEED_APPLY_CEILING_KMH`])
+/// - the belt must be at/below the device crawl ([`DEFAULT_SPEED_APPLY_CEILING`])
 ///   — a belt already moving faster was set by the operator (or a daemon restart
 ///   landed mid-walk); never override it;
 /// - a qualifying prior workout must exist ([`default_speed::compute_default_speed`]).
@@ -1483,13 +1505,13 @@ async fn restore_speed(peripheral: &Peripheral, target_kmh: f32) -> Result<()> {
 async fn try_apply_default_speed(
     peripheral: &Peripheral,
     store: &Store,
-    resumed_kmh: f32,
+    resumed: CentiKmh,
     link: &mut TreadmillLink,
-) -> Option<f32> {
+) -> Option<CentiKmh> {
     if link.default_speed_applied() {
         return None;
     }
-    if resumed_kmh > DEFAULT_SPEED_APPLY_CEILING_KMH {
+    if resumed > DEFAULT_SPEED_APPLY_CEILING {
         // Belt already at a real speed — the operator's choice, or a mid-walk
         // reconnect. Not a fresh crawl start; leave it alone (and let a later
         // genuine crawl start still get its one attempt).
@@ -1498,7 +1520,16 @@ async fn try_apply_default_speed(
 
     let gap_minutes = goals::load_workout_gap_minutes();
     let target = match default_speed::compute_default_speed(store, gap_minutes) {
-        Ok(Some(default)) => default.kmh,
+        Ok(Some(default)) => match CentiKmh::from_kmh_f32(default.kmh) {
+            Some(t) => t,
+            None => {
+                warn!(
+                    kmh = default.kmh,
+                    "computed default speed out of range — skipping"
+                );
+                return None;
+            }
+        },
         Ok(None) => {
             info!(
                 "no qualifying prior workout (≥30m walking) — leaving belt at its device default speed"
@@ -1521,21 +1552,21 @@ async fn try_apply_default_speed(
     match tokio::time::timeout(SPEED_RESTORE_TIMEOUT, restore_speed(peripheral, target)).await {
         Ok(Ok(())) => {
             info!(
-                from = resumed_kmh,
-                to = target,
+                from = %resumed,
+                to = %target,
                 control_source = source.as_str(),
                 "applied computed default belt speed at workout start"
             );
             Some(target)
         }
         Ok(Err(err)) => {
-            warn!(%err, target, control_source = source.as_str(), "failed to apply default belt speed at workout start — leaving belt as is");
+            warn!(%err, %target, control_source = source.as_str(), "failed to apply default belt speed at workout start — leaving belt as is");
             None
         }
         Err(_) => {
             warn!(
                 timeout_s = SPEED_RESTORE_TIMEOUT.as_secs(),
-                target,
+                %target,
                 control_source = source.as_str(),
                 "default belt speed write timed out (possible CoreBluetooth hang)"
             );
@@ -1585,19 +1616,16 @@ fn execute_config_effects(
                 // Prefer last measured walking speed; min_speed only as
                 // engage seed when we have *some* observation (задача 036
                 // forbids inventing 0.0, not a known min floor).
-                let zh_resumed_kmh = last_walking_speed.or(Some(config.zone_hold.min_speed_kmh));
-                let zh_default_kmh =
+                let zh_resumed = last_walking_speed
+                    .and_then(CentiKmh::from_kmh_f32)
+                    .or(Some(config.zone_hold.min_speed_kmh));
+                let zh_default =
                     default_speed::compute_default_speed(store, goals::load_workout_gap_minutes())
                         .ok()
                         .flatten()
-                        .map(|d| d.kmh)
+                        .and_then(|d| CentiKmh::from_kmh_f32(d.kmh))
                         .unwrap_or(config.zone_hold.min_speed_kmh);
-                zone.on_config_engaged(
-                    &config.zone_hold,
-                    zh_resumed_kmh,
-                    zh_default_kmh,
-                    Instant::now(),
-                );
+                zone.on_config_engaged(&config.zone_hold, zh_resumed, zh_default, Instant::now());
             }
             ConfigEffect::ZoneReResolve => {
                 match config.zone_hold.resolve_target_zone() {
@@ -1642,11 +1670,11 @@ fn execute_config_effects(
 /// Execute a pure [`ZoneWrite`] from [`ZoneSession::tick`] (BLE effect side).
 async fn execute_zone_write(peripheral: &Peripheral, write: ZoneWrite) {
     match write {
-        ZoneWrite::SetSpeed { target_kmh } => {
-            apply_zone_hold_speed(peripheral, target_kmh, false).await;
+        ZoneWrite::SetSpeed { target } => {
+            apply_zone_hold_speed(peripheral, target, false).await;
         }
-        ZoneWrite::Suppressed { target_kmh } => {
-            apply_zone_hold_speed(peripheral, target_kmh, true).await;
+        ZoneWrite::Suppressed { target } => {
+            apply_zone_hold_speed(peripheral, target, true).await;
         }
         ZoneWrite::Stop => {
             let _ = tokio::time::timeout(
@@ -1664,33 +1692,33 @@ async fn execute_zone_write(peripheral: &Peripheral, write: ZoneWrite) {
 /// down the session over a convenience write" rule as `try_restore_speed`/
 /// `try_apply_default_speed`. When `suppressed` (operator override window,
 /// задача 039), skip the write and log once at this call site.
-async fn apply_zone_hold_speed(peripheral: &Peripheral, target_kmh: f32, suppressed: bool) {
+async fn apply_zone_hold_speed(peripheral: &Peripheral, target: CentiKmh, suppressed: bool) {
     let source = ControlSource::Zone;
     if suppressed {
         info!(
-            target = target_kmh,
+            %target,
             control_source = source.as_str(),
             "zone hold: suppressed, operator override active"
         );
         return;
     }
-    match tokio::time::timeout(SPEED_RESTORE_TIMEOUT, restore_speed(peripheral, target_kmh)).await {
+    match tokio::time::timeout(SPEED_RESTORE_TIMEOUT, restore_speed(peripheral, target)).await {
         Ok(Ok(())) => info!(
-            target = target_kmh,
+            %target,
             control_source = source.as_str(),
             "zone hold: applied speed correction"
         ),
         Ok(Err(err)) => {
             warn!(
                 %err,
-                target = target_kmh,
+                %target,
                 control_source = source.as_str(),
                 "zone hold: speed correction write failed"
             )
         }
         Err(_) => warn!(
             timeout_s = SPEED_RESTORE_TIMEOUT.as_secs(),
-            target = target_kmh,
+            %target,
             control_source = source.as_str(),
             "zone hold: speed correction timed out (possible CoreBluetooth hang)"
         ),
@@ -2223,14 +2251,15 @@ mod tests {
 
     #[test]
     fn speed_restore_target_restores_only_a_real_slowdown() {
+        let c = |kmh: f32| CentiKmh::from_kmh_f32(kmh).expect("test speed");
         // Typical case: paused at 2.5, machine resumed at 0.5 → restore 2.5.
-        assert_eq!(speed_restore_target(2.5, 0.5), Some(2.5));
+        assert_eq!(speed_restore_target(c(2.5), c(0.5)), Some(c(2.5)));
         // No slowdown (resumed at the same speed) → nothing to restore.
-        assert_eq!(speed_restore_target(2.5, 2.5), None);
+        assert_eq!(speed_restore_target(c(2.5), c(2.5)), None);
         // Resumed faster than before → nothing to restore.
-        assert_eq!(speed_restore_target(2.5, 3.0), None);
+        assert_eq!(speed_restore_target(c(2.5), c(3.0)), None);
         // Within epsilon → treated as no change.
-        assert_eq!(speed_restore_target(2.5, 2.48), None);
+        assert_eq!(speed_restore_target(c(2.5), c(2.48)), None);
     }
 
     #[test]

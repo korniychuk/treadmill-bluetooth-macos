@@ -156,7 +156,9 @@ mod tests {
         // arr
         let store = memory_store();
         let id = store
-            .enqueue_control_command(&ControlCommand::Speed(2.5))
+            .enqueue_control_command(&ControlCommand::Speed(crate::speed::CentiKmh::from_wire(
+                250,
+            )))
             .unwrap();
 
         // act — the freshly enqueued command is the oldest pending one.
@@ -167,7 +169,10 @@ mod tests {
 
         // assert — round-tripped through the wire form, then transitions to done.
         assert_eq!(pending.id, id);
-        assert_eq!(pending.command, ControlCommand::Speed(2.5));
+        assert_eq!(
+            pending.command,
+            ControlCommand::Speed(crate::speed::CentiKmh::from_wire(250))
+        );
         assert_eq!(
             store.control_command_outcome(id).unwrap().unwrap().0,
             "pending"
