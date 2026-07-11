@@ -3,7 +3,7 @@
 use anyhow::{Result, bail};
 
 use crate::ZoneAction;
-use crate::commands::common::zone_hold_config_path;
+use crate::commands::common::{highlight_config, zone_hold_config_path};
 use crate::commands::zone_prompts::{
     prompt_age, prompt_line, prompt_optional_max_speed, prompt_optional_resting_hr,
     prompt_zone_bounds, prompt_zone_id,
@@ -18,7 +18,7 @@ pub(crate) fn run_zone(action: Option<ZoneAction>) -> Result<()> {
         None => print_zone_status(),
         Some(ZoneAction::On) => zone_on(),
         Some(ZoneAction::Off) => set_zone_hold_key("enabled", "false".to_string()).map(|()| {
-            println!("Zone Hold disabled.");
+            println!("Zone Hold {}.", highlight_config("disabled"));
         }),
         Some(ZoneAction::Setup) => zone_onboarding_prompt(),
         Some(ZoneAction::Limits { max, min, min_flag }) => zone_limits(max, min.or(min_flag)),
@@ -38,7 +38,7 @@ pub(crate) fn zone_on() -> Result<()> {
         return zone_onboarding_prompt();
     }
     set_zone_hold_key("enabled", "true".to_string())?;
-    println!("Zone Hold enabled.");
+    println!("Zone Hold {}.", highlight_config("enabled"));
     Ok(())
 }
 
@@ -92,8 +92,10 @@ pub(crate) fn zone_limits(max: Option<f32>, min: Option<f32>) -> Result<()> {
     zone_hold::upsert_zone_hold_keys(&path, &updates)?;
     println!(
         "Zone Hold limits updated:{}{}",
-        max.map(|m| format!(" max {m} km/h")).unwrap_or_default(),
-        min.map(|m| format!(" min {m} km/h")).unwrap_or_default(),
+        max.map(|m| format!(" max {} km/h", highlight_config(m)))
+            .unwrap_or_default(),
+        min.map(|m| format!(" min {} km/h", highlight_config(m)))
+            .unwrap_or_default(),
     );
     Ok(())
 }
@@ -125,8 +127,8 @@ pub(crate) fn zone_target(raw: &str) -> Result<()> {
     };
     set_zone_hold_key("target_zone", value)?;
     println!(
-        "Zone Hold target zone set to #{number} {} ({}).",
-        zone.id, zone.name
+        "Zone Hold target zone set to {}.",
+        highlight_config(format!("#{number} {} ({})", zone.id, zone.name))
     );
     Ok(())
 }
@@ -147,7 +149,7 @@ pub(crate) fn zone_list() -> Result<()> {
             "Configured zones (age not set — showing raw bounds, not bpm; run `tm zone setup`):"
         );
     } else {
-        println!("Configured zones ({method_label}):");
+        println!("Configured zones ({}):", highlight_config(method_label));
     }
     let target_number = zone_hold::find_zone(&config.zones, &config.target_zone).map(|(n, _)| n);
     for (index, zone) in config.zones.iter().enumerate() {
@@ -175,10 +177,13 @@ pub(crate) fn zone_list() -> Result<()> {
             },
         };
         let max_speed = zone.max_speed_kmh.unwrap_or(config.max_speed_kmh);
-        println!(
-            "{marker} #{number} {:<14} id={:<16} {range:<16} max {max_speed:.1} km/h",
-            zone.name, zone.id,
-        );
+        // name / id / max-speed are config → cyan; the bpm range is resolved at
+        // runtime → plain. Pad *before* colouring so the ANSI bytes don't count
+        // toward the `{:<N}` column widths and break alignment (задача 057).
+        let name_col = highlight_config(format!("{:<14}", zone.name));
+        let id_col = highlight_config(format!("{:<16}", zone.id));
+        let max_col = highlight_config(format!("max {max_speed:.1} km/h"));
+        println!("{marker} #{number} {name_col} id={id_col} {range:<16} {max_col}");
     }
     println!("(* = current target; select with `tm zone target <id|name|number>`)");
     Ok(())
@@ -205,8 +210,12 @@ pub(crate) fn zone_add() -> Result<()> {
     });
     let path = zone_hold_config_path()?;
     zone_hold::replace_zones(&path, &config.zones)?;
+    // The just-written zone identity is cyan; the trailing `tm zone target {id}`
+    // is a command hint, left plain (задача 057).
     println!(
-        "Added zone `{id}` ({name}). See it with `tm zone list`; select it with `tm zone target {id}`."
+        "Added zone `{}` ({}). See it with `tm zone list`; select it with `tm zone target {id}`.",
+        highlight_config(&id),
+        highlight_config(&name),
     );
     Ok(())
 }
@@ -238,7 +247,7 @@ pub(crate) fn zone_edit(raw: &str) -> Result<()> {
     };
     let path = zone_hold_config_path()?;
     zone_hold::replace_zones(&path, &config.zones)?;
-    println!("Updated zone `{id}`.");
+    println!("Updated zone `{}`.", highlight_config(&id));
     Ok(())
 }
 
@@ -258,7 +267,11 @@ pub(crate) fn zone_remove(raw: &str) -> Result<()> {
     config.zones.retain(|z| z.id != removed_id);
     let path = zone_hold_config_path()?;
     zone_hold::replace_zones(&path, &config.zones)?;
-    println!("Removed zone `{removed_id}` ({removed_name}).");
+    println!(
+        "Removed zone `{}` ({}).",
+        highlight_config(&removed_id),
+        highlight_config(&removed_name)
+    );
     if config.resolve_target_zone().is_none() {
         println!(
             "Note: the current target_zone no longer resolves — pick a new one with `tm zone target`."
@@ -283,7 +296,10 @@ pub(crate) fn zone_mode(tracking: &str) -> Result<()> {
     match tracking {
         "band" | "center" => {
             set_zone_hold_key("tracking", format!("\"{tracking}\""))?;
-            println!("Zone Hold tracking mode set to `{tracking}`.");
+            println!(
+                "Zone Hold tracking mode set to `{}`.",
+                highlight_config(tracking)
+            );
             Ok(())
         }
         other => bail!("unknown tracking mode `{other}` — use `band` or `center`"),
@@ -300,7 +316,11 @@ pub(crate) fn set_zone_hold_key(key: &str, value: String) -> Result<()> {
 /// (задача 027).
 pub(crate) fn print_zone_status() -> Result<()> {
     let config = zone_hold::load_zone_hold_config();
-    println!("Zone Hold: {}", if config.enabled { "on" } else { "off" });
+    // `on`/`off` mirrors the config `enabled` flag → cyan (задача 057).
+    println!(
+        "Zone Hold: {}",
+        highlight_config(if config.enabled { "on" } else { "off" })
+    );
     if !config.enabled {
         println!("  enable with `tm zone on`");
         return Ok(());
@@ -317,18 +337,28 @@ pub(crate) fn print_zone_status() -> Result<()> {
                 zone_hold::Tracking::Band => "band",
                 zone_hold::Tracking::Center => "center",
             };
-            println!("  age {age}, method {method}, tracking {tracking}");
+            // age / method / tracking are all config values → cyan.
+            println!(
+                "  age {}, method {}, tracking {}",
+                highlight_config(age),
+                highlight_config(method),
+                highlight_config(tracking),
+            );
             match config.resolve_target_zone() {
-                Some(resolved) => println!(
-                    "  target zone #{} {} ({}): {}-{} bpm \u{2022} speed {:.1}-{:.1} km/h",
-                    resolved.number,
-                    resolved.id,
-                    resolved.name,
-                    resolved.low_bpm,
-                    resolved.high_bpm,
-                    config.min_speed_kmh,
-                    resolved.effective_max_speed_kmh,
-                ),
+                Some(resolved) => {
+                    // The targeted zone's identity and the speed limits are
+                    // config; the bpm range is resolved from HRmax at runtime,
+                    // so it stays plain (задача 057).
+                    let target =
+                        highlight_config(format!("#{} {} ({})", resolved.number, resolved.id, resolved.name));
+                    let min_speed = highlight_config(format!("{:.1}", config.min_speed_kmh));
+                    let max_speed =
+                        highlight_config(format!("{:.1}", resolved.effective_max_speed_kmh));
+                    println!(
+                        "  target zone {target}: {}-{} bpm \u{2022} speed {min_speed}-{max_speed} km/h",
+                        resolved.low_bpm, resolved.high_bpm,
+                    );
+                }
                 None => println!(
                     "  target zone not found among {} configured zones — see `tm zone list`",
                     config.zones.len()

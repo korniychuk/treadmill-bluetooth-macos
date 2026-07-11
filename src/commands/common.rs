@@ -1,11 +1,36 @@
 //! Shared helpers used by two or more CLI commands.
 
+use std::io::IsTerminal;
+use std::sync::OnceLock;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
 
 use crate::daemon;
 use crate::store;
 use crate::zone_hold;
+
+/// Whether stdout should carry ANSI colour: it is a terminal AND the caller
+/// hasn't opted out via the `NO_COLOR` convention (https://no-color.org).
+/// Cached — the answer cannot change within one CLI invocation.
+pub(crate) fn color_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal())
+}
+
+/// Wrap a *configurable* value in cyan so it reads as "you can change this in
+/// config.toml" (задача 057). A no-op when colour is disabled (piped output,
+/// `NO_COLOR`) so scripts and `grep` still get clean text. Cyan is a strict
+/// signal: only values the operator can change via config/`tm` setters get it —
+/// never labels, never live/derived state (bpm, phase, power mode).
+pub(crate) fn highlight_config<T: std::fmt::Display>(value: T) -> String {
+    if color_enabled() {
+        format!("\x1b[36m{value}\x1b[0m")
+    } else {
+        value.to_string()
+    }
+}
 
 /// Seconds form of [`daemon::WATCHDOG_STALE_THRESHOLD`] (задача 043 — single
 /// source of truth; do not re-derive as an independent literal).
@@ -141,4 +166,19 @@ pub(crate) fn zone_hold_config_path() -> Result<std::path::PathBuf> {
 }
 pub(crate) fn fmt_duration(seconds: i64) -> String {
     format!("{}m{:02}s", seconds / 60, seconds % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn highlight_config_is_plain_off_tty() {
+        // `cargo test` runs with a non-terminal stdout, so `color_enabled()` is
+        // false and the value must come back verbatim — no escape sequences to
+        // leak into piped/redirected output.
+        let painted = highlight_config("band");
+        assert_eq!(painted, "band");
+        assert!(!painted.contains('\x1b'));
+    }
 }

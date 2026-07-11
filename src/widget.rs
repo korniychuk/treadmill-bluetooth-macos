@@ -5,7 +5,7 @@ use chrono::{DateTime, Local, Utc};
 
 use crate::SpeedWidgetAction;
 use crate::commands::common::{
-    HR_STALE_THRESHOLD_S, WATCHDOG_STALE_THRESHOLD_S, zone_hold_config_path,
+    HR_STALE_THRESHOLD_S, WATCHDOG_STALE_THRESHOLD_S, highlight_config, zone_hold_config_path,
 };
 use crate::goals;
 use crate::store;
@@ -16,7 +16,11 @@ pub(crate) fn run_speed_widget(action: Option<SpeedWidgetAction>) -> Result<()> 
     match action {
         None => {
             let enabled = goals::load_show_speed();
-            println!("Speed widget: {}", if enabled { "on" } else { "off" });
+            // `on`/`off` mirrors the config `show_speed` flag → cyan (задача 057).
+            println!(
+                "Speed widget: {}",
+                highlight_config(if enabled { "on" } else { "off" })
+            );
             Ok(())
         }
         Some(SpeedWidgetAction::On) => set_show_speed(true),
@@ -29,7 +33,7 @@ pub(crate) fn set_show_speed(enabled: bool) -> Result<()> {
     goals::upsert_top_level_key(&path, "show_speed", if enabled { "true" } else { "false" })?;
     println!(
         "Speed widget {}.",
-        if enabled { "enabled" } else { "disabled" }
+        highlight_config(if enabled { "enabled" } else { "disabled" })
     );
     Ok(())
 }

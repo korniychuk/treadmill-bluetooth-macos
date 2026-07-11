@@ -5,6 +5,7 @@ use chrono::{DateTime, Local, Utc};
 
 use crate::commands::common::{
     HR_STALE_THRESHOLD_S, WATCHDOG_STALE_THRESHOLD_S, daemon_process_alive, describe_timestamp,
+    highlight_config,
 };
 use crate::commands::stats::print_workout_line;
 use crate::goals;
@@ -63,7 +64,10 @@ pub(crate) fn format_doctor_report(
             out.push_str("  battery:          n/a\n");
             out.push_str("  contact (inferred): n/a\n");
             out.push_str("\nzone hold\n");
-            out.push_str(&format!("  config enabled:   {}\n", zone_config_enabled));
+            out.push_str(&format!(
+                "  config enabled:   {}\n",
+                highlight_config(zone_config_enabled)
+            ));
             out.push_str("  phase snapshot:   n/a\n");
             out.push_str("  active flag:      n/a\n");
             out.push_str("\nlegend: loop=process+heartbeat · treadmill=connected+last_speed_ts · hr=hr_connected+last_bpm_ts · config=enabled vs phase\n");
@@ -139,7 +143,10 @@ pub(crate) fn format_doctor_report(
             }
 
             out.push_str("\nzone hold\n");
-            out.push_str(&format!("  config enabled:   {zone_config_enabled}\n"));
+            out.push_str(&format!(
+                "  config enabled:   {}\n",
+                highlight_config(zone_config_enabled)
+            ));
             let phase = s.zone_hold_phase.as_deref().unwrap_or("n/a");
             out.push_str(&format!("  phase snapshot:   {phase}\n"));
             out.push_str(&format!("  active flag:      {}\n", s.zone_hold_active));
@@ -232,6 +239,8 @@ pub(crate) fn run_status() -> Result<()> {
             let zh_config = zone_hold::load_zone_hold_config();
             if zh_config.enabled {
                 if status.zone_hold_active {
+                    // Live snapshot — phase/target bpm are runtime state, not
+                    // config, so nothing here is cyan (задача 057).
                     let phase = status.zone_hold_phase.as_deref().unwrap_or("?");
                     let range = match (status.zone_hold_target_lo, status.zone_hold_target_hi) {
                         (Some(lo), Some(hi)) => format!("{lo}-{hi} bpm"),
@@ -239,10 +248,11 @@ pub(crate) fn run_status() -> Result<()> {
                     };
                     println!("zone hold: active, phase {phase}, target {range}");
                 } else {
-                    println!("zone hold: on (not currently engaged)");
+                    // `on`/`off` mirror the config `enabled` flag → cyan.
+                    println!("zone hold: {} (not currently engaged)", highlight_config("on"));
                 }
             } else {
-                println!("zone hold: off");
+                println!("zone hold: {}", highlight_config("off"));
             }
 
             let mode_desc = match status.power_mode.as_str() {
@@ -266,15 +276,19 @@ pub(crate) fn run_status() -> Result<()> {
             // Only printed once a 022-aware daemon has written the snapshot
             // (older rows leave these columns NULL).
             if let Some(loaded_at) = &status.config_loaded_at {
-                let goals_desc = status
-                    .config_goals
-                    .as_deref()
-                    .map(format_goal_list)
-                    .unwrap_or_else(|| "—".to_string());
-                let auto_pause = match status.config_auto_pause_secs {
+                // goals / auto-pause / workout-gap are all config values → cyan
+                // (задача 057); the read timestamp is live, so it stays plain.
+                let goals_desc = highlight_config(
+                    status
+                        .config_goals
+                        .as_deref()
+                        .map(format_goal_list)
+                        .unwrap_or_else(|| "—".to_string()),
+                );
+                let auto_pause = highlight_config(match status.config_auto_pause_secs {
                     Some(secs) => format_secs_short(secs),
                     None => "off".to_string(),
-                };
+                });
                 println!(
                     "config (in daemon): goals {goals_desc} · auto-pause {auto_pause} · read {}",
                     describe_timestamp(loaded_at)
@@ -282,8 +296,8 @@ pub(crate) fn run_status() -> Result<()> {
                 // The workout-gap is read-time (задача 014) — the CLI resolves it
                 // itself, the daemon does not hold it; shown here for completeness.
                 println!(
-                    "  workout gap: {}m (read-time, applied when stats are read)",
-                    goals::load_workout_gap_minutes()
+                    "  workout gap: {} (read-time, applied when stats are read)",
+                    highlight_config(format!("{}m", goals::load_workout_gap_minutes()))
                 );
             }
 

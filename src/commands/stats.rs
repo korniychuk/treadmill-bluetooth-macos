@@ -1,11 +1,9 @@
 //! `stats` and `default-speed` CLI commands.
 
-use std::io::IsTerminal;
-
 use anyhow::Result;
 use chrono::{DateTime, Local, TimeZone, Utc};
 
-use crate::commands::common::{fmt_duration, format_local_time};
+use crate::commands::common::{color_enabled, fmt_duration, format_local_time};
 use crate::default_speed;
 use crate::goals;
 use crate::store;
@@ -164,14 +162,15 @@ pub(crate) fn raw_span_s(started_at: &str, ended_at: &str) -> Option<i64> {
     (secs >= 0).then_some(secs)
 }
 /// A dim `" (raw <value>)"` hint when `show` is true, else empty. Dimming uses
-/// the ANSI faint code, but only on a TTY — piping `tm stats` into a file or
-/// `grep` gets clean text with no escape sequences.
+/// the ANSI faint code, but only when colour is enabled (a TTY without
+/// `NO_COLOR`, see [`color_enabled`]) — piping `tm stats` into a file or `grep`
+/// gets clean text with no escape sequences.
 pub(crate) fn raw_hint(show: bool, value: &str) -> String {
     if !show {
         return String::new();
     }
     let hint = format!(" (raw {value})");
-    if std::io::stdout().is_terminal() {
+    if color_enabled() {
         format!("\x1b[2m{hint}\x1b[0m")
     } else {
         hint

@@ -161,6 +161,14 @@ pub(crate) fn highlight_config<T: std::fmt::Display>(value: T) -> String {
 - `src/widget.rs` — `run_speed_widget` статус + `set_show_speed` confirmation.
 - `CLAUDE.md` — короткая заметка про cyan-конвенцию (cyan = конфигурируемое).
 
+## Статус: реализовано
+
+Все пункты выполнены. Верификация через pty (`script -q /dev/null`):
+`zone list` красит `method`/`name`/`id`/`max`, оставляя bpm-range plain,
+выравнивание колонок цело (pad-then-colour); `doctor` красит `config enabled`;
+piped-вывод и `NO_COLOR=1` — полностью чистый текст. `cargo build`/`clippy`
+чисто, 192 теста зелёные.
+
 ## Не в scope
 
 - `tm widget` (TSV/tmux-виджет) — машинный вывод, ANSI туда не идёт (свой tmux
