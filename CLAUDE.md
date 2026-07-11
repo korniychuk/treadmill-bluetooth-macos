@@ -275,15 +275,19 @@ This file is read by two different agents. Follow the branch that matches who yo
 
 Live 2026-07-11: after connect, **btleplug** can panic on a background thread
 (`Got descriptors for a characteristic we don't know about`) without killing the
-process. Subsequent scans fail instantly with `err=start filtered BLE scan`;
-launchd KeepAlive does **not** restart. Recovery:
+process; subsequent scans fail instantly with `err=start filtered BLE scan`.
+**Fixed by задача [051](docs/tasks/051-ble-scan-auto-recover.md)** (закрыла
+backlog [009](docs/backlog/009-btleplug-panic-wedges-ble-scan.md)): panic
+fail-fast hook (exit 101), typed `ScanStartFailed` + `ScanRecovery` — recycle
+адаптера после 3 подряд, exit 87 после 2 recycle; launchd KeepAlive
+перезапускает. Exit-коды форензики: 86 watchdog, 87 scan-wedge, 88 persistent
+DB failure, 101 panic. Ручной рычаг, если что-то новое всё же заклинит:
 
 ```bash
 launchctl kickstart -k "gui/$(id -u)/com.korniychuk.treadmill-bluetooth-macos.daemon"
 ```
 
-Wake the treadmill console if it stopped advertising. Permanent fix: backlog
-[009](docs/backlog/009-btleplug-panic-wedges-ble-scan.md). Reliability tasks
+Wake the treadmill console if it stopped advertising. Reliability tasks
 035–047: done; smoke notes [048](docs/tasks/048-live-smoke-035-047.md).
 
 ## Протокол

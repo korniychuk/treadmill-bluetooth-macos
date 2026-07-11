@@ -1,6 +1,9 @@
 # 009 — btleplug panic on discover_services wedges BLE scan forever
 
-**Status:** backlog  
+**Status:** done → задача [051](../tasks/051-ble-scan-auto-recover.md) (2026-07-11):
+panic fail-fast hook (exit 101 → launchd restart), typed `ScanStartFailed` +
+`ScanRecovery` (recycle adapter после 3 подряд, exit 87 после 2 recycle без
+здорового скана), powered-off радио не кормит wedge-streak (`38de7da`)  
 **Severity:** high for MTTR (session dead until manual kickstart)  
 **Seen live:** 2026-07-11 smoke ([048](../tasks/048-live-smoke-035-047.md))  
 **Class:** liveness / third-party panic / process isolation

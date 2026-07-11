@@ -1,6 +1,8 @@
 # 007 — Split god modules (`store` / `daemon` wiring / `main` CLI)
 
-**Status:** backlog  
+**Status:** частично done — `store` → задача [049](../tasks/049-store-module-split.md),
+`main`/CLI → [050](../tasks/050-cli-module-split.md); остаток (`daemon` wiring +
+`zone_hold`) → задача [055](../tasks/055-daemon-zone-module-split.md)  
 **Depends on:** [005](005-session-state-extract.md) Step 1 (state extract first — otherwise we only move gods)  
 **Source:** [research/003](../research/003-reliability-architecture-review.md) Phase 5
 
