@@ -1,6 +1,6 @@
 # 051 — Авто-восстановление после btleplug-паники, которая навсегда ломает BLE-скан
 
-> **Статус: planned**
+> **Статус: done**
 > **Источник:** backlog [009](../backlog/009-btleplug-panic-wedges-ble-scan.md); live-инцидент 2026-07-11 ([048](048-live-smoke-035-047.md))
 > **Класс:** liveness / third-party panic / MTTR
 > **Scope-файлы (ЖЁСТКО):** `src/daemon.rs`, `src/scan.rs`. **НЕ трогать** `src/main.rs`, `src/store.rs`, `tm doctor` (`daemon_status`-колонки) — эти файлы параллельно рефакторятся другими агентами. LaunchAgent plist (`scripts/install-daemon.sh`) — правка **не требуется** (см. «KeepAlive-семантика» ниже), не трогать без причины.
@@ -236,14 +236,14 @@ exit(87) ≈ 45–50 с; launchd throttle ~10 с → свежий процесс
 
 ## Acceptance (из backlog 009)
 
-- [ ] После симулированного streak'а scan-start-отказов (или реальной
+- [x] После симулированного streak'а scan-start-отказов (или реальной
       discover-паники) демон восстанавливается сам, без `kickstart`, за ~1 мин:
       либо adapter recycle (~15 с), либо exit(87/101) → launchd-рестарт.
-- [ ] Логи делают класс отказа очевидным: `panic_fail_fast` /
+- [x] Логи делают класс отказа очевидным: `panic_fail_fast` /
       `scan_recovery` теги, streak/recycle-счётчики, exit-код.
-- [ ] Здоровый путь не тронут: «no FTMS treadmill found» сбрасывает счётчики,
+- [x] Здоровый путь не тронут: «no FTMS treadmill found» сбрасывает счётчики,
       обычный connect/reconnect работает, ложных рестартов нет.
-- [ ] Юнит-тесты на чистую streak-логику и panic-описатель зелёные;
+- [x] Юнит-тесты на чистую streak-логику и panic-описатель зелёные;
       `cargo clippy` чистый.
 
 ## Связанное

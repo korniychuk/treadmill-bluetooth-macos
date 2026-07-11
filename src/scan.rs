@@ -4,6 +4,7 @@
 //! to have Bluetooth permission (granted on first run). There are no numeric
 //! addresses on macOS — peripherals are identified by an opaque system UUID.
 
+use std::fmt;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -19,6 +20,20 @@ use crate::logger::WorkoutLogger;
 
 /// How long to scan before giving up on finding a treadmill.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Marker context for a failed `start_scan` so callers can classify the
+/// failure without string-matching (backlog 009: a wedged `CBCentralManager`
+/// fails scan starts instantly and forever).
+#[derive(Debug)]
+pub struct ScanStartFailed;
+
+impl fmt::Display for ScanStartFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("start filtered BLE scan")
+    }
+}
+
+impl std::error::Error for ScanStartFailed {}
 
 /// How long to wait on a single CoreBluetooth call (`connect()`,
 /// `discover_services()`, `subscribe()`, `notifications()`, `disconnect()`)
@@ -144,7 +159,7 @@ pub async fn connect_treadmill(adapter: &Adapter) -> Result<Peripheral> {
             services: vec![ftms::FITNESS_MACHINE_SERVICE],
         })
         .await
-        .context("start filtered BLE scan")?;
+        .context(ScanStartFailed)?;
 
     let deadline = tokio::time::Instant::now() + SCAN_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
@@ -204,7 +219,10 @@ pub async fn connect_hr(adapter: &Adapter) -> Result<Peripheral> {
             services: vec![hr::HEART_RATE_SERVICE],
         })
         .await
-        .context("start filtered HR BLE scan")?;
+        // Same typed marker as the treadmill path so a wedged adapter is
+        // classifiable; the daemon's recycle streak only counts treadmill
+        // connect failures (HR is best-effort on a spawned task).
+        .context(ScanStartFailed)?;
 
     let deadline = tokio::time::Instant::now() + SCAN_TIMEOUT;
     while tokio::time::Instant::now() < deadline {

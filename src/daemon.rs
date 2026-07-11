@@ -49,6 +49,24 @@
 //! launchd restart the daemon within seconds. SQLite commits per operation
 //! and the JSONL log flushes per line, so an exit loses nothing a hung
 //! daemon wasn't already losing. See `docs/tasks/007-...md`.
+//!
+//! ## BLE scan wedge recovery (backlog 009 / задача 051)
+//!
+//! btleplug 0.12 can panic on a *background* CoreBluetooth callback thread
+//! (`Got descriptors for a characteristic we don't know about`) without
+//! killing the process. The surviving `CBCentralManager` then fails every
+//! `start_scan` instantly (`ScanStartFailed`). Two layers heal this:
+//!
+//! 1. **Fail-fast panic hook** (installed only in [`run`]): any thread panic
+//!    logs under `panic_fail_fast` and `process::exit`([`PANIC_EXIT_CODE`]) so
+//!    launchd KeepAlive restarts a clean process (exit 101, distinct from
+//!    watchdog 86 and scan-wedged 87).
+//! 2. **Adapter recycle** ([`ScanRecovery`]): consecutive typed
+//!    `start_scan` failures recycle the adapter (fresh `Manager` /
+//!    `CBCentralManager` via [`scan::first_adapter`]); after
+//!    [`SCAN_RECYCLE_MAX`] recycles without a successful scan start, exit
+//!    [`SCAN_WEDGED_EXIT_CODE`]. Healthy outcomes ("no FTMS treadmill found")
+//!    reset both counters — never recycle/exit on a merely powered-off belt.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -58,7 +76,7 @@ use std::time::{Duration, Instant};
 use std::pin::Pin;
 
 use anyhow::{Result, anyhow};
-use btleplug::api::{Peripheral as _, ValueNotification};
+use btleplug::api::{Central, Peripheral as _, ValueNotification};
 use btleplug::platform::{Adapter, Peripheral};
 use chrono::{DateTime, Local, Utc};
 use futures::{Stream, StreamExt};
@@ -174,6 +192,122 @@ const SPEED_HISTORY_RETENTION: Duration = Duration::from_secs(45);
 /// distinct from panics/normal errors so `launchctl print` / log forensics
 /// can tell watchdog restarts apart.
 const WATCHDOG_EXIT_CODE: i32 = 86;
+
+/// Exit code for the fail-fast panic hook — matches Rust's own exit code for
+/// a panicking main thread, distinct from [`WATCHDOG_EXIT_CODE`] (86) and
+/// [`SCAN_WEDGED_EXIT_CODE`] (87) for log/`launchctl print` forensics.
+const PANIC_EXIT_CODE: i32 = 101;
+
+/// Consecutive `start_scan` failures before recycling the adapter (~15s at
+/// [`RETRY_DELAY`] — fast enough for MTTR, wide enough to skip a one-off blip).
+const SCAN_START_RECYCLE_THRESHOLD: u32 = 3;
+
+/// Adapter recycles (without a successful scan start in between) before
+/// giving up and exiting for a launchd restart.
+const SCAN_RECYCLE_MAX: u32 = 2;
+
+/// Exit code when scanning stays wedged after [`SCAN_RECYCLE_MAX`] recycles.
+const SCAN_WEDGED_EXIT_CODE: i32 = 87;
+
+/// Decision from [`ScanRecovery`] after a connect-cycle outcome (задача 051).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanRecoveryAction {
+    /// Keep using the current adapter; sleep [`RETRY_DELAY`] and try again.
+    Retry,
+    /// Drop the wedged `CBCentralManager` and open a fresh one via
+    /// [`scan::first_adapter`].
+    RecycleAdapter,
+    /// Recycles exhausted — `process::exit`([`SCAN_WEDGED_EXIT_CODE`]).
+    Exit,
+}
+
+/// Pure streak counters for wedged-scan recovery (задача 051 / backlog 009).
+///
+/// No IO or time: callers inject the classification (`is_scan_start_failure`)
+/// and apply side effects (`stop_scan`, `first_adapter`, `exit`) themselves —
+/// same shape as [`presence::PresenceTracker`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ScanRecovery {
+    scan_start_streak: u32,
+    recycles: u32,
+}
+
+impl ScanRecovery {
+    /// Record a failed `connect_treadmill` cycle.
+    ///
+    /// Non-scan-start failures (belt off, connect/discover errors) mean the
+    /// adapter is alive — both counters reset, always [`ScanRecoveryAction::Retry`].
+    fn on_connect_failure(&mut self, is_scan_start_failure: bool) -> ScanRecoveryAction {
+        if !is_scan_start_failure {
+            self.on_scan_ok();
+            return ScanRecoveryAction::Retry;
+        }
+
+        self.scan_start_streak += 1;
+        if self.scan_start_streak < SCAN_START_RECYCLE_THRESHOLD {
+            return ScanRecoveryAction::Retry;
+        }
+
+        // Streak hit the recycle threshold.
+        if self.recycles >= SCAN_RECYCLE_MAX {
+            return ScanRecoveryAction::Exit;
+        }
+
+        self.scan_start_streak = 0;
+        self.recycles += 1;
+        ScanRecoveryAction::RecycleAdapter
+    }
+
+    /// Any successful scan start (connect `Ok`, or a non-scan-start failure)
+    /// proves the adapter is healthy — reset both counters.
+    fn on_scan_ok(&mut self) {
+        self.scan_start_streak = 0;
+        self.recycles = 0;
+    }
+}
+
+/// Extract a human-readable message from a panic payload (`&str` / `String` /
+/// anything else). Pure so unit tests cover the branches without constructing
+/// a real [`std::panic::PanicHookInfo`].
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "<non-string panic payload>".to_string()
+}
+
+/// Format a panic location for structured logs (`file:line`, or a stable
+/// placeholder when the runtime provides none).
+fn panic_location_message(location: Option<&std::panic::Location<'_>>) -> String {
+    match location {
+        Some(loc) => format!("{}:{}", loc.file(), loc.line()),
+        None => "<unknown>".to_string(),
+    }
+}
+
+/// Install a process-wide fail-fast panic hook used only in daemon mode
+/// (called from [`run`], never from one-shot CLI paths). Logs under
+/// `panic_fail_fast`, prints the default backtrace, then exits so launchd
+/// KeepAlive restarts a clean process (backlog 009).
+fn install_panic_fail_fast_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = panic_payload_message(info.payload());
+        let location = panic_location_message(info.location());
+        error!(
+            target: "panic_fail_fast",
+            payload = %payload,
+            location = %location,
+            exit_code = PANIC_EXIT_CODE,
+            "panic detected — exiting so launchd KeepAlive restarts the daemon (backlog 009)"
+        );
+        default_hook(info);
+        std::process::exit(PANIC_EXIT_CODE);
+    }));
+}
 
 /// Backstop poll cadence for the control-command queue while connected but
 /// quiet (no telemetry-driven check). Commands are also processed at the end
@@ -385,6 +519,11 @@ fn spawn_hr_connect_attempt(adapter: Adapter, tx: UnboundedSender<HrConnectOutco
 /// on disconnect, toast and go back to scanning. Reacts to power/sleep
 /// events instead of polling — see module docs.
 pub async fn run(adapter: &Adapter) -> Result<()> {
+    // Fail-fast on any thread panic (incl. btleplug CoreBluetooth callbacks)
+    // so launchd KeepAlive restarts a clean process. One-shot CLI never reaches
+    // here — see задача 051 / backlog 009.
+    install_panic_fail_fast_hook();
+
     let mut power_events = power::spawn_power_event_listener();
     let mut store = Store::open()?;
     // Loaded once here (not per session): config edits take effect on the next
@@ -428,6 +567,11 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
     // first connection/session (задача 022).
     state.set_config(&live_config.goals, live_config.auto_pause);
     state.persist(&store, &watchdog)?;
+
+    // Owned override when we recycle a wedged CBCentralManager (задача 051).
+    // `run` only borrows the adapter from main, so replacement is local.
+    let mut recycled_adapter: Option<Adapter> = None;
+    let mut scan_recovery = ScanRecovery::default();
 
     loop {
         if !on_ac {
@@ -481,6 +625,11 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
             continue;
         }
 
+        // Clone so the select!/stream body does not borrow `recycled_adapter`
+        // (we may drop and replace that Option on a recycle — задача 051).
+        // `Adapter: Clone` is a handle; old clones in finished HR tasks drop cleanly.
+        let active_adapter = recycled_adapter.as_ref().unwrap_or(adapter).clone();
+
         tokio::select! {
             biased;
             event = power_events.recv() => {
@@ -514,16 +663,17 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
             _ = persist_tick.tick() => {
                 state.persist(&store, &watchdog)?;
             }
-            result = scan::connect_treadmill(adapter) => {
+            result = scan::connect_treadmill(&active_adapter) => {
                 match result {
                     Ok(peripheral) => {
+                        scan_recovery.on_scan_ok();
                         notify::treadmill_found();
                         state.connected = true;
                         state.last_connected_at = Some(Utc::now().to_rfc3339());
                         state.persist(&store, &watchdog)?;
 
                         if let Err(err) = stream_with_presence(
-                            adapter,
+                            &active_adapter,
                             &peripheral,
                             &mut power_events,
                             &mut store,
@@ -570,8 +720,80 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                         scan::disconnect_best_effort(&peripheral).await;
                     }
                     Err(err) => {
-                        warn!(%err, "treadmill not found this cycle, retrying");
-                        sleep(RETRY_DELAY).await;
+                        let is_scan_start =
+                            err.downcast_ref::<scan::ScanStartFailed>().is_some();
+                        match scan_recovery.on_connect_failure(is_scan_start) {
+                            ScanRecoveryAction::Retry => {
+                                if is_scan_start {
+                                    warn!(
+                                        target: "scan_recovery",
+                                        streak = scan_recovery.scan_start_streak,
+                                        recycles = scan_recovery.recycles,
+                                        %err,
+                                        "start_scan failed — retrying (backlog 009)"
+                                    );
+                                } else {
+                                    warn!(%err, "treadmill not found this cycle, retrying");
+                                }
+                                sleep(RETRY_DELAY).await;
+                            }
+                            ScanRecoveryAction::RecycleAdapter => {
+                                warn!(
+                                    target: "scan_recovery",
+                                    streak = SCAN_START_RECYCLE_THRESHOLD,
+                                    recycle = scan_recovery.recycles,
+                                    %err,
+                                    "start_scan failure streak — recycling BLE adapter (backlog 009)"
+                                );
+                                match tokio::time::timeout(
+                                    scan::CONNECT_TIMEOUT,
+                                    active_adapter.stop_scan(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(stop_err)) => warn!(
+                                        target: "scan_recovery",
+                                        %stop_err,
+                                        "stop_scan failed during adapter recycle — continuing"
+                                    ),
+                                    Err(_) => warn!(
+                                        target: "scan_recovery",
+                                        timeout_s = scan::CONNECT_TIMEOUT.as_secs(),
+                                        "stop_scan timed out during adapter recycle — continuing"
+                                    ),
+                                }
+                                // Drop any previous owned adapter before opening a
+                                // fresh Manager / CBCentralManager (this cycle's
+                                // clone drops at end of match).
+                                drop(recycled_adapter.take());
+                                match scan::first_adapter().await {
+                                    Ok(new_adapter) => {
+                                        recycled_adapter = Some(new_adapter);
+                                    }
+                                    Err(adapter_err) => {
+                                        error!(
+                                            target: "scan_recovery",
+                                            %adapter_err,
+                                            exit_code = SCAN_WEDGED_EXIT_CODE,
+                                            "failed to acquire BLE adapter after recycle — exiting for launchd restart (backlog 009)"
+                                        );
+                                        std::process::exit(SCAN_WEDGED_EXIT_CODE);
+                                    }
+                                }
+                            }
+                            ScanRecoveryAction::Exit => {
+                                error!(
+                                    target: "scan_recovery",
+                                    streak = scan_recovery.scan_start_streak,
+                                    recycles = scan_recovery.recycles,
+                                    exit_code = SCAN_WEDGED_EXIT_CODE,
+                                    %err,
+                                    "start_scan still failing after adapter recycles — exiting for launchd restart (backlog 009)"
+                                );
+                                std::process::exit(SCAN_WEDGED_EXIT_CODE);
+                            }
+                        }
                     }
                 }
             }
@@ -2416,10 +2638,10 @@ mod tests {
         // Pure predicate mirror of the reconnect-tick recovery (задача 042).
         let started = Instant::now();
         assert!(
-            !started
+            started
                 .elapsed()
                 .checked_sub(HR_CONNECT_ATTEMPT_DEADLINE)
-                .is_some()
+                .is_none()
         );
         // Document the constant is strictly above a full scan window.
         assert!(HR_CONNECT_ATTEMPT_DEADLINE > Duration::from_secs(15));
@@ -2750,5 +2972,163 @@ mod tests {
             return; // would return from tick without writing
         };
         panic!("must not reach speed-dependent logic");
+    }
+
+    // --- задача 051 / backlog 009: scan recovery streak + panic payload ---
+
+    /// Healthy connect failures ("no FTMS treadmill found", connect/discover
+    /// errors) must never grow the streak or trigger recycle/exit.
+    #[test]
+    fn scan_recovery_non_scan_start_always_retries_and_resets() {
+        let mut r = ScanRecovery::default();
+        for _ in 0..10 {
+            assert_eq!(
+                r.on_connect_failure(false),
+                ScanRecoveryAction::Retry,
+                "non-scan-start failure must stay Retry"
+            );
+            assert_eq!(r.scan_start_streak, 0);
+            assert_eq!(r.recycles, 0);
+        }
+    }
+
+    /// Exactly `SCAN_START_RECYCLE_THRESHOLD` consecutive scan-start failures
+    /// yield one recycle and clear the streak.
+    #[test]
+    fn scan_recovery_threshold_triggers_recycle() {
+        let mut r = ScanRecovery::default();
+        for i in 1..SCAN_START_RECYCLE_THRESHOLD {
+            assert_eq!(
+                r.on_connect_failure(true),
+                ScanRecoveryAction::Retry,
+                "streak {i} should still Retry"
+            );
+            assert_eq!(r.scan_start_streak, i);
+            assert_eq!(r.recycles, 0);
+        }
+        assert_eq!(
+            r.on_connect_failure(true),
+            ScanRecoveryAction::RecycleAdapter
+        );
+        assert_eq!(r.scan_start_streak, 0, "streak cleared after recycle");
+        assert_eq!(r.recycles, 1);
+    }
+
+    /// A successful scan (or non-scan-start failure) after a partial streak
+    /// resets both counters — including an earlier recycle count.
+    #[test]
+    fn scan_recovery_success_resets_partial_streak_and_recycles() {
+        let mut r = ScanRecovery::default();
+        // Build one recycle, then a partial streak toward the next.
+        for _ in 0..SCAN_START_RECYCLE_THRESHOLD {
+            let _ = r.on_connect_failure(true);
+        }
+        assert_eq!(r.recycles, 1);
+        assert_eq!(r.on_connect_failure(true), ScanRecoveryAction::Retry);
+        assert_eq!(r.scan_start_streak, 1);
+
+        r.on_scan_ok();
+        assert_eq!(r.scan_start_streak, 0);
+        assert_eq!(r.recycles, 0);
+
+        // Non-scan-start failure is also a full reset (adapter proved alive).
+        for _ in 0..SCAN_START_RECYCLE_THRESHOLD {
+            let _ = r.on_connect_failure(true);
+        }
+        assert_eq!(r.recycles, 1);
+        assert_eq!(r.on_connect_failure(false), ScanRecoveryAction::Retry);
+        assert_eq!(r.scan_start_streak, 0);
+        assert_eq!(r.recycles, 0);
+    }
+
+    /// After `SCAN_RECYCLE_MAX` recycles with no healthy scan in between, the
+    /// next full streak exits for launchd restart.
+    #[test]
+    fn scan_recovery_exits_after_max_recycles() {
+        let mut r = ScanRecovery::default();
+        for expected_recycle in 1..=SCAN_RECYCLE_MAX {
+            let mut last = ScanRecoveryAction::Retry;
+            for _ in 0..SCAN_START_RECYCLE_THRESHOLD {
+                last = r.on_connect_failure(true);
+            }
+            assert_eq!(
+                last,
+                ScanRecoveryAction::RecycleAdapter,
+                "recycle #{expected_recycle}"
+            );
+            assert_eq!(r.recycles, expected_recycle);
+            assert_eq!(r.scan_start_streak, 0);
+        }
+
+        // Next streak must Exit (recycles already at max).
+        for i in 1..SCAN_START_RECYCLE_THRESHOLD {
+            assert_eq!(r.on_connect_failure(true), ScanRecoveryAction::Retry);
+            assert_eq!(r.scan_start_streak, i);
+        }
+        assert_eq!(r.on_connect_failure(true), ScanRecoveryAction::Exit);
+        assert_eq!(r.recycles, SCAN_RECYCLE_MAX);
+        assert_eq!(r.scan_start_streak, SCAN_START_RECYCLE_THRESHOLD);
+    }
+
+    /// A healthy scan after a recycle clears the recycle budget — the next
+    /// wedge starts from recycle #1 again, not Exit.
+    #[test]
+    fn scan_recovery_success_after_recycle_allows_another_recycle() {
+        let mut r = ScanRecovery::default();
+        for _ in 0..SCAN_START_RECYCLE_THRESHOLD {
+            let _ = r.on_connect_failure(true);
+        }
+        assert_eq!(r.recycles, 1);
+
+        r.on_scan_ok();
+        assert_eq!(r.recycles, 0);
+
+        for _ in 0..SCAN_START_RECYCLE_THRESHOLD {
+            let _ = r.on_connect_failure(true);
+        }
+        assert_eq!(
+            r.recycles, 1,
+            "post-success streak must recycle again, not exit"
+        );
+        // Not at max yet with a single recycle — still not Exit.
+        assert_ne!(r.on_connect_failure(true), ScanRecoveryAction::Exit);
+    }
+
+    #[test]
+    fn panic_payload_message_str_string_and_other() {
+        let as_str: &str = "boom from &str";
+        assert_eq!(
+            panic_payload_message(&as_str as &(dyn std::any::Any + Send)),
+            "boom from &str"
+        );
+
+        let as_string = String::from("boom from String");
+        assert_eq!(
+            panic_payload_message(&as_string as &(dyn std::any::Any + Send)),
+            "boom from String"
+        );
+
+        let as_int = 42i32;
+        assert_eq!(
+            panic_payload_message(&as_int as &(dyn std::any::Any + Send)),
+            "<non-string panic payload>"
+        );
+    }
+
+    #[test]
+    fn panic_location_message_with_and_without_location() {
+        // `Location::caller()` always yields Some when we pass it explicitly.
+        let loc = std::panic::Location::caller();
+        let formatted = panic_location_message(Some(loc));
+        assert!(
+            formatted.contains(':'),
+            "expected file:line, got {formatted}"
+        );
+        assert!(
+            formatted.contains("daemon.rs"),
+            "expected this source file in {formatted}"
+        );
+
+        assert_eq!(panic_location_message(None), "<unknown>");
     }
 }
