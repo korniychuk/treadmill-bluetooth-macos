@@ -203,6 +203,63 @@ const DB_PERSIST_FAILURE_LIMIT: u32 = 30;
 /// scan-wedge (87) for log/`launchctl print` forensics.
 const DB_PERSIST_EXIT_CODE: i32 = 88;
 
+/// Shared tolerate-and-escalate for DB writes that must not tear down a
+/// healthy session/loop (backlog 010 / 011). Resets `failures` on success;
+/// on a transient error increments and runs `on_skip`; after
+/// [`DB_PERSIST_FAILURE_LIMIT`] consecutive failures logs ERROR and exits
+/// for a launchd restart (never returns).
+fn tolerate_db_write<T>(
+    result: Result<T>,
+    failures: &mut u32,
+    on_skip: impl FnOnce(&anyhow::Error, u32),
+) -> Option<T> {
+    match result {
+        Ok(value) => {
+            *failures = 0;
+            Some(value)
+        }
+        Err(err) if *failures + 1 < DB_PERSIST_FAILURE_LIMIT => {
+            *failures += 1;
+            on_skip(&err, *failures);
+            None
+        }
+        Err(err) => {
+            error!(
+                error = %err,
+                consecutive = *failures + 1,
+                exit_code = DB_PERSIST_EXIT_CODE,
+                "DB persist failing persistently — exiting for launchd restart"
+            );
+            std::process::exit(DB_PERSIST_EXIT_CODE);
+        }
+    }
+}
+
+/// Upsert `daemon_status` without letting a busy/full DB kill the loop.
+///
+/// On success [`DaemonState::persist`] already calls [`Watchdog::touch`].
+/// On a skipped failure we still touch: event-loop progress must not depend
+/// on SQLite (Liveness matrix — shell/watchdog row).
+fn persist_daemon_status(
+    state: &DaemonState,
+    store: &Store,
+    watchdog: &Watchdog,
+    failures: &mut u32,
+) {
+    let _ = tolerate_db_write(
+        state.persist(store, watchdog),
+        failures,
+        |err, consecutive| {
+            watchdog.touch();
+            warn!(
+                error = %err,
+                consecutive,
+                "daemon status persist failed — skipping upsert, keeping the loop"
+            );
+        },
+    );
+}
+
 /// Exit code for the fail-fast panic hook — matches Rust's own exit code for
 /// a panicking main thread, distinct from [`WATCHDOG_EXIT_CODE`] (86) and
 /// [`SCAN_WEDGED_EXIT_CODE`] (87) for log/`launchctl print` forensics.
@@ -477,6 +534,9 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
     // Refreshes `daemon_status.updated_at` (and the watchdog) while idle, so
     // quiet-but-healthy stretches never look like a hang to `status`.
     let mut persist_tick = tokio::time::interval(PERSIST_TICK_INTERVAL);
+    // Consecutive DB persist failures (backlog 010/011) — shared across the
+    // idle heartbeat and the connected session. Reset on the first success.
+    let mut db_persist_failures: u32 = 0;
 
     // The listener always sends the current AC/battery state as its first
     // event (see `power::spawn_power_event_listener`), so this seeds `on_ac`
@@ -549,7 +609,7 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                         }
                     }
                     _ = persist_tick.tick() => {
-                        state.persist(&store, &watchdog)?;
+                        persist_daemon_status(&state, &store, &watchdog, &mut db_persist_failures);
                     }
                 }
             }
@@ -592,7 +652,7 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                 }
             }
             _ = persist_tick.tick() => {
-                state.persist(&store, &watchdog)?;
+                persist_daemon_status(&state, &store, &watchdog, &mut db_persist_failures);
             }
             result = scan::connect_treadmill(&active_adapter) => {
                 match result {
@@ -612,6 +672,7 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                             &watchdog,
                             &mut on_ac,
                             &mut live_config,
+                            &mut db_persist_failures,
                         )
                         .await
                         {
@@ -767,6 +828,7 @@ async fn stream_with_presence(
     watchdog: &Watchdog,
     on_ac: &mut bool,
     config: &mut LiveConfig,
+    db_persist_failures: &mut u32,
 ) -> Result<()> {
     scan::subscribe_treadmill_data(peripheral).await?;
     scan::subscribe_treadmill_status(peripheral).await?;
@@ -827,10 +889,8 @@ async fn stream_with_presence(
     spawn_hr_connect_attempt(adapter.clone(), hr_tx.clone());
     let mut hr_reconnect_tick = tokio::time::interval(HR_RECONNECT_INTERVAL);
     let mut hr_battery_check_tick = tokio::time::interval(HR_BATTERY_CHECK_INTERVAL);
-    // Consecutive per-sample DB persist failures (backlog 010) — reset on the
-    // first successful persist. Deliberately NOT part of `TreadmillLink`: the
-    // counter tracks DB health, which outlives any single BLE session.
-    let mut db_persist_failures: u32 = 0;
+    // `db_persist_failures` is owned by `run()` and shared with the idle
+    // heartbeat (backlog 011) — DB health outlives any single BLE session.
 
     loop {
         tokio::select! {
@@ -840,15 +900,15 @@ async fn stream_with_presence(
                     Some(PowerEvent::AcPowerChanged(new_on_ac)) => {
                         *on_ac = new_on_ac;
                         state.set_power_mode(new_on_ac);
-                        state.persist(store, watchdog)?;
+                        persist_daemon_status(state, store, watchdog, db_persist_failures);
                     }
                     Some(PowerEvent::WillSleep) => {
                         info!("system will sleep — active session left connected, BLE will drop on its own if it doesn't survive");
-                        state.persist(store, watchdog)?;
+                        persist_daemon_status(state, store, watchdog, db_persist_failures);
                     }
                     Some(PowerEvent::DidWake) => {
                         info!("system woke while connected — active session unaffected");
-                        state.persist(store, watchdog)?;
+                        persist_daemon_status(state, store, watchdog, db_persist_failures);
                     }
                     Some(PowerEvent::WillPowerOff) => {
                         warn!("system will power off — closing active session best-effort before the process may be killed");
@@ -894,7 +954,7 @@ async fn stream_with_presence(
                     } else {
                         warn!("empty Fitness Machine Status frame");
                     }
-                    state.persist(store, watchdog)?;
+                    persist_daemon_status(state, store, watchdog, db_persist_failures);
                     continue;
                 }
                 if notification.uuid != ftms::TREADMILL_DATA {
@@ -916,29 +976,14 @@ async fn stream_with_presence(
                 let persisted = store
                     .insert_raw_sample(session_id, Utc::now().timestamp_millis(), &data, &notification.value)
                     .and_then(|()| store.advance_baseline(data.steps, data.total_distance_m, data.elapsed_s));
-                let deltas = match persisted {
-                    Ok(deltas) => {
-                        db_persist_failures = 0;
-                        deltas
-                    }
-                    Err(err) if db_persist_failures + 1 < DB_PERSIST_FAILURE_LIMIT => {
-                        db_persist_failures += 1;
-                        warn!(
-                            error = %err,
-                            consecutive = db_persist_failures,
-                            "sample persist failed — skipping sample, keeping the stream"
-                        );
-                        continue;
-                    }
-                    Err(err) => {
-                        error!(
-                            error = %err,
-                            consecutive = db_persist_failures + 1,
-                            exit_code = DB_PERSIST_EXIT_CODE,
-                            "sample persist failing persistently — exiting for launchd restart"
-                        );
-                        std::process::exit(DB_PERSIST_EXIT_CODE);
-                    }
+                let Some(deltas) = tolerate_db_write(persisted, db_persist_failures, |err, consecutive| {
+                    warn!(
+                        error = %err,
+                        consecutive,
+                        "sample persist failed — skipping sample, keeping the stream"
+                    );
+                }) else {
+                    continue;
                 };
 
                 // Speed memory feeds resume-restore and Zone Hold ramp seeding —
@@ -1168,7 +1213,7 @@ async fn stream_with_presence(
                 if deltas.steps > 0 {
                     celebrate_reached_goals(store, &config.goals)?;
                 }
-                state.persist(store, watchdog)?;
+                persist_daemon_status(state, store, watchdog, db_persist_failures);
                 // Primary control-command check: telemetry arrives ~1/s while
                 // connected, so this bounds command latency to ≤1s during an
                 // active session (задача 013). The interval arm below is only a
@@ -1209,7 +1254,7 @@ async fn stream_with_presence(
                     // `tm status` (задача 022): the file was actually re-read here
                     // even when the delta is empty (mtime moved, content identical).
                     state.set_config(&config.goals, config.auto_pause);
-                    state.persist(store, watchdog)?;
+                    persist_daemon_status(state, store, watchdog, db_persist_failures);
                 }
             }
             // A background connect attempt finished (задача 025). `NotFound`
@@ -1229,7 +1274,7 @@ async fn stream_with_presence(
                             state,
                         );
                         hr_peripheral = Some(peripheral);
-                        state.persist(store, watchdog)?;
+                        persist_daemon_status(state, store, watchdog, db_persist_failures);
                     }
                     Some(HrConnectOutcome::NotFound) => {}
                     None => {
@@ -1266,11 +1311,16 @@ async fn stream_with_presence(
                                     // stored — insert-then-publish, pre-refactor
                                     // order (053 review follow-up).
                                     hr.on_frame_stored(&m, ts_ms, state);
-                                    state.persist(store, watchdog)?;
+                                    persist_daemon_status(state, store, watchdog, db_persist_failures);
                                 }
                                 HrFrameAction::Drop { state_changed } => {
                                     if state_changed {
-                                        state.persist(store, watchdog)?;
+                                        persist_daemon_status(
+                                            state,
+                                            store,
+                                            watchdog,
+                                            db_persist_failures,
+                                        );
                                     }
                                 }
                             }
@@ -1288,7 +1338,7 @@ async fn stream_with_presence(
                         // Keep link_up ↔ hr_notifications in lockstep (задача 053).
                         hr_notifications = None;
                         hr.on_link_lost(state);
-                        state.persist(store, watchdog)?;
+                        persist_daemon_status(state, store, watchdog, db_persist_failures);
                         if let Some(p) = hr_peripheral.take() {
                             scan::disconnect_best_effort(&p).await;
                         }
@@ -1306,7 +1356,7 @@ async fn stream_with_presence(
                 // Keep link_up ↔ hr_notifications in lockstep (задача 053).
                 hr_notifications = None;
                 hr.on_link_lost(state);
-                state.persist(store, watchdog)?;
+                persist_daemon_status(state, store, watchdog, db_persist_failures);
                 if let Some(p) = hr_peripheral.take() {
                     scan::disconnect_best_effort(&p).await;
                 }
@@ -1339,7 +1389,7 @@ async fn stream_with_presence(
                     // so a wedged sensor is not hammered every tick.
                     hr.on_battery_read(read, Instant::now(), state);
                     if read.is_some() {
-                        state.persist(store, watchdog)?;
+                        persist_daemon_status(state, store, watchdog, db_persist_failures);
                     }
                 }
             }
