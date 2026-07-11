@@ -63,6 +63,18 @@ impl Store {
         // with SQLITE_BUSY.
         conn.busy_timeout(std::time::Duration::from_secs(3))
             .context("set busy_timeout")?;
+        // WAL keeps readers (the 2s `widget` poll, `tm stats`) from blocking
+        // the daemon's writes entirely: under the default rollback journal a
+        // slow reader on a loaded machine held its SHARED lock past the 3s
+        // busy_timeout and `advance_baseline` failed mid-workout, tearing
+        // down the live BLE stream (backlog 010). WAL is persistent per DB
+        // file, so this is a one-time flip. `:memory:` reports "memory".
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .context("set journal_mode=WAL")?;
+        if journal_mode != "wal" && journal_mode != "memory" {
+            tracing::warn!(journal_mode, "unexpected journal_mode after requesting WAL");
+        }
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -84,4 +96,24 @@ pub(super) fn memory_store() -> Store {
         std::env::set_var("TZ", "UTC");
     }
     Store::open_at(std::path::Path::new(":memory:")).expect("open in-memory store")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_at_enables_wal_on_file_backed_db() {
+        let dir = std::env::temp_dir().join(format!("tm-wal-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("treadmill.db");
+        let store = Store::open_at(&path).expect("open file-backed store");
+        let mode: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("read journal_mode");
+        assert_eq!(mode, "wal");
+        drop(store);
+        std::fs::remove_dir_all(&dir).expect("clean temp dir");
+    }
 }

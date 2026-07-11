@@ -194,6 +194,14 @@ const SPEED_HISTORY_RETENTION: Duration = Duration::from_secs(45);
 /// can tell watchdog restarts apart.
 const WATCHDOG_EXIT_CODE: i32 = 86;
 
+/// How many *consecutive* per-sample DB persist failures are tolerated before
+/// the telemetry stream is torn down. One-off SQLITE_BUSY under system load is
+/// a recoverable anomaly (WARN + skip — the cumulative FTMS counters make the
+/// next successful `advance_baseline` self-healing), but a persistent failure
+/// (disk full, schema corruption) must escalate instead of silently dropping
+/// every sample (backlog 010).
+const DB_PERSIST_FAILURE_LIMIT: u32 = 30;
+
 /// Exit code for the fail-fast panic hook — matches Rust's own exit code for
 /// a panicking main thread, distinct from [`WATCHDOG_EXIT_CODE`] (86) and
 /// [`SCAN_WEDGED_EXIT_CODE`] (87) for log/`launchctl print` forensics.
@@ -910,6 +918,9 @@ async fn stream_with_presence(
     // Deadline anchor for the telemetry-silence arm below (задача 031); advanced
     // only by a decoded `0x2ACD` frame, never by HR/control/config activity.
     let mut last_telemetry_at = tokio::time::Instant::now();
+    // Consecutive per-sample DB persist failures (backlog 010) — reset on the
+    // first successful persist.
+    let mut db_persist_failures: u32 = 0;
     // Absolute HR-silence deadline (задача 035), advanced only by a received
     // `0x2A37` frame or when a new HR stream is installed — never by sibling arms.
     let mut last_hr_at = tokio::time::Instant::now();
@@ -968,7 +979,11 @@ async fn stream_with_presence(
                     let ts_ms = Utc::now().timestamp_millis();
                     if let Some(&event_code) = notification.value.first() {
                         info!(event = ftms::describe_status_event(event_code), code = event_code, "machine status event");
-                        store.insert_status_event(session_id, ts_ms, event_code, &notification.value)?;
+                        // Same rationale as the sample persist below: a busy DB
+                        // must not kill the stream over an informational event.
+                        if let Err(err) = store.insert_status_event(session_id, ts_ms, event_code, &notification.value) {
+                            warn!(error = %err, "status event persist failed — skipping event");
+                        }
                     } else {
                         warn!("empty Fitness Machine Status frame");
                     }
@@ -985,9 +1000,35 @@ async fn stream_with_presence(
                 last_telemetry_at = tokio::time::Instant::now();
                 watchdog.touch_telemetry();
                 logger.log(&data)?;
-                store.insert_raw_sample(session_id, Utc::now().timestamp_millis(), &data, &notification.value)?;
-
-                let deltas = store.advance_baseline(data.steps, data.total_distance_m, data.elapsed_s)?;
+                // A failed per-sample persist must not tear down a healthy BLE
+                // link: skip the sample (the cumulative FTMS counters make the
+                // next successful `advance_baseline` recompute the full delta),
+                // escalate only when the failure is persistent (backlog 010).
+                let persisted = store
+                    .insert_raw_sample(session_id, Utc::now().timestamp_millis(), &data, &notification.value)
+                    .and_then(|()| store.advance_baseline(data.steps, data.total_distance_m, data.elapsed_s));
+                let deltas = match persisted {
+                    Ok(deltas) => {
+                        db_persist_failures = 0;
+                        deltas
+                    }
+                    Err(err) if db_persist_failures + 1 < DB_PERSIST_FAILURE_LIMIT => {
+                        db_persist_failures += 1;
+                        warn!(
+                            error = %err,
+                            consecutive = db_persist_failures,
+                            "sample persist failed — skipping sample, keeping the stream"
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        error!(
+                            consecutive = db_persist_failures + 1,
+                            "sample persist failing persistently — ending stream"
+                        );
+                        return Err(err);
+                    }
+                };
 
                 // Record the belt speed so it can be restored after a pause (the
                 // machine resets the belt to a crawl on resume — задача 012).
@@ -1837,8 +1878,7 @@ fn execute_config_effects(
                 // Prefer last measured walking speed; min_speed only as
                 // engage seed when we have *some* observation (задача 036
                 // forbids inventing 0.0, not a known min floor).
-                let zh_resumed_kmh =
-                    last_walking_speed.or(Some(config.zone_hold.min_speed_kmh));
+                let zh_resumed_kmh = last_walking_speed.or(Some(config.zone_hold.min_speed_kmh));
                 let zh_default_kmh =
                     default_speed::compute_default_speed(store, goals::load_workout_gap_minutes())
                         .ok()
@@ -1870,9 +1910,7 @@ fn execute_config_effects(
                     None => {
                         // apply_config emits Disengage instead of ReResolve when
                         // unresolvable; keep defense in depth.
-                        warn!(
-                            "zone hold: re-resolve failed after config reload — disengaging"
-                        );
+                        warn!("zone hold: re-resolve failed after config reload — disengaging");
                         disengage_zone_hold(zh_phase, state);
                     }
                 }

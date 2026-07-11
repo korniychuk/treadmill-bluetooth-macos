@@ -1,6 +1,8 @@
 # 010 — SQLITE_BUSY на записи роняет presence-стрим (нет WAL)
 
-**Status:** backlog → взять сразу после мержа 049 (store split)
+**Status:** done (2026-07-11) — WAL в `store/mod.rs::open_at` + WARN+skip
+с эскалацией после `DB_PERSIST_FAILURE_LIMIT` (30) подряд в телеметрической
+ветке `daemon.rs`; статус-события — WARN+skip без эскалации.
 **Severity:** high — живые разрывы телеметрии во время тренировки
 **Seen live:** 2026-07-11 ~03:19 и ~03:33 UTC, во время тренировки оператора
 
