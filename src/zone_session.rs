@@ -28,14 +28,16 @@ const ZONE_HOLD_SAFETY_COOLDOWN: Duration = Duration::from_secs(5);
 /// HRmax-percent above which, once already at min_speed, Zone Hold hard-stops.
 const ZONE_HOLD_HARD_STOP_PERCENT: f32 = 85.0;
 
-
-
 /// Control-Point intent from a pure tick (shell executes).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ZoneWrite {
-    SetSpeed { target_kmh: f32 },
+    SetSpeed {
+        target_kmh: f32,
+    },
     /// Suppressed by operator-override window (задача 039) — shell logs, no write.
-    Suppressed { target_kmh: f32 },
+    Suppressed {
+        target_kmh: f32,
+    },
     /// Safety hard-stop — never suppressed by override (current behaviour).
     Stop,
 }
@@ -53,7 +55,9 @@ pub enum ZoneHoldPhase {
     /// Presence left Walking — HR ignored until return.
     Frozen,
     /// Just returned to Walking — no corrections until `until`.
-    Grace { until: Instant },
+    Grace {
+        until: Instant,
+    },
 }
 
 impl ZoneHoldPhase {
@@ -499,7 +503,13 @@ mod tests {
         );
         assert!(matches!(z.phase, ZoneHoldPhase::Ramp { .. }));
         // Warmup is 1 minute.
-        let w = z.tick(&config, &resolved, Some(2.5), Some(100), t0 + Duration::from_secs(60));
+        let w = z.tick(
+            &config,
+            &resolved,
+            Some(2.5),
+            Some(100),
+            t0 + Duration::from_secs(60),
+        );
         assert!(w.is_none());
         assert_eq!(z.phase, ZoneHoldPhase::Hold);
     }
@@ -545,9 +555,10 @@ mod tests {
         z.phase = ZoneHoldPhase::Hold;
         let config = enabled_config();
         let resolved = resolved(&config);
-        assert!(z
-            .tick(&config, &resolved, None, Some(120), Instant::now())
-            .is_none());
+        assert!(
+            z.tick(&config, &resolved, None, Some(120), Instant::now())
+                .is_none()
+        );
     }
 
     #[test]
@@ -557,9 +568,10 @@ mod tests {
         let mut config = enabled_config();
         let resolved = resolved(&config);
         config.enabled = false;
-        assert!(z
-            .tick(&config, &resolved, Some(3.0), Some(120), Instant::now())
-            .is_none());
+        assert!(
+            z.tick(&config, &resolved, Some(3.0), Some(120), Instant::now())
+                .is_none()
+        );
     }
 
     #[test]
@@ -574,7 +586,13 @@ mod tests {
         // Force a correction: bpm=60 is far below any default zone for age 30
         // (hrmax 187), so band tracking must step up by max_step (2.0 → 2.3) —
         // deterministic, and the override window must downgrade it to Suppressed.
-        let w = z.tick(&config, &resolved, Some(2.0), Some(60), t0 + Duration::from_secs(1));
+        let w = z.tick(
+            &config,
+            &resolved,
+            Some(2.0),
+            Some(60),
+            t0 + Duration::from_secs(1),
+        );
         assert!(
             matches!(w, Some(ZoneWrite::Suppressed { .. })),
             "expected Suppressed correction under override, got {w:?}"
@@ -654,10 +672,7 @@ mod tests {
         assert_eq!(state.zone_hold_phase.as_deref(), Some("hold"));
         assert_eq!(state.zone_hold_last_speed, Some(3.5));
         assert!(state.zone_hold_position.is_some());
-        assert_eq!(
-            state.zone_hold_target_lo,
-            Some(i64::from(resolved.low_bpm))
-        );
+        assert_eq!(state.zone_hold_target_lo, Some(i64::from(resolved.low_bpm)));
     }
 
     #[test]

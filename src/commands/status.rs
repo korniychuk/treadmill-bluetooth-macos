@@ -249,7 +249,10 @@ pub(crate) fn run_status() -> Result<()> {
                     println!("zone hold: active, phase {phase}, target {range}");
                 } else {
                     // `on`/`off` mirror the config `enabled` flag → cyan.
-                    println!("zone hold: {} (not currently engaged)", highlight_config("on"));
+                    println!(
+                        "zone hold: {} (not currently engaged)",
+                        highlight_config("on")
+                    );
                 }
             } else {
                 println!("zone hold: {}", highlight_config("off"));

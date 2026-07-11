@@ -1,7 +1,12 @@
 # 011 — Follow-ups из адверсариального ревью волны 1 (Low)
 
-**Status:** backlog — взять после мержа 053 (session state extract), оба
-пункта в зонах, которые 053 переписывает.
+**Status:** done (2026-07-11) — (1) `tolerate_db_write` /
+`persist_daemon_status` in `daemon.rs`: WARN+skip+escalation on remaining
+`state.persist` sites (status-event, 30s `persist_tick`, config-reload,
+telemetry tail, HR arms, in-session power events); skipped upsert still
+`Watchdog::touch`s. (2) `ZoneConfigChanged` log-only effect in
+`config_apply.rs` for field-only `[zone_hold]` reloads; matrix + dedicated
+test.
 **Source:** ревью `git diff 2e2bb1a..d8aa483` (049/050/051/052/010),
 2026-07-11. Находки Medium/#2 уже закрыты (`38de7da`).
 

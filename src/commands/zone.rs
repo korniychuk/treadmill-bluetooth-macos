@@ -349,8 +349,10 @@ pub(crate) fn print_zone_status() -> Result<()> {
                     // The targeted zone's identity and the speed limits are
                     // config; the bpm range is resolved from HRmax at runtime,
                     // so it stays plain (задача 057).
-                    let target =
-                        highlight_config(format!("#{} {} ({})", resolved.number, resolved.id, resolved.name));
+                    let target = highlight_config(format!(
+                        "#{} {} ({})",
+                        resolved.number, resolved.id, resolved.name
+                    ));
                     let min_speed = highlight_config(format!("{:.1}", config.min_speed_kmh));
                     let max_speed =
                         highlight_config(format!("{:.1}", resolved.effective_max_speed_kmh));

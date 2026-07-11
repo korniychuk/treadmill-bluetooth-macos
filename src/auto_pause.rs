@@ -207,10 +207,7 @@ mod tests {
         let arm = now - Duration::from_secs(30);
         ap.on_away(arm);
         let dur = ap.on_return(now).expect("duration");
-        assert_eq!(
-            dur,
-            Duration::from_secs(30) + presence::AWAY_THRESHOLD
-        );
+        assert_eq!(dur, Duration::from_secs(30) + presence::AWAY_THRESHOLD);
         assert_eq!(ap.away_for(now), None);
         // Fresh spell after return is independent.
         ap.on_away(now);
