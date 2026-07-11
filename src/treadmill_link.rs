@@ -300,4 +300,44 @@ mod tests {
         link.mark_default_speed_applied();
         assert!(link.default_speed_applied());
     }
+
+    /// The telemetry deadline must survive `select!` rebuilding its arm on every
+    /// pass — the bug of задача 031, where a 1s sibling tick reset a relative
+    /// `timeout(NOTIFICATION_TIMEOUT, ...)` forever.
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_deadline_fires_despite_a_faster_sibling_arm() {
+        use std::time::Duration;
+
+        let link = TreadmillLink::new(tokio::time::Instant::now());
+        let deadline = link.silence_deadline();
+        let mut sibling = tokio::time::interval(Duration::from_secs(1));
+        let mut ticks = 0u32;
+
+        let fired = loop {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(link.silence_deadline()) => break true,
+                _ = sibling.tick() => {
+                    ticks += 1;
+                    // Guard against an infinite loop if the deadline never lands.
+                    if ticks > NOTIFICATION_TIMEOUT.as_secs() as u32 * 2 {
+                        break false;
+                    }
+                }
+            }
+        };
+
+        assert!(fired, "telemetry deadline never fired");
+        assert_eq!(
+            deadline.elapsed(),
+            Duration::ZERO,
+            "deadline must land exactly at silence_deadline, not drift with the sibling"
+        );
+        assert_eq!(link.silence_deadline().elapsed(), Duration::ZERO,);
+        // Elapsed since construction equals the timeout when the arm fires.
+        assert_eq!(
+            (deadline - NOTIFICATION_TIMEOUT).elapsed(),
+            NOTIFICATION_TIMEOUT,
+        );
+    }
 }

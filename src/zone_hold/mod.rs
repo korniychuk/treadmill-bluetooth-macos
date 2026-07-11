@@ -372,11 +372,6 @@ pub fn classify_position(bpm: u16, low_bpm: u16, high_bpm: u16) -> ZonePosition 
     }
 }
 
-/// Linear warm-up target: `start` at `elapsed = 0`, `target` at
-/// `elapsed >= warmup`. HR is never read here — see task doc §Жизненный цикл.
-/// Interpolation stays in f32 (compute, not compare); the result is re-quantized
-/// to [`CentiKmh`] so callers compare/write on integers. A zero `warmup` skips
-
 #[cfg(test)]
 mod tests {
     use super::*;

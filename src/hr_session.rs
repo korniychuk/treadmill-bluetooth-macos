@@ -441,4 +441,36 @@ mod tests {
         assert!(HR_CONNECT_ATTEMPT_DEADLINE > Duration::from_secs(15));
         assert!(HR_CONNECT_ATTEMPT_DEADLINE.as_secs() >= 45);
     }
+
+    /// Same class as `telemetry_deadline_fires_despite_a_faster_sibling_arm`
+    /// (задача 031) for the HR link (задача 035): relative `timeout` around
+    /// `stream.next()` never ages while a 1s sibling completes every pass.
+    #[tokio::test(start_paused = true)]
+    async fn hr_silence_deadline_fires_despite_a_faster_sibling_arm() {
+        use std::time::{Duration, Instant};
+
+        let hr = HrSession::new_connecting(Instant::now(), tokio::time::Instant::now());
+        let mut sibling = tokio::time::interval(Duration::from_secs(1));
+        let mut ticks = 0u32;
+
+        let fired = loop {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(hr.silence_deadline()) => break true,
+                _ = sibling.tick() => {
+                    ticks += 1;
+                    if ticks > HR_NOTIFICATION_TIMEOUT.as_secs() as u32 * 2 {
+                        break false;
+                    }
+                }
+            }
+        };
+
+        assert!(fired, "HR silence deadline never fired");
+        assert_eq!(
+            (hr.silence_deadline() - HR_NOTIFICATION_TIMEOUT).elapsed(),
+            HR_NOTIFICATION_TIMEOUT,
+            "HR deadline must land exactly at the timeout, not drift with the sibling"
+        );
+    }
 }
