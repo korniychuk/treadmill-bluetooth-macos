@@ -86,6 +86,13 @@ pub enum ConfigEffect {
     /// `warmup_minutes` changed mid-Ramp. POLICY: keep the ramp — do NOT restart.
     /// Log-only; next tick reads the new value from live config.
     ZoneWarmupRetarget { old_minutes: i64, new_minutes: i64 },
+    /// `[zone_hold]` fields changed without a session phase effect (field-only
+    /// reload — e.g. `target_zone` while Off, `deadband` mid-Hold). Log-only;
+    /// the live config already holds the new values (backlog 011).
+    ZoneConfigChanged {
+        /// Stable field names that differed (for the INFO line).
+        fields: Vec<&'static str>,
+    },
 }
 
 /// Pure diff old vs new (each field via `PartialEq`, as the reload branch did).
@@ -173,6 +180,57 @@ fn zone_target_affecting_changed(old: &ZoneHoldConfig, new: &ZoneHoldConfig) -> 
         || old.resting_hr != new.resting_hr
 }
 
+/// Field names that differ between two `[zone_hold]` configs (stable order).
+fn zone_fields_changed(old: &ZoneHoldConfig, new: &ZoneHoldConfig) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if old.enabled != new.enabled {
+        fields.push("enabled");
+    }
+    if old.age != new.age {
+        fields.push("age");
+    }
+    if old.resting_hr != new.resting_hr {
+        fields.push("resting_hr");
+    }
+    if old.method != new.method {
+        fields.push("method");
+    }
+    if old.target_zone != new.target_zone {
+        fields.push("target_zone");
+    }
+    if old.min_speed_kmh != new.min_speed_kmh {
+        fields.push("min_speed_kmh");
+    }
+    if old.max_speed_kmh != new.max_speed_kmh {
+        fields.push("max_speed_kmh");
+    }
+    if old.tracking != new.tracking {
+        fields.push("tracking");
+    }
+    if old.warmup_minutes != new.warmup_minutes {
+        fields.push("warmup_minutes");
+    }
+    if old.correction_interval_seconds != new.correction_interval_seconds {
+        fields.push("correction_interval_seconds");
+    }
+    if old.deadband_bpm != new.deadband_bpm {
+        fields.push("deadband_bpm");
+    }
+    if old.max_step_kmh != new.max_step_kmh {
+        fields.push("max_step_kmh");
+    }
+    if old.reentry_grace_seconds != new.reentry_grace_seconds {
+        fields.push("reentry_grace_seconds");
+    }
+    if old.safety_cap_percent != new.safety_cap_percent {
+        fields.push("safety_cap_percent");
+    }
+    if old.zones != new.zones {
+        fields.push("zones");
+    }
+    fields
+}
+
 fn push_zone_effects(
     effects: &mut Vec<ConfigEffect>,
     old: &ZoneHoldConfig,
@@ -180,6 +238,7 @@ fn push_zone_effects(
     snap: &SessionSnapshot,
 ) {
     let phase_live = snap.phase != PhaseKind::Off;
+    let before_len = effects.len();
 
     // enabled is false after this edit: disengage if the phase machine is
     // still live. Wins over retarget/re-resolve on the same edit
@@ -190,32 +249,39 @@ fn push_zone_effects(
     // firing for a disabled controller.
     if !new.enabled {
         if phase_live {
-            effects.push(ConfigEffect::ZoneDisengage(DisengageReason::DisabledInConfig));
+            effects.push(ConfigEffect::ZoneDisengage(
+                DisengageReason::DisabledInConfig,
+            ));
         }
-        return;
-    }
-
-    if phase_live {
+    } else if phase_live {
         // Target no longer resolvable (age removed, unknown zone id, …).
         if new.resolve_target_zone().is_none() {
-            effects.push(ConfigEffect::ZoneDisengage(DisengageReason::TargetUnresolvable));
-            return;
+            effects.push(ConfigEffect::ZoneDisengage(
+                DisengageReason::TargetUnresolvable,
+            ));
+        } else {
+            if zone_target_affecting_changed(old, new) {
+                effects.push(ConfigEffect::ZoneReResolve);
+            }
+            if snap.phase == PhaseKind::Ramp && old.warmup_minutes != new.warmup_minutes {
+                effects.push(ConfigEffect::ZoneWarmupRetarget {
+                    old_minutes: old.warmup_minutes,
+                    new_minutes: new.warmup_minutes,
+                });
+            }
         }
-        if zone_target_affecting_changed(old, new) {
-            effects.push(ConfigEffect::ZoneReResolve);
-        }
-        if snap.phase == PhaseKind::Ramp && old.warmup_minutes != new.warmup_minutes {
-            effects.push(ConfigEffect::ZoneWarmupRetarget {
-                old_minutes: old.warmup_minutes,
-                new_minutes: new.warmup_minutes,
-            });
-        }
-        return;
+    } else if !old.enabled && new.enabled && snap.walking {
+        // phase == Off: engage only when enabled flips on while already Walking.
+        effects.push(ConfigEffect::ZoneEngage);
     }
 
-    // phase == Off: engage only when enabled flips on while already Walking.
-    if !old.enabled && new.enabled && snap.walking {
-        effects.push(ConfigEffect::ZoneEngage);
+    // Field-only reload: config applied, no session phase effect — still log
+    // which keys moved so `tm zone target 3` off-belt is visible (backlog 011).
+    if effects.len() == before_len {
+        let fields = zone_fields_changed(old, new);
+        if !fields.is_empty() {
+            effects.push(ConfigEffect::ZoneConfigChanged { fields });
+        }
     }
 }
 
@@ -224,9 +290,10 @@ fn effect_rank(effect: &ConfigEffect) -> u8 {
         ConfigEffect::ZoneDisengage(_) => 0,
         ConfigEffect::GoalsChanged => 1,
         ConfigEffect::AutoPauseChanged => 2,
-        ConfigEffect::ZoneReResolve => 3,
-        ConfigEffect::ZoneWarmupRetarget { .. } => 4,
-        ConfigEffect::ZoneEngage => 5,
+        ConfigEffect::ZoneConfigChanged { .. } => 3,
+        ConfigEffect::ZoneReResolve => 4,
+        ConfigEffect::ZoneWarmupRetarget { .. } => 5,
+        ConfigEffect::ZoneEngage => 6,
     }
 }
 
@@ -274,7 +341,8 @@ mod tests {
             walking: bool,
             /// Build (old_zh, new_zh) from a fresh `zh_enabled()` / disabled pair.
             build: fn() -> (ZoneHoldConfig, ZoneHoldConfig),
-            expect: &'static [ConfigEffect],
+            /// Owned so field-only cases can carry `ZoneConfigChanged { fields }`.
+            expect: Vec<ConfigEffect>,
             /// When set, also assert goals/auto_pause field application via full delta.
             extra: ExtraDelta,
         }
@@ -297,7 +365,9 @@ mod tests {
                     new.enabled = false;
                     (old, new)
                 },
-                expect: &[ConfigEffect::ZoneDisengage(DisengageReason::DisabledInConfig)],
+                expect: vec![ConfigEffect::ZoneDisengage(
+                    DisengageReason::DisabledInConfig,
+                )],
                 extra: ExtraDelta::None,
             },
             Case {
@@ -310,7 +380,9 @@ mod tests {
                     new.enabled = false;
                     (old, new)
                 },
-                expect: &[],
+                expect: vec![ConfigEffect::ZoneConfigChanged {
+                    fields: vec!["enabled"],
+                }],
                 extra: ExtraDelta::None,
             },
             Case {
@@ -324,7 +396,7 @@ mod tests {
                     new.enabled = true;
                     (old, new)
                 },
-                expect: &[ConfigEffect::ZoneEngage],
+                expect: vec![ConfigEffect::ZoneEngage],
                 extra: ExtraDelta::None,
             },
             Case {
@@ -338,7 +410,9 @@ mod tests {
                     new.enabled = true;
                     (old, new)
                 },
-                expect: &[],
+                expect: vec![ConfigEffect::ZoneConfigChanged {
+                    fields: vec!["enabled"],
+                }],
                 extra: ExtraDelta::None,
             },
             Case {
@@ -351,7 +425,7 @@ mod tests {
                     new.target_zone = ZoneSelector::Number(3);
                     (old, new)
                 },
-                expect: &[ConfigEffect::ZoneReResolve],
+                expect: vec![ConfigEffect::ZoneReResolve],
                 extra: ExtraDelta::None,
             },
             Case {
@@ -364,7 +438,7 @@ mod tests {
                     new.max_speed_kmh = 6.5;
                     (old, new)
                 },
-                expect: &[ConfigEffect::ZoneReResolve],
+                expect: vec![ConfigEffect::ZoneReResolve],
                 extra: ExtraDelta::None,
             },
             Case {
@@ -378,7 +452,7 @@ mod tests {
                     new.resting_hr = Some(55);
                     (old, new)
                 },
-                expect: &[ConfigEffect::ZoneReResolve],
+                expect: vec![ConfigEffect::ZoneReResolve],
                 extra: ExtraDelta::None,
             },
             Case {
@@ -391,7 +465,7 @@ mod tests {
                     new.target_zone = ZoneSelector::Number(1);
                     (old, new)
                 },
-                expect: &[ConfigEffect::ZoneReResolve],
+                expect: vec![ConfigEffect::ZoneReResolve],
                 extra: ExtraDelta::None,
             },
             Case {
@@ -404,7 +478,9 @@ mod tests {
                     new.target_zone = ZoneSelector::Number(3);
                     (old, new)
                 },
-                expect: &[],
+                expect: vec![ConfigEffect::ZoneConfigChanged {
+                    fields: vec!["target_zone"],
+                }],
                 extra: ExtraDelta::None,
             },
             Case {
@@ -417,7 +493,9 @@ mod tests {
                     new.age = None;
                     (old, new)
                 },
-                expect: &[ConfigEffect::ZoneDisengage(DisengageReason::TargetUnresolvable)],
+                expect: vec![ConfigEffect::ZoneDisengage(
+                    DisengageReason::TargetUnresolvable,
+                )],
                 extra: ExtraDelta::None,
             },
             Case {
@@ -430,7 +508,9 @@ mod tests {
                     new.target_zone = ZoneSelector::Id("no-such-zone".into());
                     (old, new)
                 },
-                expect: &[ConfigEffect::ZoneDisengage(DisengageReason::TargetUnresolvable)],
+                expect: vec![ConfigEffect::ZoneDisengage(
+                    DisengageReason::TargetUnresolvable,
+                )],
                 extra: ExtraDelta::None,
             },
             Case {
@@ -443,7 +523,9 @@ mod tests {
                     new.age = None;
                     (old, new)
                 },
-                expect: &[],
+                expect: vec![ConfigEffect::ZoneConfigChanged {
+                    fields: vec!["age"],
+                }],
                 extra: ExtraDelta::None,
             },
             Case {
@@ -456,7 +538,7 @@ mod tests {
                     new.warmup_minutes = 10;
                     (old, new)
                 },
-                expect: &[ConfigEffect::ZoneWarmupRetarget {
+                expect: vec![ConfigEffect::ZoneWarmupRetarget {
                     old_minutes: 5, // DEFAULT_WARMUP_MINUTES
                     new_minutes: 10,
                 }],
@@ -472,7 +554,9 @@ mod tests {
                     new.warmup_minutes = 10;
                     (old, new)
                 },
-                expect: &[],
+                expect: vec![ConfigEffect::ZoneConfigChanged {
+                    fields: vec!["warmup_minutes"],
+                }],
                 extra: ExtraDelta::None,
             },
             Case {
@@ -483,7 +567,7 @@ mod tests {
                     let zh = zh_enabled();
                     (zh.clone(), zh)
                 },
-                expect: &[ConfigEffect::GoalsChanged],
+                expect: vec![ConfigEffect::GoalsChanged],
                 extra: ExtraDelta::Goals,
             },
             Case {
@@ -494,7 +578,7 @@ mod tests {
                     let zh = zh_enabled();
                     (zh.clone(), zh)
                 },
-                expect: &[ConfigEffect::AutoPauseChanged],
+                expect: vec![ConfigEffect::AutoPauseChanged],
                 extra: ExtraDelta::AutoPause,
             },
             Case {
@@ -509,7 +593,9 @@ mod tests {
                     new.max_speed_kmh = 6.0;
                     (old, new)
                 },
-                expect: &[ConfigEffect::ZoneDisengage(DisengageReason::DisabledInConfig)],
+                expect: vec![ConfigEffect::ZoneDisengage(
+                    DisengageReason::DisabledInConfig,
+                )],
                 extra: ExtraDelta::None,
             },
             Case {
@@ -523,7 +609,9 @@ mod tests {
                     new.warmup_minutes = 99;
                     (old, new)
                 },
-                expect: &[ConfigEffect::ZoneDisengage(DisengageReason::DisabledInConfig)],
+                expect: vec![ConfigEffect::ZoneDisengage(
+                    DisengageReason::DisabledInConfig,
+                )],
                 extra: ExtraDelta::None,
             },
         ];
@@ -564,7 +652,11 @@ mod tests {
             );
             match case.extra {
                 ExtraDelta::Goals => {
-                    assert_eq!(config.goals, new_goals, "case `{}`: goals applied", case.label);
+                    assert_eq!(
+                        config.goals, new_goals,
+                        "case `{}`: goals applied",
+                        case.label
+                    );
                 }
                 ExtraDelta::AutoPause => {
                     assert_eq!(
@@ -588,6 +680,33 @@ mod tests {
 
     fn old_zh_ne(a: &ZoneHoldConfig, b: &ZoneHoldConfig) -> bool {
         a != b
+    }
+
+    /// Field-only mid-session edits (deadband / min_speed / safety_cap) used
+    /// to apply with zero effects — operator saw no daemon log (backlog 011).
+    #[test]
+    fn field_only_zone_reload_emits_zone_config_changed() {
+        let mut config = live(zh_enabled());
+        let mut new_zh = config.zone_hold.clone();
+        new_zh.deadband_bpm = 12;
+        new_zh.min_speed_kmh = 2.5;
+        new_zh.safety_cap_percent = 90.0;
+        let effects = apply_config(
+            &mut config,
+            ConfigDelta {
+                goals: None,
+                auto_pause: None,
+                zone_hold: Some(new_zh.clone()),
+            },
+            &snap(PhaseKind::Hold, true),
+        );
+        assert_eq!(
+            effects,
+            vec![ConfigEffect::ZoneConfigChanged {
+                fields: vec!["min_speed_kmh", "deadband_bpm", "safety_cap_percent"],
+            }]
+        );
+        assert_eq!(config.zone_hold, new_zh);
     }
 
     // --- diff ---------------------------------------------------------------
@@ -711,12 +830,8 @@ mod tests {
         );
 
         // Monotonic in elapsed at fixed endpoints (task doc consequence).
-        let later = warmup_target_speed(
-            start,
-            target,
-            elapsed + Duration::from_secs(60),
-            new_warmup,
-        );
+        let later =
+            warmup_target_speed(start, target, elapsed + Duration::from_secs(60), new_warmup);
         assert!(later > speed_at_new);
         assert!(later < target);
     }

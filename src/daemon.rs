@@ -1629,6 +1629,12 @@ fn execute_config_effects(
                     "zone hold: warmup_minutes changed mid-ramp — retargeting without restart"
                 );
             }
+            ConfigEffect::ZoneConfigChanged { fields } => {
+                info!(
+                    ?fields,
+                    "zone hold: config fields changed on disk — applied without a session phase effect"
+                );
+            }
         }
     }
 }
