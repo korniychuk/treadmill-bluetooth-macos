@@ -435,7 +435,7 @@ mod tests {
                 build: || {
                     let old = zh_enabled();
                     let mut new = old.clone();
-                    new.max_speed_kmh = 6.5;
+                    new.max_speed_kmh = crate::speed::CentiKmh::from_wire(650);
                     (old, new)
                 },
                 expect: vec![ConfigEffect::ZoneReResolve],
@@ -590,7 +590,7 @@ mod tests {
                     old.enabled = false;
                     let mut new = old.clone();
                     new.warmup_minutes = 9;
-                    new.max_speed_kmh = 6.0;
+                    new.max_speed_kmh = crate::speed::CentiKmh::from_wire(600);
                     (old, new)
                 },
                 expect: vec![ConfigEffect::ZoneDisengage(
@@ -750,7 +750,7 @@ mod tests {
         let mut all = base.clone();
         all.goals = goals(&[2000, 4000]);
         all.auto_pause = Some(Duration::from_secs(60));
-        all.zone_hold.max_speed_kmh = 9.0;
+        all.zone_hold.max_speed_kmh = crate::speed::CentiKmh::from_wire(900);
         let d = diff(&base, &all);
         assert!(d.goals.is_some());
         assert!(d.auto_pause.is_some());
@@ -764,8 +764,8 @@ mod tests {
     /// on the next tick (`elapsed >= warmup` → Hold), without restarting.
     #[test]
     fn warmup_shorten_below_elapsed_completes_ramp_on_next_tick() {
-        let start = 2.0_f32;
-        let target = 4.0_f32;
+        let start = crate::speed::CentiKmh::from_wire(200);
+        let target = crate::speed::CentiKmh::from_wire(400);
         let elapsed = Duration::from_secs(180); // 3 minutes into ramp
         let new_warmup_minutes = 2_i64; // 2 minutes < elapsed
         let new_warmup = Duration::from_secs(new_warmup_minutes as u64 * 60);
@@ -811,8 +811,8 @@ mod tests {
     /// elapsed; speed does not jump back to `start_speed_kmh`.
     #[test]
     fn warmup_extend_recalculates_from_same_elapsed_without_resetting_to_start() {
-        let start = 2.0_f32;
-        let target = 4.0_f32;
+        let start = crate::speed::CentiKmh::from_wire(200);
+        let target = crate::speed::CentiKmh::from_wire(400);
         let elapsed = Duration::from_secs(150); // 2.5 min
         let old_warmup = Duration::from_secs(5 * 60);
         let new_warmup = Duration::from_secs(10 * 60);

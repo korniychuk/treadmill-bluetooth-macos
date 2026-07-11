@@ -17,15 +17,17 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
+use crate::speed::CentiKmh;
+
 /// Fallback target zone (1-based index into the configured/default zones)
 /// when `target_zone` is absent — Zone 2 (Aerobic base), the mode's whole
 /// reason for existing (see task doc §Физиология).
 pub const DEFAULT_TARGET_ZONE: u8 = 2;
-/// Hard floor on commanded belt speed (km/h).
-pub const DEFAULT_MIN_SPEED_KMH: f32 = 2.0;
-/// Global ceiling on commanded belt speed (km/h); a zone may override it lower
-/// or higher via `ZoneDef::max_speed_kmh`.
-pub const DEFAULT_MAX_SPEED_KMH: f32 = 4.5;
+/// Hard floor on commanded belt speed (2.0 km/h).
+pub const DEFAULT_MIN_SPEED: CentiKmh = CentiKmh::from_wire(200);
+/// Global ceiling on commanded belt speed (4.5 km/h); a zone may override it
+/// lower or higher via `ZoneDef::max_speed_kmh`.
+pub const DEFAULT_MAX_SPEED: CentiKmh = CentiKmh::from_wire(450);
 /// Linear ramp duration at session start, HR ignored throughout (HR-kinetics
 /// has not settled in the first few minutes — see task doc §Физиология).
 pub const DEFAULT_WARMUP_MINUTES: i64 = 5;
@@ -33,24 +35,15 @@ pub const DEFAULT_WARMUP_MINUTES: i64 = 5;
 pub const DEFAULT_CORRECTION_INTERVAL_SECONDS: i64 = 20;
 /// `tracking = "center"` deadband around the zone midpoint, bpm.
 pub const DEFAULT_DEADBAND_BPM: i64 = 3;
-/// Max speed change applied per correction, km/h.
-pub const DEFAULT_MAX_STEP_KMH: f32 = 0.3;
-/// Minimum speed delta worth a Control Point write. Pinned at a clamp (min
-/// or max), the live-telemetry value and the clamp constant are computed
-/// down two different float paths — telemetry decodes as `raw as f32 *
-/// 0.01` (`ftms.rs`, `0.01` isn't exactly representable in binary32, so
-/// e.g. raw=320 decodes to `3.1999998`, not `3.2`) while the clamp comes
-/// from config parsing — so they never compare bit-equal even though both
-/// mean the same nominal speed (confirmed empirically: telemetry stayed
-/// bit-identical at `3.1999998` for 20+ minutes straight, i.e. no real
-/// jitter, purely a fixed ~2e-7 representation gap). Exact equality made
-/// `next_speed` re-issue the *same* target every correction interval
-/// forever once pinned, each write costing a RequestControl+SetSpeed
-/// round-trip (and an audible double beep) for zero actual change. This
-/// tolerance is comfortably above that gap (and would also absorb genuine
-/// device-reported jitter, if a given model has any) and well below
-/// `max_step_kmh`, so real corrections are unaffected.
-pub const MIN_SPEED_CHANGE_KMH: f32 = 0.05;
+/// Max speed change applied per correction (0.3 km/h).
+pub const DEFAULT_MAX_STEP: CentiKmh = CentiKmh::from_wire(30);
+/// Controller deadband: minimum speed delta worth a Control Point write
+/// (5 centi = 0.05 km/h). Not float glue — with [`CentiKmh`] the 030
+/// representation gap is gone by construction; this remains a policy
+/// ("don't jiggle the belt for a 1-centi wiggle") that also absorbs genuine
+/// device-reported jitter if a model has any. Well below `max_step`, so real
+/// corrections are unaffected. See задача 030 / 054.
+pub const MIN_SPEED_CHANGE: CentiKmh = CentiKmh::from_wire(5);
 /// Grace window after returning to `Walking` during which no correction runs.
 pub const DEFAULT_REENTRY_GRACE_SECONDS: i64 = 45;
 /// HR percent-of-HRmax above which the controller force-reduces regardless of
@@ -96,7 +89,7 @@ pub struct ZoneDef {
     pub bounds: ZoneBounds,
     /// Per-zone override of the global `max_speed_kmh` — `None` defers to it
     /// (task doc §Min/max: `effective max = zone.max_speed ?? global`).
-    pub max_speed_kmh: Option<f32>,
+    pub max_speed_kmh: Option<CentiKmh>,
 }
 
 /// Derive a stable `id` from a zone `name` when the config doesn't set one
@@ -214,7 +207,7 @@ pub struct ResolvedZone {
     pub name: String,
     pub low_bpm: u16,
     pub high_bpm: u16,
-    pub effective_max_speed_kmh: f32,
+    pub effective_max_speed_kmh: CentiKmh,
 }
 
 /// The full `[zone_hold]` configuration, parsed with per-user compiled-in
@@ -227,13 +220,13 @@ pub struct ZoneHoldConfig {
     pub resting_hr: Option<u16>,
     pub method: Method,
     pub target_zone: ZoneSelector,
-    pub min_speed_kmh: f32,
-    pub max_speed_kmh: f32,
+    pub min_speed_kmh: CentiKmh,
+    pub max_speed_kmh: CentiKmh,
     pub tracking: Tracking,
     pub warmup_minutes: i64,
     pub correction_interval_seconds: i64,
     pub deadband_bpm: i64,
-    pub max_step_kmh: f32,
+    pub max_step_kmh: CentiKmh,
     pub reentry_grace_seconds: i64,
     pub safety_cap_percent: f32,
     pub zones: Vec<ZoneDef>,
@@ -249,13 +242,13 @@ impl ZoneHoldConfig {
             resting_hr: None,
             method: Method::HrMax,
             target_zone: ZoneSelector::Number(DEFAULT_TARGET_ZONE),
-            min_speed_kmh: DEFAULT_MIN_SPEED_KMH,
-            max_speed_kmh: DEFAULT_MAX_SPEED_KMH,
+            min_speed_kmh: DEFAULT_MIN_SPEED,
+            max_speed_kmh: DEFAULT_MAX_SPEED,
             tracking: Tracking::Band,
             warmup_minutes: DEFAULT_WARMUP_MINUTES,
             correction_interval_seconds: DEFAULT_CORRECTION_INTERVAL_SECONDS,
             deadband_bpm: DEFAULT_DEADBAND_BPM,
-            max_step_kmh: DEFAULT_MAX_STEP_KMH,
+            max_step_kmh: DEFAULT_MAX_STEP,
             reentry_grace_seconds: DEFAULT_REENTRY_GRACE_SECONDS,
             safety_cap_percent: DEFAULT_SAFETY_CAP_PERCENT,
             zones: default_zones(),
@@ -372,22 +365,23 @@ pub fn classify_position(bpm: u16, low_bpm: u16, high_bpm: u16) -> ZonePosition 
     }
 }
 
-/// Linear warm-up target: `start_kmh` at `elapsed = 0`, `target_kmh` at
+/// Linear warm-up target: `start` at `elapsed = 0`, `target` at
 /// `elapsed >= warmup`. HR is never read here — see task doc §Жизненный цикл.
-/// A zero/negative `warmup` skips straight to `target_kmh` (defensive; the
-/// config loader never produces one, but a hand-edited `0` should not divide
-/// by zero here).
+/// Interpolation stays in f32 (compute, not compare); the result is re-quantized
+/// to [`CentiKmh`] so callers compare/write on integers. A zero `warmup` skips
+/// straight to `target` (defensive; a hand-edited `0` must not divide by zero).
 pub fn warmup_target_speed(
-    start_kmh: f32,
-    target_kmh: f32,
+    start: CentiKmh,
+    target: CentiKmh,
     elapsed: Duration,
     warmup: Duration,
-) -> f32 {
+) -> CentiKmh {
     if warmup.is_zero() || elapsed >= warmup {
-        return target_kmh;
+        return target;
     }
     let frac = elapsed.as_secs_f32() / warmup.as_secs_f32();
-    start_kmh + (target_kmh - start_kmh) * frac
+    let kmh = start.to_kmh_f32() + (target.to_kmh_f32() - start.to_kmh_f32()) * frac;
+    CentiKmh::from_kmh_f32(kmh).unwrap_or(target)
 }
 
 /// Inputs the pure closed-loop controller needs for one correction — bundled
@@ -398,29 +392,31 @@ pub struct ControllerParams {
     pub zone_low_bpm: u16,
     pub zone_high_bpm: u16,
     pub deadband_bpm: i64,
-    pub max_step_kmh: f32,
-    pub min_speed_kmh: f32,
-    pub max_speed_kmh: f32,
+    pub max_step_kmh: CentiKmh,
+    pub min_speed_kmh: CentiKmh,
+    pub max_speed_kmh: CentiKmh,
 }
 
 /// One closed-loop correction (task doc §Control-loop). `None` means "leave
 /// the belt speed alone" — either the bpm is where it should be, or the belt
 /// is already pinned at the clamp in the direction the correction would move
 /// it (task doc §Границы достижимости: never chase past min/max).
-pub fn next_speed(params: &ControllerParams, current_speed_kmh: f32, bpm: u16) -> Option<f32> {
+pub fn next_speed(params: &ControllerParams, current: CentiKmh, bpm: u16) -> Option<CentiKmh> {
     let low = params.zone_low_bpm as f32;
     let high = params.zone_high_bpm as f32;
     let bpm = bpm as f32;
 
-    let step = match params.tracking {
+    // Step magnitude may be fractional under Center tracking; quantize after
+    // applying so clamp/deadband stay on integer wire units.
+    let step_kmh = match params.tracking {
         Tracking::Band => {
             if bpm >= low && bpm <= high {
                 return None;
             }
             if bpm < low {
-                params.max_step_kmh // below zone → speed up
+                params.max_step_kmh.to_kmh_f32() // below zone → speed up
             } else {
-                -params.max_step_kmh // above zone → slow down
+                -params.max_step_kmh.to_kmh_f32() // above zone → slow down
             }
         }
         Tracking::Center => {
@@ -430,10 +426,11 @@ pub fn next_speed(params: &ControllerParams, current_speed_kmh: f32, bpm: u16) -
             if error.abs() <= params.deadband_bpm as f32 || half_width <= 0.0 {
                 return None;
             }
-            // Scaled so the step reaches max_step_kmh right at the zone boundary
+            // Scaled so the step reaches max_step right at the zone boundary
             // (task doc §Режимы: "у границ зоны шаг максимален").
-            let k = params.max_step_kmh / half_width;
-            let magnitude = (k * error.abs()).min(params.max_step_kmh);
+            let max_step = params.max_step_kmh.to_kmh_f32();
+            let k = max_step / half_width;
+            let magnitude = (k * error.abs()).min(max_step);
             if error > 0.0 {
                 -magnitude // above centre → slow down
             } else {
@@ -442,22 +439,30 @@ pub fn next_speed(params: &ControllerParams, current_speed_kmh: f32, bpm: u16) -
         }
     };
 
-    let target = (current_speed_kmh + step).clamp(params.min_speed_kmh, params.max_speed_kmh);
-    ((target - current_speed_kmh).abs() > MIN_SPEED_CHANGE_KMH).then_some(target)
+    let unclamped = CentiKmh::from_kmh_f32(current.to_kmh_f32() + step_kmh).unwrap_or({
+        if step_kmh >= 0.0 {
+            CentiKmh::MAX_SANE
+        } else {
+            CentiKmh::ZERO
+        }
+    });
+    let target = unclamped.clamp(params.min_speed_kmh, params.max_speed_kmh);
+    (target.abs_diff(current) > MIN_SPEED_CHANGE.to_wire()).then_some(target)
 }
 
 /// Target for a safety-cap force-reduce write (задача 041): drop by `2 * max_step`,
 /// clamp to `min_speed`. Returns `None` when the computed target is within
-/// [`MIN_SPEED_CHANGE_KMH`] of the measured speed — same deadband as
+/// [`MIN_SPEED_CHANGE`] of the measured speed — same deadband as
 /// [`next_speed`] — so a belt already at the floor does not spam no-op Control
 /// Point writes (and double beeps) every safety cooldown.
 pub fn safety_force_reduce_target(
-    measured_speed_kmh: f32,
-    max_step_kmh: f32,
-    min_speed_kmh: f32,
-) -> Option<f32> {
-    let target = (measured_speed_kmh - max_step_kmh * 2.0).max(min_speed_kmh);
-    ((target - measured_speed_kmh).abs() > MIN_SPEED_CHANGE_KMH).then_some(target)
+    measured: CentiKmh,
+    max_step: CentiKmh,
+    min_speed: CentiKmh,
+) -> Option<CentiKmh> {
+    let drop = max_step.to_wire().saturating_mul(2);
+    let target = measured.saturating_sub_centi(drop).max(min_speed);
+    (target.abs_diff(measured) > MIN_SPEED_CHANGE.to_wire()).then_some(target)
 }
 
 /// Per-user config path shared with `goals`/`auto_pause` (`~/.config/treadmill-
@@ -559,8 +564,8 @@ fn parse_zone_hold_config(raw: &str) -> ZoneHoldConfig {
         }
     };
 
-    let min_speed_kmh = positive_float_or(table, "min_speed", defaults.min_speed_kmh);
-    let max_speed_kmh = positive_float_or(table, "max_speed", defaults.max_speed_kmh);
+    let min_speed_kmh = positive_centi_or(table, "min_speed", defaults.min_speed_kmh);
+    let max_speed_kmh = positive_centi_or(table, "max_speed", defaults.max_speed_kmh);
 
     let tracking = match table.get("tracking").and_then(|v| v.as_str()) {
         Some("band") | None => Tracking::Band,
@@ -582,7 +587,7 @@ fn parse_zone_hold_config(raw: &str) -> ZoneHoldConfig {
         defaults.correction_interval_seconds,
     );
     let deadband_bpm = positive_int_or(table, "deadband_bpm", defaults.deadband_bpm);
-    let max_step_kmh = positive_float_or(table, "max_step_kmh", defaults.max_step_kmh);
+    let max_step_kmh = positive_centi_or(table, "max_step_kmh", defaults.max_step_kmh);
     let reentry_grace_seconds = positive_int_or(
         table,
         "reentry_grace_seconds",
@@ -663,7 +668,8 @@ fn parse_zone_def(value: &toml::Value) -> Result<ZoneDef, String> {
         .get("max_speed")
         .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|n| n as f64)))
         .map(|n| n as f32)
-        .filter(|&n| n > 0.0);
+        .filter(|&n| n > 0.0)
+        .and_then(CentiKmh::from_kmh_f32);
 
     let bounds = if let (Some(min_bpm), Some(max_bpm)) = (
         value.get("min_bpm").and_then(|v| v.as_integer()),
@@ -729,6 +735,32 @@ fn positive_float_or(table: &toml::Value, key: &str, default: f32) -> f32 {
         .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|n| n as f64)));
     match raw {
         Some(n) if n > 0.0 => n as f32,
+        Some(_) => {
+            warn!(key, "zone_hold config value not positive — using default");
+            default
+        }
+        None => {
+            if table.get(key).is_some() {
+                warn!(key, "zone_hold config value not a number — using default");
+            }
+            default
+        }
+    }
+}
+
+/// Positive km/h config key quantized to [`CentiKmh`] at parse time.
+fn positive_centi_or(table: &toml::Value, key: &str, default: CentiKmh) -> CentiKmh {
+    let raw = table
+        .get(key)
+        .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|n| n as f64)));
+    match raw {
+        Some(n) if n > 0.0 => match CentiKmh::from_kmh_f32(n as f32) {
+            Some(c) if c > CentiKmh::ZERO => c,
+            _ => {
+                warn!(key, "zone_hold speed out of range — using default");
+                default
+            }
+        },
         Some(_) => {
             warn!(key, "zone_hold config value not positive — using default");
             default
@@ -1054,7 +1086,7 @@ warmup_minutes = 0
         config.target_zone = ZoneSelector::Number(2);
         let resolved = config.resolve_target_zone().expect("zone 2 exists");
         assert_eq!((resolved.low_bpm, resolved.high_bpm), (112, 131));
-        assert_eq!(resolved.effective_max_speed_kmh, DEFAULT_MAX_SPEED_KMH);
+        assert_eq!(resolved.effective_max_speed_kmh, DEFAULT_MAX_SPEED);
     }
 
     #[test]
@@ -1106,9 +1138,9 @@ warmup_minutes = 0
         let mut config = ZoneHoldConfig::disabled_default();
         config.age = Some(30);
         config.target_zone = ZoneSelector::Number(2);
-        config.zones[1].max_speed_kmh = Some(5.5);
+        config.zones[1].max_speed_kmh = Some(CentiKmh::from_wire(550));
         let resolved = config.resolve_target_zone().expect("zone 2 exists");
-        assert_eq!(resolved.effective_max_speed_kmh, 5.5);
+        assert_eq!(resolved.effective_max_speed_kmh, CentiKmh::from_wire(550));
     }
 
     #[test]
@@ -1122,16 +1154,16 @@ warmup_minutes = 0
 
     #[test]
     fn warmup_ramps_linearly_then_snaps_to_target() {
-        let start = 1.0;
-        let target = 3.0;
+        let start = CentiKmh::from_wire(100);
+        let target = CentiKmh::from_wire(300);
         let warmup = Duration::from_secs(300);
         assert_eq!(
             warmup_target_speed(start, target, Duration::ZERO, warmup),
-            1.0
+            start
         );
-        assert!(
-            (warmup_target_speed(start, target, Duration::from_secs(150), warmup) - 2.0).abs()
-                < 0.01
+        assert_eq!(
+            warmup_target_speed(start, target, Duration::from_secs(150), warmup),
+            CentiKmh::from_wire(200)
         );
         assert_eq!(
             warmup_target_speed(start, target, Duration::from_secs(300), warmup),
@@ -1143,87 +1175,119 @@ warmup_minutes = 0
         );
     }
 
+    #[test]
+    fn warmup_target_is_monotone_non_decreasing_across_ticks() {
+        let start = CentiKmh::from_wire(200);
+        let target = CentiKmh::from_wire(400);
+        let warmup = Duration::from_secs(300);
+        let mut prev = start;
+        for secs in 0..=300 {
+            let next = warmup_target_speed(start, target, Duration::from_secs(secs), warmup);
+            assert!(next >= prev, "secs={secs}: {next:?} < {prev:?}");
+            prev = next;
+        }
+        assert_eq!(prev, target);
+    }
+
     fn band_params() -> ControllerParams {
         ControllerParams {
             tracking: Tracking::Band,
             zone_low_bpm: 112,
             zone_high_bpm: 131,
             deadband_bpm: DEFAULT_DEADBAND_BPM,
-            max_step_kmh: DEFAULT_MAX_STEP_KMH,
-            min_speed_kmh: DEFAULT_MIN_SPEED_KMH,
-            max_speed_kmh: DEFAULT_MAX_SPEED_KMH,
+            max_step_kmh: DEFAULT_MAX_STEP,
+            min_speed_kmh: DEFAULT_MIN_SPEED,
+            max_speed_kmh: DEFAULT_MAX_SPEED,
         }
+    }
+
+    fn c(kmh: f32) -> CentiKmh {
+        CentiKmh::from_kmh_f32(kmh).expect("test speed in range")
     }
 
     #[test]
     fn band_mode_does_not_correct_inside_the_zone() {
         let params = band_params();
-        assert_eq!(next_speed(&params, 3.0, 112), None);
-        assert_eq!(next_speed(&params, 3.0, 120), None);
-        assert_eq!(next_speed(&params, 3.0, 131), None);
+        assert_eq!(next_speed(&params, c(3.0), 112), None);
+        assert_eq!(next_speed(&params, c(3.0), 120), None);
+        assert_eq!(next_speed(&params, c(3.0), 131), None);
     }
 
     #[test]
     fn band_mode_steps_toward_the_zone_when_outside() {
         let params = band_params();
         // Below zone → speed up by max_step.
-        assert_eq!(next_speed(&params, 3.0, 100), Some(3.3));
+        assert_eq!(next_speed(&params, c(3.0), 100), Some(c(3.3)));
         // Above zone → slow down by max_step.
-        assert_eq!(next_speed(&params, 3.0, 140), Some(2.7));
+        assert_eq!(next_speed(&params, c(3.0), 140), Some(c(2.7)));
     }
 
     #[test]
     fn band_mode_clamps_to_min_max_and_reports_no_change_at_the_pin() {
         let params = band_params();
         // Already at max, HR still low → stays pinned, no spurious "change".
-        assert_eq!(next_speed(&params, DEFAULT_MAX_SPEED_KMH, 100), None);
+        assert_eq!(next_speed(&params, DEFAULT_MAX_SPEED, 100), None);
         // Already at min, HR still high → stays pinned.
-        assert_eq!(next_speed(&params, DEFAULT_MIN_SPEED_KMH, 140), None);
+        assert_eq!(next_speed(&params, DEFAULT_MIN_SPEED, 140), None);
     }
 
     #[test]
     fn safety_force_reduce_target_skips_noop_at_min() {
         // Pinned at min → target collapses to min ≈ measured → None (задача 041).
         assert_eq!(
-            safety_force_reduce_target(DEFAULT_MIN_SPEED_KMH, 0.3, DEFAULT_MIN_SPEED_KMH),
+            safety_force_reduce_target(DEFAULT_MIN_SPEED, DEFAULT_MAX_STEP, DEFAULT_MIN_SPEED),
             None
         );
         // Within deadband of min after reduce → still None.
         assert_eq!(
-            safety_force_reduce_target(DEFAULT_MIN_SPEED_KMH + 0.02, 0.3, DEFAULT_MIN_SPEED_KMH),
+            safety_force_reduce_target(c(2.02), DEFAULT_MAX_STEP, DEFAULT_MIN_SPEED),
             None
         );
         // Real reduce: measured well above min → Some(min) when 2*step would go under.
         assert_eq!(
-            safety_force_reduce_target(DEFAULT_MIN_SPEED_KMH + 0.3, 0.3, DEFAULT_MIN_SPEED_KMH),
-            Some(DEFAULT_MIN_SPEED_KMH)
+            safety_force_reduce_target(c(2.3), DEFAULT_MAX_STEP, DEFAULT_MIN_SPEED),
+            Some(DEFAULT_MIN_SPEED)
         );
         // Large measured → drop by 2*step without hitting floor.
         assert_eq!(
-            safety_force_reduce_target(4.0, 0.3, DEFAULT_MIN_SPEED_KMH),
-            Some(3.4)
+            safety_force_reduce_target(c(4.0), DEFAULT_MAX_STEP, DEFAULT_MIN_SPEED),
+            Some(c(3.4))
         );
     }
 
     #[test]
-    fn band_mode_ignores_float_precision_gap_at_the_pin() {
+    fn quantize_identity_pins_at_clamp_without_epsilon() {
+        // Acceptance 054: telemetry-vs-config meet at one CentiKmh, so pinned
+        // at the clamp returns None *exactly* (no float glue).
         let params = band_params();
-        // Telemetry-decoded speed (`raw as f32 * 0.01`) never lands bit-equal
-        // on the config-parsed clamp — e.g. observed in production as
-        // 3.1999998 vs. a 3.2 clamp, a fixed ~2e-7 gap, not jitter (see
-        // MIN_SPEED_CHANGE_KMH doc comment). Pinned at max, still below the
-        // zone: must not re-fire a same-value write every tick (the bug that
-        // caused a Control Point round-trip, and an audible double beep, on
-        // a no-op speed every ~20s).
-        assert_eq!(next_speed(&params, DEFAULT_MAX_SPEED_KMH - 0.02, 100), None);
-        assert_eq!(next_speed(&params, DEFAULT_MAX_SPEED_KMH + 0.03, 100), None);
-        // Pinned at min, HR still high → same for the floor.
-        assert_eq!(next_speed(&params, DEFAULT_MIN_SPEED_KMH + 0.02, 140), None);
-        assert_eq!(next_speed(&params, DEFAULT_MIN_SPEED_KMH - 0.03, 140), None);
-        // But a genuine gap beyond the tolerance still corrects.
+        let tele = CentiKmh::from_kmh_f32(320f32 * 0.01).expect("telemetry path");
+        let conf = CentiKmh::from_kmh_f32(3.2).expect("config path");
+        assert_eq!(tele, conf);
+        let mut pinned = params;
+        pinned.max_speed_kmh = conf;
+        assert_eq!(next_speed(&pinned, tele, 100), None);
+    }
+
+    #[test]
+    fn deadband_policy_masks_small_diffs_not_real_corrections() {
+        let params = band_params();
+        // diff ≤ 5 centi → None (controller deadband).
         assert_eq!(
-            next_speed(&params, DEFAULT_MAX_SPEED_KMH - 0.2, 100),
-            Some(DEFAULT_MAX_SPEED_KMH)
+            next_speed(&params, DEFAULT_MAX_SPEED.saturating_sub_centi(2), 100),
+            None
+        );
+        assert_eq!(
+            next_speed(&params, DEFAULT_MAX_SPEED.saturating_sub_centi(5), 100),
+            None
+        );
+        // diff > 5 → Some; a genuine max_step-sized correction is not muted.
+        assert_eq!(
+            next_speed(&params, DEFAULT_MAX_SPEED.saturating_sub_centi(20), 100),
+            Some(DEFAULT_MAX_SPEED)
+        );
+        assert_eq!(
+            next_speed(&params, c(3.0), 100),
+            Some(c(3.0).saturating_add_centi(DEFAULT_MAX_STEP.to_wire()))
         );
     }
 
@@ -1238,29 +1302,29 @@ warmup_minutes = 0
     fn center_mode_does_not_correct_within_deadband_of_the_midpoint() {
         let params = center_params();
         // Midpoint of 112-131 is 121.5.
-        assert_eq!(next_speed(&params, 3.0, 122), None); // within ±3
-        assert_eq!(next_speed(&params, 3.0, 119), None);
+        assert_eq!(next_speed(&params, c(3.0), 122), None); // within ±3
+        assert_eq!(next_speed(&params, c(3.0), 119), None);
     }
 
     #[test]
     fn center_mode_is_more_aggressive_near_the_boundary_than_near_the_midpoint() {
         let params = center_params();
         // Small deviation past the deadband → small step.
-        let near = next_speed(&params, 3.0, 126).expect("some correction");
-        // At the boundary → step saturates at max_step_kmh.
-        let at_boundary = next_speed(&params, 3.0, 131).expect("some correction");
-        let near_step = (near - 3.0).abs();
-        let boundary_step = (at_boundary - 3.0).abs();
+        let near = next_speed(&params, c(3.0), 126).expect("some correction");
+        // At the boundary → step saturates at max_step.
+        let at_boundary = next_speed(&params, c(3.0), 131).expect("some correction");
+        let near_step = near.abs_diff(c(3.0));
+        let boundary_step = at_boundary.abs_diff(c(3.0));
         assert!(near_step < boundary_step);
-        assert!((boundary_step - DEFAULT_MAX_STEP_KMH).abs() < 0.01);
+        assert_eq!(boundary_step, DEFAULT_MAX_STEP.to_wire());
     }
 
     #[test]
     fn center_mode_direction_matches_band_mode() {
         let params = center_params();
         // Below centre → speed up; above centre → slow down.
-        assert!(next_speed(&params, 3.0, 100).unwrap() > 3.0);
-        assert!(next_speed(&params, 3.0, 140).unwrap() < 3.0);
+        assert!(next_speed(&params, c(3.0), 100).unwrap() > c(3.0));
+        assert!(next_speed(&params, c(3.0), 140).unwrap() < c(3.0));
     }
 
     #[test]
@@ -1296,13 +1360,13 @@ warmup_minutes = 0
         assert_eq!(config.resting_hr, Some(65));
         assert_eq!(config.method, Method::Karvonen);
         assert_eq!(config.target_zone, ZoneSelector::Number(3));
-        assert_eq!(config.min_speed_kmh, 2.5);
-        assert_eq!(config.max_speed_kmh, 5.0);
+        assert_eq!(config.min_speed_kmh, CentiKmh::from_wire(250));
+        assert_eq!(config.max_speed_kmh, CentiKmh::from_wire(500));
         assert_eq!(config.tracking, Tracking::Center);
         assert_eq!(config.warmup_minutes, 3);
         assert_eq!(config.correction_interval_seconds, 15);
         assert_eq!(config.deadband_bpm, 4);
-        assert_eq!(config.max_step_kmh, 0.2);
+        assert_eq!(config.max_step_kmh, CentiKmh::from_wire(20));
         assert_eq!(config.reentry_grace_seconds, 30);
         assert_eq!(config.safety_cap_percent, 75.0);
     }
@@ -1318,7 +1382,7 @@ warmup_minutes = 0
         let config = parse_zone_hold_config(raw);
         assert!(config.enabled);
         assert_eq!(config.age, None, "implausible age rejected");
-        assert_eq!(config.max_speed_kmh, DEFAULT_MAX_SPEED_KMH);
+        assert_eq!(config.max_speed_kmh, DEFAULT_MAX_SPEED);
     }
 
     #[test]
@@ -1341,7 +1405,10 @@ warmup_minutes = 0
             config.zones[0].id, "custom",
             "id derived from name when absent"
         );
-        assert_eq!(config.zones[0].max_speed_kmh, Some(6.0));
+        assert_eq!(
+            config.zones[0].max_speed_kmh,
+            Some(CentiKmh::from_wire(600))
+        );
     }
 
     #[test]
@@ -1452,7 +1519,7 @@ warmup_minutes = 0
                     min_bpm: 140,
                     max_bpm: 160,
                 },
-                max_speed_kmh: Some(5.0),
+                max_speed_kmh: Some(CentiKmh::from_wire(500)),
             },
         ];
         replace_zones(&path, &zones).unwrap();
@@ -1466,7 +1533,10 @@ warmup_minutes = 0
         assert_eq!(config.zones.len(), 2);
         assert_eq!(config.zones[0].id, "easy");
         assert_eq!(config.zones[1].name, "Hard \"quoted\"");
-        assert_eq!(config.zones[1].max_speed_kmh, Some(5.0));
+        assert_eq!(
+            config.zones[1].max_speed_kmh,
+            Some(CentiKmh::from_wire(500))
+        );
 
         // Replacing again must not leave the old blocks behind (regression:
         // the previous zones section, not just appended-to).

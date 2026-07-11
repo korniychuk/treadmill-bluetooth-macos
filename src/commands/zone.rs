@@ -182,7 +182,7 @@ pub(crate) fn zone_list() -> Result<()> {
         // toward the `{:<N}` column widths and break alignment (задача 057).
         let name_col = highlight_config(format!("{:<14}", zone.name));
         let id_col = highlight_config(format!("{:<16}", zone.id));
-        let max_col = highlight_config(format!("max {max_speed:.1} km/h"));
+        let max_col = highlight_config(format!("max {max_speed} km/h"));
         println!("{marker} #{number} {name_col} id={id_col} {range:<16} {max_col}");
     }
     println!("(* = current target; select with `tm zone target <id|name|number>`)");
@@ -353,9 +353,8 @@ pub(crate) fn print_zone_status() -> Result<()> {
                         "#{} {} ({})",
                         resolved.number, resolved.id, resolved.name
                     ));
-                    let min_speed = highlight_config(format!("{:.1}", config.min_speed_kmh));
-                    let max_speed =
-                        highlight_config(format!("{:.1}", resolved.effective_max_speed_kmh));
+                    let min_speed = highlight_config(config.min_speed_kmh.to_string());
+                    let max_speed = highlight_config(resolved.effective_max_speed_kmh.to_string());
                     println!(
                         "  target zone {target}: {}-{} bpm \u{2022} speed {min_speed}-{max_speed} km/h",
                         resolved.low_bpm, resolved.high_bpm,

@@ -200,7 +200,9 @@ pub(crate) fn prompt_zone_bounds(
 /// Prompt for an optional per-zone max-speed override. Empty line keeps
 /// `default`; `none`/`-` explicitly clears it (only meaningful when editing);
 /// an implausible number keeps `default` rather than erroring out on a typo.
-pub(crate) fn prompt_optional_max_speed(default: Option<f32>) -> Result<Option<f32>> {
+pub(crate) fn prompt_optional_max_speed(
+    default: Option<crate::speed::CentiKmh>,
+) -> Result<Option<crate::speed::CentiKmh>> {
     use std::io::Write;
     match default {
         Some(d) => print!("Per-zone max speed override, km/h (`none` to clear) [{d}]: "),
@@ -218,9 +220,14 @@ pub(crate) fn prompt_optional_max_speed(default: Option<f32>) -> Result<Option<f
     if trimmed.eq_ignore_ascii_case("none") || trimmed == "-" {
         return Ok(None);
     }
-    match trimmed.parse::<f32>() {
-        Ok(n) if n > 0.0 => Ok(Some(n)),
-        _ => {
+    match trimmed
+        .parse::<f32>()
+        .ok()
+        .and_then(crate::speed::CentiKmh::from_kmh_f32)
+        .filter(|c| *c > crate::speed::CentiKmh::ZERO)
+    {
+        Some(c) => Ok(Some(c)),
+        None => {
             println!("not a plausible speed — keeping the previous value");
             Ok(default)
         }
