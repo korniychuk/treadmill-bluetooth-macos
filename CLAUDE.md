@@ -14,6 +14,19 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
 - [`btleplug`](https://github.com/deviceplug/btleplug) — кросс-платформенный BLE; на macOS работает через **CoreBluetooth**.
 - `tokio` — async runtime; `tracing` — логирование; `anyhow` — ошибки.
 
+## Delegating to the Grok subagent
+
+This file is read by two different agents. Follow the branch that matches who you are.
+
+**If you are a Grok subagent** — launched via the global wrapper (`GROK_AGENT_DEPTH` is set in your env); your working directory is a `…_grok-<name>` worktree (or the main repo in read-only research mode): do the assigned task **directly and completely**, then commit on your branch (research mode: just report). Your own in-session subagents (`spawn_subagent`) are allowed and encouraged; the one thing you must **never** do is shell out to `grok-agent.sh` — that's a fork loop, and the wrapper hard-refuses re-entry anyway. The rest of this section is not for you.
+
+**If you are the orchestrating Claude Code session**: **Grok delegation is the DEFAULT in this repo** — this overrides the global CLAUDE.md's explicit-opt-in rule; no explicit ask is needed here.
+- **Delegate:** internet research (`~/.claude/tools/grok-agent.sh --ro <name> "<question>"`) and self-contained, well-scoped implementation (`~/.claude/tools/grok-agent.sh <name> "<task>"`) — run from inside this repo. Grok is fast and produces good, well-split commits.
+- **Keep in the main thread:** task decomposition, design decisions, writing the task doc, reviewing Grok's diff, and integrating its `grok/<name>` branch.
+- **Rust builds needing crate fetches:** add `--net crates.io --net static.crates.io`.
+- **Trust the diff, not the prose:** verify the actual commit on `grok/<name>`. An aborted run exits 2 with `stopReason=Cancelled` — continue it with `--resume <name>` rather than restarting.
+- Full doc: `ankor-dotfiles/docs/grok-agent.md`.
+
 ## Архитектура
 
 - `src/main.rs` — точка входа и CLI (`scan` | `connect` | `daemon` | `stats` | ...).
