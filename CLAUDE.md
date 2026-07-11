@@ -244,6 +244,21 @@ CLI-утилита, которая по Bluetooth Low Energy находит бе
 `hr_connected=false` ⇒ `last_bpm=None`; Zone Hold bpm только если sample fresh
 (≤15s). Диагностика: `tm doctor`.
 
+### Ops: BLE scan wedged (`start filtered BLE scan`)
+
+Live 2026-07-11: after connect, **btleplug** can panic on a background thread
+(`Got descriptors for a characteristic we don't know about`) without killing the
+process. Subsequent scans fail instantly with `err=start filtered BLE scan`;
+launchd KeepAlive does **not** restart. Recovery:
+
+```bash
+launchctl kickstart -k "gui/$(id -u)/com.korniychuk.treadmill-bluetooth-macos.daemon"
+```
+
+Wake the treadmill console if it stopped advertising. Permanent fix: backlog
+[009](docs/backlog/009-btleplug-panic-wedges-ble-scan.md). Reliability tasks
+035–047: done; smoke notes [048](docs/tasks/048-live-smoke-035-047.md).
+
 ## Протокол
 
 Большинство дорожек отдают стандартный GATT-профиль **FTMS** (Fitness Machine Service, `0x1826`).

@@ -126,4 +126,6 @@ apply_zone_hold_speed(peripheral, target).await;   // безусловно, бе
 
 - Обновлены: задачи [035](../tasks/035-hr-relative-timeout-in-select.md), [036](../tasks/036-zone-engage-zero-speed-defaults.md), [037](../tasks/037-atomic-config-toml-write.md), [040](../tasks/040-karvonen-missing-resting-hr-warn.md); research [003](003-reliability-architecture-review.md) (эррата-ссылка).
 - Созданы: задачи [041](../tasks/041-zone-safety-cap-noop-writes.md)–[047](../tasks/047-hygiene-sweep.md).
+- **Implementation (2026-07-10/11):** 035–047 shipped in code; live smoke [048](../tasks/048-live-smoke-035-047.md) partial green.
 - Backlog 005–008 — без изменений (подтверждены).
+- **New backlog after smoke:** [009](../backlog/009-btleplug-panic-wedges-ble-scan.md) — btleplug descriptor panic leaves process alive with permanent `start filtered BLE scan` failure.

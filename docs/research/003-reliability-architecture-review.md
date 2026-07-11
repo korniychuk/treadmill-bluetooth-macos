@@ -470,12 +470,13 @@ Phase 6–7 (tests/obs tags)                      ──► continuous, not a bi
 
 ## 11. Связанные артефакты
 
-- **Reliability tasks (from this review):**  
-  - open: [035](../tasks/035-hr-relative-timeout-in-select.md) HR silence, [036](../tasks/036-zone-engage-zero-speed-defaults.md) engage zeros, [037](../tasks/037-atomic-config-toml-write.md) atomic config, [038](../tasks/038-tm-doctor-liveness-matrix.md) doctor, [039](../tasks/039-control-source-and-operator-override.md) control intent, [040](../tasks/040-karvonen-missing-resting-hr-warn.md) Karvonen WARN  
-  - backlog: [005](../backlog/005-session-state-extract.md) state extract, [006](../backlog/006-speed-quantize-newtype.md) quantize, [007](../backlog/007-split-god-modules.md) file splits, [008](../backlog/008-typed-config-apply.md) config apply  
+- **Reliability tasks (from this review + 004):**  
+  - **done (code):** [035](../tasks/035-hr-relative-timeout-in-select.md)–[047](../tasks/047-hygiene-sweep.md)  
+  - **live smoke (partial):** [048](../tasks/048-live-smoke-035-047.md) — 2026-07-11: connect + walk + HR + doctor + default_speed `control_source` green; S2/S3/zone not run this session  
+  - backlog: [005](../backlog/005-session-state-extract.md) state extract, [006](../backlog/006-speed-quantize-newtype.md) quantize, [007](../backlog/007-split-god-modules.md) file splits, [008](../backlog/008-typed-config-apply.md) config apply, [009](../backlog/009-btleplug-panic-wedges-ble-scan.md) btleplug panic wedges scan (live 2026-07-11)  
 - Prior tasks: `030`–`034`, also `007`, `013`, `015`, `017`, `018`, `020`, `025`–`029`  
 - ADR: `0001` (no OS pair), `0002` (Life OS boundary)  
-- Research: `001` protocol, `002` Polar H10  
-- Code anchors:  
-  - `src/daemon.rs` — `stream_with_presence`, HR `timeout` ~1050, engage unwraps ~755/771/797, treadmill `sleep_until` ~688/2124, zone set_speed ~1298, CLI queue ~1768, reconnect gate ~1132  
-  - `src/hr.rs`, `src/zone_hold.rs` (resting_hr ~297, fs::write ~682+), `src/goals.rs` (~335), `src/activity.rs`, `src/store.rs`, `src/main.rs`
+- Research: `001` protocol, `002` Polar H10, `004` independent review  
+- Code anchors (as of review; lines drifted after 035–047):  
+  - `src/daemon.rs` — `stream_with_presence`, HR `sleep_until`, `zh_bpm_if_fresh`, control_source, zone engage Option  
+  - `src/hr.rs`, `src/zone_hold.rs`, `src/goals.rs` (`write_atomic`), `src/activity.rs`, `src/store.rs`, `src/main.rs` (`tm doctor`)
