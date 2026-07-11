@@ -102,22 +102,22 @@ use tracing::{error, info, warn};
 use crate::activity::ActivityAccumulator;
 use crate::auto_pause::AutoPause;
 use crate::config_apply::{self, LiveConfig};
-use crate::hr_session::{HrFrameAction, HrReconnect, HrSession, HR_NOTIFICATION_TIMEOUT};
-use crate::zone_session::{self, ZoneSession, ZoneWrite, ZH_BPM_MAX_AGE};
 use crate::control::Controller;
 use crate::control_command::{self, ControlCommand};
 use crate::default_speed;
 use crate::ftms;
 use crate::goals::{self, Goal};
 use crate::hr;
+use crate::hr_session::{HR_NOTIFICATION_TIMEOUT, HrFrameAction, HrReconnect, HrSession};
 use crate::logger::WorkoutLogger;
 use crate::notify;
 use crate::power::{self, PowerEvent};
 use crate::presence::PresenceState;
 use crate::scan;
 use crate::store::{DaemonStatus, Store};
-use crate::treadmill_link::{TreadmillLink, NOTIFICATION_TIMEOUT};
+use crate::treadmill_link::{NOTIFICATION_TIMEOUT, TreadmillLink};
 use crate::zone_hold;
+use crate::zone_session::{self, ZH_BPM_MAX_AGE, ZoneSession, ZoneWrite};
 
 /// Delay before retrying discovery after a scan/connect failure, so a
 /// transient Bluetooth hiccup does not spin the CPU in a tight loop.
@@ -906,7 +906,7 @@ async fn stream_with_presence(
                 };
                 let now = Instant::now();
                 let tokio_now = tokio::time::Instant::now();
-                link.on_telemetry(data.speed_kmh, now, tokio_now);
+                link.on_frame_decoded(tokio_now);
                 watchdog.touch_telemetry();
                 logger.log(&data)?;
                 // A failed per-sample persist must not tear down a healthy BLE
@@ -941,6 +941,10 @@ async fn stream_with_presence(
                     }
                 };
 
+                // Speed memory feeds resume-restore and Zone Hold ramp seeding —
+                // only persisted samples count (pre-refactor behavior): a
+                // restored belt speed must not depend on samples skipped above.
+                link.record_speed(data.speed_kmh, now);
                 // Live speed snapshot for `tm widget` (задача 029) — every sample
                 // with speed, unconditionally (unlike `last_walking_speed` on the
                 // link, which only tracks non-zero cruising speed).
@@ -1258,6 +1262,10 @@ async fn stream_with_presence(
                                         &m,
                                         &notification.value,
                                     )?;
+                                    // Snapshot only after the sample is durably
+                                    // stored — insert-then-publish, pre-refactor
+                                    // order (053 review follow-up).
+                                    hr.on_frame_stored(&m, ts_ms, state);
                                     state.persist(store, watchdog)?;
                                 }
                                 HrFrameAction::Drop { state_changed } => {
@@ -2119,10 +2127,7 @@ mod tests {
             Duration::ZERO,
             "deadline must land exactly at silence_deadline, not drift with the sibling"
         );
-        assert_eq!(
-            link.silence_deadline().elapsed(),
-            Duration::ZERO,
-        );
+        assert_eq!(link.silence_deadline().elapsed(), Duration::ZERO,);
         // Elapsed since construction equals the timeout when the arm fires.
         assert_eq!(
             (deadline - NOTIFICATION_TIMEOUT).elapsed(),

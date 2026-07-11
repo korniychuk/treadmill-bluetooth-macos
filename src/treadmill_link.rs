@@ -56,15 +56,18 @@ impl TreadmillLink {
         }
     }
 
-    /// Each decoded `0x2ACD`: advance silence anchor; if speed present, push
-    /// history (prune by [`SPEED_HISTORY_RETENTION`]) and update last walking.
-    pub fn on_telemetry(
-        &mut self,
-        speed_kmh: Option<f32>,
-        now: Instant,
-        tokio_now: tokio::time::Instant,
-    ) {
+    /// Each decoded `0x2ACD`, *before* the persist gate: advance the silence
+    /// anchor. Split from [`Self::record_speed`] because a persist-failed
+    /// sample still proves the link is alive but must not enter the speed
+    /// memory — pre-refactor code excluded skipped samples from the cruising
+    /// estimate, and a restored belt speed must not depend on DB health.
+    pub fn on_frame_decoded(&mut self, tokio_now: tokio::time::Instant) {
         self.last_telemetry_at = tokio_now;
+    }
+
+    /// A successfully persisted sample's speed: push history (prune by
+    /// [`SPEED_HISTORY_RETENTION`]) and update last walking speed.
+    pub fn record_speed(&mut self, speed_kmh: Option<f32>, now: Instant) {
         let Some(speed) = speed_kmh else {
             return;
         };
@@ -202,29 +205,31 @@ mod tests {
     }
 
     #[test]
-    fn on_telemetry_prunes_history_past_retention() {
+    fn record_speed_prunes_history_past_retention() {
         let mut link = TreadmillLink::new(tokio::time::Instant::from_std(Instant::now()));
         let t0 = Instant::now();
         // Old sample outside retention.
-        link.on_telemetry(
+        link.record_speed(
             Some(2.0),
             t0 - SPEED_HISTORY_RETENTION - Duration::from_secs(5),
-            tokio::time::Instant::from_std(t0),
         );
         // Fresh sample triggers prune of the old one.
-        link.on_telemetry(Some(3.0), t0, tokio::time::Instant::from_std(t0));
+        link.on_frame_decoded(tokio::time::Instant::from_std(t0));
+        link.record_speed(Some(3.0), t0);
         assert_eq!(link.speed_history.len(), 1);
         assert_eq!(link.speed_history[0].1, 3.0);
         assert_eq!(link.last_walking_speed(), Some(3.0));
     }
 
     #[test]
-    fn on_telemetry_zero_speed_does_not_overwrite_last_walking() {
+    fn record_speed_zero_speed_does_not_overwrite_last_walking() {
         let mut link = TreadmillLink::new(tokio::time::Instant::from_std(Instant::now()));
         let now = Instant::now();
         let tk = tokio::time::Instant::from_std(now);
-        link.on_telemetry(Some(2.5), now, tk);
-        link.on_telemetry(Some(0.0), now, tk);
+        link.on_frame_decoded(tk);
+        link.record_speed(Some(2.5), now);
+        link.on_frame_decoded(tk);
+        link.record_speed(Some(0.0), now);
         assert_eq!(link.last_walking_speed(), Some(2.5));
     }
 
@@ -235,13 +240,10 @@ mod tests {
         let tk = tokio::time::Instant::from_std(pause);
         // Steady cruise well outside decel window, then a last non-zero crawl.
         for secs_ago in 15..=40 {
-            link.on_telemetry(
-                Some(2.5),
-                pause - Duration::from_secs(secs_ago),
-                tk,
-            );
+            link.record_speed(Some(2.5), pause - Duration::from_secs(secs_ago));
         }
-        link.on_telemetry(Some(0.6), pause - Duration::from_secs(1), tk);
+        link.on_frame_decoded(tk);
+        link.record_speed(Some(0.6), pause - Duration::from_secs(1));
         // last_walking would be 0.6 if we only took last non-zero; cruise is 2.5.
         assert_eq!(link.last_walking_speed(), Some(0.6));
         link.on_pause(pause);
@@ -254,8 +256,10 @@ mod tests {
         let pause = Instant::now();
         let tk = tokio::time::Instant::from_std(pause);
         // All samples inside decel skip — cruising_speed uses peak (≥ floor).
-        link.on_telemetry(Some(2.5), pause - Duration::from_secs(5), tk);
-        link.on_telemetry(Some(1.2), pause - Duration::from_secs(2), tk);
+        link.on_frame_decoded(tk);
+        link.record_speed(Some(2.5), pause - Duration::from_secs(5));
+        link.on_frame_decoded(tk);
+        link.record_speed(Some(1.2), pause - Duration::from_secs(2));
         link.on_pause(pause);
         // Peak walking inside short window is still 2.5 via cruising_speed fallback.
         assert_eq!(link.pre_pause_speed, Some(2.5));
@@ -284,7 +288,8 @@ mod tests {
         let mut link = TreadmillLink::new(start);
         assert_eq!(link.silence_deadline(), start + NOTIFICATION_TIMEOUT);
         let later = start + Duration::from_secs(7);
-        link.on_telemetry(Some(1.0), Instant::now(), later);
+        link.on_frame_decoded(later);
+        link.record_speed(Some(1.0), Instant::now());
         assert_eq!(link.silence_deadline(), later + NOTIFICATION_TIMEOUT);
     }
 

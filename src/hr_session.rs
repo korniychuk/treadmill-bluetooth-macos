@@ -30,7 +30,7 @@ const HR_BATTERY_LOW_THRESHOLD_PCT: u8 = 20;
 /// What the shell should do with a parsed `0x2A37` frame after contact decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HrFrameAction {
-    /// Contact Live: write `hr_sample` (snapshot already updated).
+    /// Contact Live: write `hr_sample`, then publish via [`HrSession::on_frame_stored`].
     Store { ts_ms: i64 },
     /// Contact Lost (stable or transition). `state_changed` ⇒ shell must persist.
     Drop { state_changed: bool },
@@ -100,7 +100,11 @@ impl HrSession {
         self.connect_in_flight = false;
     }
 
-    /// Parsed `0x2A37`: advance silence clock, run contact tracker, update snapshot.
+    /// Parsed `0x2A37`: advance silence clock, run contact tracker, decide
+    /// store-vs-drop. A `Store` decision does NOT yet publish the reading —
+    /// the shell writes the sample first and then calls [`Self::on_frame_stored`],
+    /// so a failed insert never leaves a bpm in the snapshot that no stored
+    /// sample backs (053 review follow-up; pre-refactor order).
     ///
     /// Invariant `hr_connected=false ⇒ last_bpm=None` is maintained here on
     /// Live→Lost (задача 033/035).
@@ -120,9 +124,6 @@ impl HrSession {
                 if changed {
                     info!(bpm = m.bpm, "HR sensor contact regained");
                 }
-                state.hr_connected = true;
-                state.last_bpm = Some(i64::from(m.bpm));
-                state.last_bpm_ts = Some(ts_ms);
                 HrFrameAction::Store { ts_ms }
             }
             hr::Contact::Lost => {
@@ -142,6 +143,15 @@ impl HrSession {
                 }
             }
         }
+    }
+
+    /// Publish a live reading to the snapshot after `insert_hr_sample`
+    /// succeeded. Kept separate from [`Self::on_frame`] so the snapshot never
+    /// advertises a bpm whose sample failed to persist.
+    pub fn on_frame_stored(&self, m: &hr::HrMeasurement, ts_ms: i64, state: &mut DaemonState) {
+        state.hr_connected = true;
+        state.last_bpm = Some(i64::from(m.bpm));
+        state.last_bpm_ts = Some(ts_ms);
     }
 
     /// Non-HR characteristic on the HR link, or undecodable frame: silence only.
@@ -201,12 +211,7 @@ impl HrSession {
 
     /// After a battery GATT read attempt: always stamp `last_read`; update pct
     /// only on success (failed read keeps last known).
-    pub fn on_battery_read(
-        &mut self,
-        pct: Option<u8>,
-        now: Instant,
-        state: &mut DaemonState,
-    ) {
+    pub fn on_battery_read(&mut self, pct: Option<u8>, now: Instant, state: &mut DaemonState) {
         self.battery_last_read = Some(now);
         if let Some(p) = pct {
             self.battery_pct = Some(p);
@@ -271,6 +276,9 @@ mod tests {
         let m = live_measurement(120);
         let action = hr.on_frame(&m, 1_000, tk, &mut state);
         assert_eq!(action, HrFrameAction::Store { ts_ms: 1_000 });
+        // Snapshot publishes only after the shell's successful insert.
+        assert!(state.last_bpm.is_none());
+        hr.on_frame_stored(&m, 1_000, &mut state);
         assert!(state.hr_connected);
         assert_eq!(state.last_bpm, Some(120));
         assert_eq!(state.last_bpm_ts, Some(1_000));
@@ -296,7 +304,12 @@ mod tests {
             rr_ms: vec![],
         };
         let action = hr.on_frame(&lost, 2_000, tk, &mut state);
-        assert_eq!(action, HrFrameAction::Drop { state_changed: true });
+        assert_eq!(
+            action,
+            HrFrameAction::Drop {
+                state_changed: true
+            }
+        );
         assert!(!state.hr_connected);
         assert!(state.last_bpm.is_none());
         assert!(state.last_bpm_ts.is_none());
@@ -334,7 +347,10 @@ mod tests {
         let tk = tokio::time::Instant::from_std(t0);
         let mut hr = HrSession::new_connecting(t0, tk);
         // Fresh in-flight from new_connecting.
-        assert_eq!(hr.reconnect_decision(t0 + Duration::from_secs(10)), HrReconnect::Skip);
+        assert_eq!(
+            hr.reconnect_decision(t0 + Duration::from_secs(10)),
+            HrReconnect::Skip
+        );
         // Past deadline → Spawn and re-arm.
         assert_eq!(
             hr.reconnect_decision(t0 + HR_CONNECT_ATTEMPT_DEADLINE + Duration::from_secs(1)),
@@ -389,6 +405,7 @@ mod tests {
         hr.on_connected(Some(90), now, tk, &mut state);
         let m = live_measurement(100);
         let _ = hr.on_frame(&m, 1, tk, &mut state);
+        hr.on_frame_stored(&m, 1, &mut state);
         assert!(state.hr_connected && state.last_bpm.is_some());
 
         // Path 2: contact lost.
@@ -403,6 +420,7 @@ mod tests {
 
         // Path 3: full link loss.
         let _ = hr.on_frame(&m, 3, tk, &mut state); // regain
+        hr.on_frame_stored(&m, 3, &mut state);
         hr.on_link_lost(&mut state);
         assert!(!state.hr_connected);
         assert!(state.last_bpm.is_none());
