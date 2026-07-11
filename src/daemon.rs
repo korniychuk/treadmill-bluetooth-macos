@@ -76,7 +76,7 @@ use std::time::{Duration, Instant};
 use std::pin::Pin;
 
 use anyhow::{Result, anyhow};
-use btleplug::api::{Central, Peripheral as _, ValueNotification};
+use btleplug::api::{Central, CentralState, Peripheral as _, ValueNotification};
 use btleplug::platform::{Adapter, Peripheral};
 use chrono::{DateTime, Local, Utc};
 use futures::{Stream, StreamExt};
@@ -195,12 +195,17 @@ const SPEED_HISTORY_RETENTION: Duration = Duration::from_secs(45);
 const WATCHDOG_EXIT_CODE: i32 = 86;
 
 /// How many *consecutive* per-sample DB persist failures are tolerated before
-/// the telemetry stream is torn down. One-off SQLITE_BUSY under system load is
-/// a recoverable anomaly (WARN + skip — the cumulative FTMS counters make the
-/// next successful `advance_baseline` self-healing), but a persistent failure
-/// (disk full, schema corruption) must escalate instead of silently dropping
-/// every sample (backlog 010).
+/// the process exits for a launchd restart. One-off SQLITE_BUSY under system
+/// load is a recoverable anomaly (WARN + skip — the cumulative FTMS counters
+/// make the next successful `advance_baseline` self-healing), but a persistent
+/// failure (disk full, schema corruption) needs a clean-slate restart: merely
+/// ending the stream would flap a healthy BLE link forever, and the watchdog
+/// never fires because telemetry keeps touching it (backlog 010).
 const DB_PERSIST_FAILURE_LIMIT: u32 = 30;
+
+/// Exit code for a persistent DB failure — distinct from watchdog (86) and
+/// scan-wedge (87) for log/`launchctl print` forensics.
+const DB_PERSIST_EXIT_CODE: i32 = 88;
 
 /// Exit code for the fail-fast panic hook — matches Rust's own exit code for
 /// a panicking main thread, distinct from [`WATCHDOG_EXIT_CODE`] (86) and
@@ -269,6 +274,23 @@ impl ScanRecovery {
 
     /// Any successful scan start (connect `Ok`, or a non-scan-start failure)
     /// proves the adapter is healthy — reset both counters.
+    /// Report whether the adapter's radio is powered on, assuming powered-on
+    /// when the state query itself fails (the wedge machinery then proceeds —
+    /// a broken state query on a healthy radio must not mask a real wedge).
+    async fn is_adapter_powered_on(adapter: &Adapter) -> bool {
+        match adapter.adapter_state().await {
+            Ok(state) => state == CentralState::PoweredOn,
+            Err(err) => {
+                warn!(
+                    target: "scan_recovery",
+                    %err,
+                    "adapter_state query failed — assuming powered on"
+                );
+                true
+            }
+        }
+    }
+
     fn on_scan_ok(&mut self) {
         self.scan_start_streak = 0;
         self.recycles = 0;
@@ -718,9 +740,24 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                     Err(err) => {
                         let is_scan_start =
                             err.downcast_ref::<scan::ScanStartFailed>().is_some();
-                        match scan_recovery.on_connect_failure(is_scan_start) {
+                        // Bluetooth powered off yields the same start_scan error
+                        // as a wedged CBCentralManager, but neither an adapter
+                        // recycle nor an exit(87) restart can heal a radio that
+                        // is simply off — it must not feed the wedge streak, or
+                        // the daemon would loop restarts until the radio is back.
+                        let powered_on = is_scan_start
+                            && ScanRecovery::is_adapter_powered_on(&active_adapter).await;
+                        let is_wedge_candidate = is_scan_start && powered_on;
+                        if is_scan_start && !powered_on {
+                            warn!(
+                                target: "scan_recovery",
+                                %err,
+                                "start_scan failed with Bluetooth not powered on — waiting for the radio, not recycling"
+                            );
+                        }
+                        match scan_recovery.on_connect_failure(is_wedge_candidate) {
                             ScanRecoveryAction::Retry => {
-                                if is_scan_start {
+                                if is_wedge_candidate {
                                     warn!(
                                         target: "scan_recovery",
                                         streak = scan_recovery.scan_start_streak,
@@ -728,7 +765,7 @@ pub async fn run(adapter: &Adapter) -> Result<()> {
                                         %err,
                                         "start_scan failed — retrying (backlog 009)"
                                     );
-                                } else {
+                                } else if !is_scan_start {
                                     warn!(%err, "treadmill not found this cycle, retrying");
                                 }
                                 sleep(RETRY_DELAY).await;
@@ -1023,10 +1060,12 @@ async fn stream_with_presence(
                     }
                     Err(err) => {
                         error!(
+                            error = %err,
                             consecutive = db_persist_failures + 1,
-                            "sample persist failing persistently — ending stream"
+                            exit_code = DB_PERSIST_EXIT_CODE,
+                            "sample persist failing persistently — exiting for launchd restart"
                         );
-                        return Err(err);
+                        std::process::exit(DB_PERSIST_EXIT_CODE);
                     }
                 };
 
