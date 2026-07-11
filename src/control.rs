@@ -15,6 +15,7 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 
 use crate::ftms;
+use crate::speed::CentiKmh;
 
 /// FTMS Control Point opcodes (subset used here).
 mod opcode {
@@ -73,14 +74,13 @@ impl<'a> Controller<'a> {
         self.execute(opcode::STOP_PAUSE, &[STOP_PARAM]).await
     }
 
-    /// Set target speed in km/h (device range: see Supported Speed Range).
-    pub async fn set_speed(&self, kmh: f32) -> Result<()> {
-        if !(0.0..=25.0).contains(&kmh) {
-            bail!("speed {kmh} km/h out of sane range");
+    /// Set target speed (device range: see Supported Speed Range).
+    pub async fn set_speed(&self, speed: CentiKmh) -> Result<()> {
+        if speed > CentiKmh::MAX_SANE {
+            bail!("speed {speed} km/h out of sane range");
         }
         // FTMS encodes speed as uint16 in units of 0.01 km/h, little-endian.
-        let raw = (kmh * 100.0).round() as u16;
-        self.execute(opcode::SET_TARGET_SPEED, &raw.to_le_bytes())
+        self.execute(opcode::SET_TARGET_SPEED, &speed.to_wire().to_le_bytes())
             .await
     }
 
