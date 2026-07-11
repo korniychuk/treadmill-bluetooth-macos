@@ -4,6 +4,7 @@
 //! devices) is the default when no subcommand is given.
 
 mod activity;
+mod auto_pause;
 mod commands;
 mod config_apply;
 mod control;
