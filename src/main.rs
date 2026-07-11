@@ -29,6 +29,7 @@ mod store;
 mod treadmill_link;
 mod widget;
 mod zone_hold;
+mod zone_session;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
