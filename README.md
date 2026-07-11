@@ -189,6 +189,11 @@ file logs a WARN and falls back to defaults. Override the path with the
 `TREADMILL_CONFIG` env var. `tm status` shows the config the daemon currently
 has loaded and when it last read it.
 
+> 💠 In the CLI output (`tm status`, `tm zone`, `tm doctor`, …) values you can
+> change — here in `config.toml` or via a `tm …` setter — are printed in **cyan**,
+> so a configurable knob stands out from static text. Piped/redirected output and
+> `NO_COLOR` get plain text.
+
 ## 🖥️ tmux status-bar widget
 
 `tm widget` prints a compact, tab-separated line for a status bar (empty output
