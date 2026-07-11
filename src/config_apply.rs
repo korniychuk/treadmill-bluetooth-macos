@@ -181,9 +181,14 @@ fn push_zone_effects(
 ) {
     let phase_live = snap.phase != PhaseKind::Off;
 
-    // enabled true → false: disengage if the phase machine is still live.
-    // Wins over retarget/re-resolve on the same edit (safety-first).
-    if old.enabled && !new.enabled {
+    // enabled is false after this edit: disengage if the phase machine is
+    // still live. Wins over retarget/re-resolve on the same edit
+    // (safety-first). Covers true→false (the 032 case) AND false→false with
+    // a live phase — the latter is an invariant violation (a disabled config
+    // must never have a live phase) that the telemetry-loop gate would catch
+    // one sample later; repairing it here keeps re-resolve/retarget from ever
+    // firing for a disabled controller.
+    if !new.enabled {
         if phase_live {
             effects.push(ConfigEffect::ZoneDisengage(DisengageReason::DisabledInConfig));
         }
@@ -491,6 +496,21 @@ mod tests {
                 },
                 expect: &[ConfigEffect::AutoPauseChanged],
                 extra: ExtraDelta::AutoPause,
+            },
+            Case {
+                label: "combo enabled stays false + zone edit, phase live → Disengage (invariant repair)",
+                phase: PhaseKind::Hold,
+                walking: true,
+                build: || {
+                    let mut old = zh_enabled();
+                    old.enabled = false;
+                    let mut new = old.clone();
+                    new.warmup_minutes = 9;
+                    new.max_speed_kmh = 6.0;
+                    (old, new)
+                },
+                expect: &[ConfigEffect::ZoneDisengage(DisengageReason::DisabledInConfig)],
+                extra: ExtraDelta::None,
             },
             Case {
                 label: "combo enabled↓ + warmup change → only Disengage",
