@@ -1,4 +1,4 @@
-# Actionable PATH guidance
+# 063 — Actionable PATH guidance
 
 The installer creates `~/.bin/tm`, but a default macOS terminal does not search
 that directory. A successful installation therefore appears broken when the
