@@ -40,7 +40,7 @@ jobs:
           mkdir -p "${stage_dir}/scripts" "${stage_dir}/macos"
 
           cp target/release/treadmill-bluetooth-macos "${stage_dir}/"
-          cp scripts/install-daemon.sh "${stage_dir}/scripts/"
+          cp scripts/install-prebuilt.sh "${stage_dir}/scripts/"
           cp scripts/uninstall-daemon.sh "${stage_dir}/scripts/"
           cp scripts/register-notification-identity.sh "${stage_dir}/scripts/"
           cp macos/AppIcon.icns "${stage_dir}/macos/"
@@ -48,6 +48,7 @@ jobs:
           cp LICENSE "${stage_dir}/"
 
           tar -czf "${archive_name}" "${stage_dir}"
+          bash scripts/check-release-archive.sh "${archive_name}"
           rm -rf "${stage_dir}"
 
           echo "archive_name=${archive_name}" >> "$GITHUB_OUTPUT"
@@ -71,11 +72,12 @@ jobs:
             xattr -d com.apple.quarantine treadmill-bluetooth-macos
             ```
 
-            Or skip this entirely and build/install locally instead, which also
-            registers the LaunchAgent and notification identity for you:
+            After extracting the archive, install the included binary (no Rust
+            toolchain required). This also registers the LaunchAgent and
+            notification identity:
 
             ```bash
-            scripts/install-daemon.sh
+            bash scripts/install-prebuilt.sh
             ```
 
             See [README.md](https://github.com/${{ github.repository }}/blob/main/README.md)
