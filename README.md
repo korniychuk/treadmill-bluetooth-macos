@@ -1,5 +1,28 @@
 # 🏃 treadmill-bluetooth-macos
 
+### Local JSON interface
+
+`tm stats --json` prints today's recorded totals and workouts; add `--all` for
+all recorded days. `tm samples --after-id 0 --limit 1000` prints a bounded page
+of raw readings. Both are read-only, use no Bluetooth, and emit one JSON object
+to stdout with `schema_version: 1`. Diagnostics go to stderr.
+
+Stats expose `days` with `date` (local YYYY-MM-DD), `steps`, `distance_m`,
+`walking_time_s`, and `workouts` (ID, RFC3339 start/end, same totals). Workouts
+use the configured grouping gap and are attributed to their start day; their
+sum may differ from calendar totals when crossing midnight. No records means
+an empty `days` array, including before first installation.
+
+Sample pages expose `samples`, `next_after_id`, and `has_more`. Pass the returned
+cursor as `--after-id` for the next page; row IDs are exclusive and increase
+within one database lifetime. Reset the cursor if replacing the database.
+Each reading has `id`, `session_id`, UTC `ts_ms`, `speed_centikmh`,
+`avg_speed_centikmh`, `distance_m`, `energy_kcal`, `elapsed_s`, and `steps`.
+Optional fields remain null. Speed is in 0.01 km/h; raw distance/energy/time/steps
+are cumulative device counters, **not additive daily totals**. `--limit` accepts
+1–10000. An empty page preserves the supplied cursor. Persist a cursor only
+after processing its page successfully; imports must handle retries.
+
 [![CI](https://github.com/korniychuk/treadmill-bluetooth-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/korniychuk/treadmill-bluetooth-macos/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-black.svg)](#-limitations)

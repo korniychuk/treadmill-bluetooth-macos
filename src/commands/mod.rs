@@ -4,6 +4,7 @@ pub(crate) mod alacritty_zoom;
 pub(crate) mod belt;
 pub(crate) mod common;
 pub(crate) mod diag;
+pub(crate) mod json;
 pub(crate) mod led;
 pub(crate) mod stats;
 pub(crate) mod status;

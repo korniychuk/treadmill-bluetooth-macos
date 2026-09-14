@@ -78,6 +78,17 @@ enum Commands {
         /// Show every recorded day instead of just today.
         #[arg(long)]
         all: bool,
+        /// Emit a versioned JSON document, without opening Bluetooth or changing SQLite.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a bounded JSON page of recorded samples (local, read-only, no BLE).
+    Samples {
+        /// Exclusive row-ID cursor; reset when replacing the source database.
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
+        after_id: i64,
+        #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(i64).range(1..=10000))]
+        limit: i64,
     },
     /// Print daemon/treadmill/power state and today's workouts. Read-only —
     /// never opens the BLE adapter itself, so it cannot contend with a
@@ -294,8 +305,14 @@ async fn main() -> Result<()> {
     // adapter — handle them before touching Bluetooth at all. `status` in
     // particular must never open the adapter: it has to work (and report
     // truthfully) while a daemon is already holding it.
-    if let Commands::Stats { all } = command {
+    if let Commands::Stats { all, json } = command {
+        if json {
+            return commands::json::run_stats_json(all);
+        }
         return run_stats(all);
+    }
+    if let Commands::Samples { after_id, limit } = command {
+        return commands::json::run_samples_json(after_id, limit);
     }
     if let Commands::Status = command {
         return run_status();
@@ -367,6 +384,7 @@ async fn main() -> Result<()> {
             run_fitshow_set(&adapter, kmh, incline_level).await?
         }
         Commands::Stats { .. }
+        | Commands::Samples { .. }
         | Commands::Status
         | Commands::Doctor
         | Commands::RecomputeSegments
@@ -403,5 +421,8 @@ fn restore_default_sigpipe() {
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("treadmill_bluetooth_macos=info,warn"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 }
