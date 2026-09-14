@@ -1,4 +1,4 @@
-# Prebuilt release packaging
+# 062 — Prebuilt release packaging
 
 The v0.4.0 archive ships `install-daemon.sh`, which invokes Cargo and expects
 source files absent from the archive. Meanwhile the README directs binary users
