@@ -1,5 +1,10 @@
 # 🏃 treadmill-bluetooth-macos
 
+If installation succeeded but `tm` says **command not found**, run
+`~/.bin/tm status` immediately. For the default install location, add
+`export PATH="$HOME/.bin:$PATH"` to `~/.zshrc` (macOS zsh), then open a new
+terminal. For custom `LINK_DIR` / `LINK_NAME`, follow the installer output.
+
 [![CI](https://github.com/korniychuk/treadmill-bluetooth-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/korniychuk/treadmill-bluetooth-macos/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-black.svg)](#-limitations)

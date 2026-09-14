@@ -58,10 +58,8 @@ if [[ -n "$LINK_NAME" ]]; then
     link=""
   else
     ln -sfn "$bin" "$link"
-    case ":$PATH:" in
-      *":$LINK_DIR:"*) ;;
-      *) echo "note: $LINK_DIR is not in your PATH — add it to call '$LINK_NAME' directly." >&2 ;;
-    esac
+    source "$repo_root/scripts/path-help.sh"
+    print_path_help "$LINK_DIR" "$LINK_NAME"
   fi
 fi
 

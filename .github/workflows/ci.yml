@@ -16,6 +16,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Installer PATH guidance
+        run: bash scripts/test-path-help.sh
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:

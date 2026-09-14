@@ -43,6 +43,7 @@ jobs:
           cp scripts/install-prebuilt.sh "${stage_dir}/scripts/"
           cp scripts/uninstall-daemon.sh "${stage_dir}/scripts/"
           cp scripts/register-notification-identity.sh "${stage_dir}/scripts/"
+          cp scripts/path-help.sh "${stage_dir}/scripts/"
           cp macos/AppIcon.icns "${stage_dir}/macos/"
           cp README.md "${stage_dir}/"
           cp LICENSE "${stage_dir}/"
