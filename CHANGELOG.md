@@ -6,6 +6,8 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-18
+
 ### Added
 
 - `tm start --speed <kmh>` — apply an explicit 0.5–6.1 km/h target after the
