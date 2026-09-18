@@ -61,9 +61,9 @@ pub enum ControlCommand {
 
 impl ControlCommand {
     /// Compact string persisted in `control_commands.command`: `start`,
-    /// `start_speed:<kmh>`, `stop`, `toggle`, `speed:<kmh>` (e.g. `speed:2.5`), `speed_step:up` /
-    /// `speed_step:down`, or `led:on`/`led:off`. Human-readable km/h outside;
-    /// [`CentiKmh`] inside. Relative forms (`toggle`, `speed_step:*`) are
+    /// `start_speed:<kmh>` (задача 065), `stop`, `toggle`, `speed:<kmh>` (e.g.
+    /// `speed:2.5`), `speed_step:up` / `speed_step:down`, or `led:on`/`led:off`.
+    /// Human-readable km/h outside; [`CentiKmh`] inside. Relative forms (`toggle`, `speed_step:*`) are
     /// resolved by the daemon (задача 063).
     pub fn to_wire(self) -> String {
         match self {

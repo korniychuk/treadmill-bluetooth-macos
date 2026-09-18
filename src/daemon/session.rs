@@ -20,7 +20,7 @@ use super::hr::{
     spawn_hr_connect_attempt,
 };
 use super::led::try_apply_led_on_connect;
-use super::speed::{try_apply_default_speed, try_restore_speed};
+use super::speed::{try_apply_default_speed, try_apply_start_speed, try_restore_speed};
 use super::state::{DaemonState, persist_daemon_status, tolerate_db_write};
 use super::watchdog::Watchdog;
 use super::zone_write::execute_zone_write;
@@ -282,8 +282,17 @@ pub(super) async fn stream_with_presence(
                         }
                         PresenceState::Walking if prev_state == PresenceState::Paused => {
                             let resume = link.on_resume(Instant::now());
+                            // An explicit `tm start --speed` beats restore and default
+                            // (задача 065); the write needs no measured speed.
                             if let Some(target) = intent.take_pending_start_speed(Instant::now()) {
-                                match super::speed::try_apply_start_speed(peripheral, target, &mut link, &mut intent).await {
+                                match try_apply_start_speed(
+                                    peripheral,
+                                    target,
+                                    &mut link,
+                                    &mut intent,
+                                )
+                                .await
+                                {
                                     Some(applied) => {
                                         zh_effective = Some(applied);
                                         zone.note_cli_speed(Instant::now());
@@ -291,6 +300,7 @@ pub(super) async fn stream_with_presence(
                                     }
                                     None => notify::treadmill_resumed(resume.paused_for, None),
                                 }
+                            // Speed-dependent restore/default only when measured.
                             } else if let Some(resumed_speed) = data.speed {
                                 match resume.pre_pause_speed {
                                     // A real captured walking speed → restore it (задача 012).

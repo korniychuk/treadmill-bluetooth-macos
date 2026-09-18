@@ -42,20 +42,24 @@ impl FromStr for SpeedTarget {
         match s {
             "up" => Ok(Self::Up),
             "down" => Ok(Self::Down),
-            other => parse_speed(other).map(Self::Absolute),
+            other => parse_speed(other, "km/h, up, or down").map(Self::Absolute),
         }
     }
 }
 
-fn parse_speed(raw: &str) -> Result<CentiKmh, String> {
+/// Quantize a CLI km/h value; `expected` names the accepted forms in the error.
+fn parse_speed(raw: &str, expected: &str) -> Result<CentiKmh, String> {
     let kmh: f32 = raw
         .parse()
-        .map_err(|_| format!("invalid speed {raw:?}; expected km/h, up, or down"))?;
+        .map_err(|_| format!("invalid speed {raw:?}; expected {expected}"))?;
     CentiKmh::from_kmh_f32(kmh).ok_or_else(|| format!("speed {kmh} km/h out of range"))
 }
 
+/// `tm start --speed` value (задача 065). Range-checked here because the
+/// firmware's reject would only arrive after the countdown, long after the CLI
+/// reported success.
 pub(crate) fn parse_start_speed(raw: &str) -> Result<CentiKmh, String> {
-    let speed = parse_speed(raw)?;
+    let speed = parse_speed(raw, "km/h")?;
     if !is_supported_target(speed) {
         return Err(format!(
             "speed {speed} km/h is outside the belt's range {SPEED_MIN}–{SPEED_MAX} km/h"

@@ -27,16 +27,24 @@ pub const SPEED_MAX: CentiKmh = CentiKmh::from_wire(610);
 /// How long a recorded target speed or start/stop remains the resolution base.
 pub const INTENT_WINDOW: Duration = Duration::from_secs(5);
 
-/// Maximum age of a deferred start-speed target at countdown completion.
+/// Maximum age of a deferred `start_speed:` target when the countdown ends
+/// (задача 065). Countdown ≈ 3.3 s plus slack; past it the target is dropped, so
+/// a Start that never moved the belt cannot surprise a much later console start.
 pub const PENDING_START_SPEED_TTL: Duration = Duration::from_secs(15);
 
+/// Whether `speed` is a target the belt accepts ([`SPEED_MIN`]..=[`SPEED_MAX`]).
+#[must_use]
 pub fn is_supported_target(speed: CentiKmh) -> bool {
     (SPEED_MIN..=SPEED_MAX).contains(&speed)
 }
 
+/// Outcome of [`BeltIntent::resolve_start_speed`] (задача 065).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartSpeedPlan {
+    /// Belt is moving, no countdown is running — write the speed right away.
     SetSpeedNow,
+    /// Belt is stopped, stopping or unknown — Start, then arm the target for
+    /// the countdown-end hook (the firmware rejects speed writes until then).
     StartThenSpeed,
 }
 
@@ -86,6 +94,7 @@ pub struct BeltIntent {
     /// Last daemon-issued Stop (auto-pause, Zone Hold safety). Blocks speed steps
     /// like a CLI Stop, but does not flip `toggle` — the operator did not press it.
     last_safety_stop: Option<Instant>,
+    /// `start_speed:` target waiting for the countdown to end, with its arm time.
     pending_start_speed: Option<(CentiKmh, Instant)>,
 }
 
@@ -117,6 +126,11 @@ impl BeltIntent {
         self.pending_start_speed = None;
     }
 
+    /// Resolve `start_speed:`: a Stop still in [`INTENT_WINDOW`] means the belt
+    /// is decelerating, so Start (a bare speed write must never re-accelerate
+    /// it — same rule as [`Self::resolve_step`]); else a moving belt takes the
+    /// speed now; a stopped or unknown belt is started first.
+    #[must_use]
     pub fn resolve_start_speed(&self, live: Option<CentiKmh>, now: Instant) -> StartSpeedPlan {
         if self.recent_run(RunIntent::Stop, now) || self.recent_safety_stop(now) {
             return StartSpeedPlan::StartThenSpeed;
@@ -127,10 +141,14 @@ impl BeltIntent {
         StartSpeedPlan::StartThenSpeed
     }
 
+    /// Arm the target once the Start was acknowledged. Cleared by any recorded
+    /// Stop ([`Self::note_run`] / [`Self::note_safety_stop`]).
     pub fn arm_start_speed(&mut self, target: CentiKmh, now: Instant) {
         self.pending_start_speed = Some((target, now));
     }
 
+    /// Take the armed target at the countdown-end hook. Always clears it; an
+    /// expired one yields `None` with a WARN.
     pub fn take_pending_start_speed(&mut self, now: Instant) -> Option<CentiKmh> {
         let (target, at) = self.pending_start_speed.take()?;
         let age = now.saturating_duration_since(at);
