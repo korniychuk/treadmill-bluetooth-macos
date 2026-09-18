@@ -21,6 +21,6 @@ Documentation-first workspace for `treadmill-bluetooth-macos`.
   - External PRs by @huertin03 (finished in review): [066](tasks/066-prebuilt-release-packaging.md)
     release archive ships `install-prebuilt.sh` + archive check; [067](tasks/067-installer-path-guidance.md)
     `tm` alias in `~/.bin`/`~/.local/bin` + PATH hint; [068](tasks/068-json-cli-contract.md)
-    `tm stats --json` / `tm samples` JSON export. `065` reserved for PR #4 (start with speed, draft).
+    `tm stats --json` / `tm samples` JSON export. [065](tasks/065-start-with-speed.md) `tm start --speed` (idea from PR #4; planned).
 - `backlog/` — not-yet-scheduled work. `004`–`011` done (see each file).
 - `ideas/` — loose ideas / future directions.
