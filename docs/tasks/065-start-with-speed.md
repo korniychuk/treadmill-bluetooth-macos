@@ -108,8 +108,7 @@ Conclusions:
 - Update `CLAUDE.md` (the `control_command.rs` / `treadmill_link.rs` /
   `daemon/speed.rs` entries plus the Команды block), README (Commands list: one
   line), `CHANGELOG.md` `[Unreleased]` (credit @huertin03 for the idea, PR #4),
-  and the index in `docs/README.md` (the line that already says «`065` reserved
-  for PR #4»: replace it with the real entry).
+  and the `065` entry in `docs/README.md` (flip «planned» to the final status).
 
 ## Gates
 
