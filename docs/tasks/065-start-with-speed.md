@@ -1,9 +1,8 @@
 # 065 — `tm start --speed <kmh>`: start the belt at an explicit speed
 
-> **Статус: implemented, awaiting live acceptance** (2026-09-18). **Класс:** feature · **Приоритет:** medium.
-> Landed on `main` (not pushed): `80f1fbb` (Codex executor run `start-speed`, implementation + tests + docs),
-> `d85e08b` (review polish). Gates green (fmt, clippy, build, 308 tests, `test-cli-link.sh`); daemon
-> reinstalled with the new binary 2026-09-18. Left: «Live acceptance», push, PR #4 comment, release `v0.5.0`.
+> **Статус: done** (2026-09-18), live-verified (see «Live acceptance — result»). **Класс:** feature · **Приоритет:** medium.
+> `80f1fbb` (Codex executor run `start-speed`, implementation + tests + docs), `d85e08b` (review polish).
+> Gates green (fmt, clippy, build, 308 tests, `test-cli-link.sh`). Ships in `v0.5.0`.
 > Fable design finished 2026-09-18 (in-session, effort high) — the pending target
 > moved from `TreadmillLink` to `BeltIntent` (stop-cleanup by construction), the
 > already-running case became an execute-time resolution to a plain `speed:`, and
@@ -260,6 +259,16 @@ After `scripts/install-daemon.sh`:
 4. With the belt already running, `tm start --speed 3.0`. Expect: an immediate
    switch to 3.0, and the log shows `resolved = speed:3` with **no** Start write.
 5. `tm start --speed 9` → CLI error, nothing enqueued.
+
+## Live acceptance — result (W2 Pro, 2026-09-18)
+
+| Step | Result |
+|---|---|
+| 1 `start --speed 3.5` | ✅ Start ack → countdown 3.3 s → `TargetSpeedChanged` + `Paused → Walking` → 0.27 s later `applied explicit start speed after countdown target=3.5`; console showed 3.5 directly, no 2.7 step, no `op 0x02 rejected` |
+| 2 `speed up` | ✅ `speed_step:up` → `resolved=speed:3.6` |
+| 3 stop + plain `start` | ✅ no start-speed leak; the resume arm took the pre-pause restore (`0.5 → 3.5`, 012 cruising speed; 016 had already been consumed this session) |
+| 4 `start --speed 3.0` on a moving belt | ✅ `resolved=speed:3`, no `op 0x07` Start write |
+| 5 `start --speed 9` | ✅ clap error, nothing enqueued |
 
 ## After landing
 
