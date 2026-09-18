@@ -28,10 +28,13 @@ IDENTITY="${IDENTITY:-AnKor Treadmill BLE Dev}"
 # Short CLI alias symlinked into a PATH dir so `tm stats`/`tm status` work from
 # anywhere. Points at the release artifact, so it tracks every rebuild. Set
 # LINK_NAME="" to skip. Keep in sync with uninstall-daemon.sh.
-LINK_DIR="${LINK_DIR:-$HOME/.bin}"
+# LINK_DIR unset → auto: see resolve_link_dir in scripts/cli-link.sh.
 LINK_NAME="${LINK_NAME:-tm}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/cli-link.sh
+source "$repo_root/scripts/cli-link.sh"
+LINK_DIR="${LINK_DIR:-$(resolve_link_dir "$LINK_NAME" "$BIN_NAME")}"
 cd "$repo_root"
 
 cargo build --release
@@ -58,7 +61,6 @@ if [[ -n "$LINK_NAME" ]]; then
     link=""
   else
     ln -sfn "$bin" "$link"
-    source "$repo_root/scripts/path-help.sh"
     print_path_help "$LINK_DIR" "$LINK_NAME"
   fi
 fi

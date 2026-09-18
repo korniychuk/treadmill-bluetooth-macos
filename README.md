@@ -1,10 +1,5 @@
 # 🏃 treadmill-bluetooth-macos
 
-If installation succeeded but `tm` says **command not found**, run
-`~/.bin/tm status` immediately. For the default install location, add
-`export PATH="$HOME/.bin:$PATH"` to `~/.zshrc` (macOS zsh), then open a new
-terminal. For custom `LINK_DIR` / `LINK_NAME`, follow the installer output.
-
 [![CI](https://github.com/korniychuk/treadmill-bluetooth-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/korniychuk/treadmill-bluetooth-macos/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-black.svg)](#-limitations)
@@ -114,9 +109,10 @@ scripts/uninstall-daemon.sh    # remove the LaunchAgent (keeps your data)
 
 `install-daemon.sh` builds a release binary, code-signs it, registers a
 notification identity, writes a **LaunchAgent** (`~/Library/LaunchAgents/…`,
-auto-starts at login), and symlinks a short `tm` alias into `~/.bin` so you can
-run `tm stats` / `tm status` from anywhere. Add `~/.bin` to your `PATH` if it
-isn't already.
+auto-starts at login), and symlinks a short `tm` alias so you can run `tm stats` / `tm status` from
+anywhere. The alias goes to `~/.bin` or `~/.local/bin`, whichever is already on
+your `PATH` (default `~/.local/bin`; override with `LINK_DIR`). If neither is,
+the installer prints the exact `export PATH=…` line to add to `~/.zshrc`.
 
 > 🔁 **Re-run `install-daemon.sh` after every rebuild** — it re-signs and reloads
 > the LaunchAgent. A bare `cargo build` leaves the daemon pointing at a stale or

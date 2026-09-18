@@ -386,7 +386,9 @@ GitHub Actions, оба на `macos-latest`: `ci.yml` (gate на push→main и P
 mirror того же порядка — **fmt валится чаще всего** и скипает остальное. Полная
 карта (шаги, watch-команды, пакетирование релиза): **[docs/ci.md](docs/ci.md)**.
 
-Короткий алиас `tm` — симлинк на release-бинарь в `~/.bin` (в `PATH`), чтобы
+Короткий алиас `tm` — симлинк на release-бинарь в `~/.bin` или `~/.local/bin`
+(что уже в `PATH`; иначе `~/.local/bin` + подсказка `export PATH`; задача 067,
+`scripts/cli-link.sh`), чтобы
 звать `tm stats` / `tm status` откуда угодно. Его **создаёт/обновляет
 `install-daemon.sh` и снимает `uninstall-daemon.sh`** (переопределяется через
 `LINK_DIR`/`LINK_NAME`, `LINK_NAME=""` — пропустить). Симлинк указывает на

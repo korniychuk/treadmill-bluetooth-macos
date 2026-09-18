@@ -33,10 +33,13 @@ readonly BIN_NAME="treadmill-bluetooth-macos"
 IDENTITY="${IDENTITY:--}"
 # Short CLI alias symlinked into a PATH dir so `tm stats`/`tm status` work from
 # anywhere. Set LINK_NAME="" to skip. Keep in sync with uninstall-daemon.sh.
-LINK_DIR="${LINK_DIR:-$HOME/.bin}"
+# LINK_DIR unset → auto: see resolve_link_dir in scripts/cli-link.sh.
 LINK_NAME="${LINK_NAME:-tm}"
 
 bundle_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/cli-link.sh
+source "$bundle_root/scripts/cli-link.sh"
+LINK_DIR="${LINK_DIR:-$(resolve_link_dir "$LINK_NAME" "$BIN_NAME")}"
 
 # Locate the pre-built binary: SOURCE_BIN override, else next to the tarball
 # root, else the conventional cargo output path (handy when run from a checkout).
@@ -82,7 +85,6 @@ if [[ -n "$LINK_NAME" ]]; then
     link=""
   else
     ln -sfn "$bin" "$link"
-    source "$bundle_root/scripts/path-help.sh"
     print_path_help "$LINK_DIR" "$LINK_NAME"
   fi
 fi
