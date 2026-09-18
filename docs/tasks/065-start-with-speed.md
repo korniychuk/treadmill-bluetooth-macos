@@ -1,6 +1,9 @@
 # 065 — `tm start --speed <kmh>`: start the belt at an explicit speed
 
-> **Статус: planned** (2026-09-18). **Класс:** feature · **Приоритет:** medium.
+> **Статус: implemented, awaiting live acceptance** (2026-09-18). **Класс:** feature · **Приоритет:** medium.
+> Landed on `main` (not pushed): `80f1fbb` (Codex executor run `start-speed`, implementation + tests + docs),
+> `d85e08b` (review polish). Gates green (fmt, clippy, build, 308 tests, `test-cli-link.sh`); daemon
+> reinstalled with the new binary 2026-09-18. Left: «Live acceptance», push, PR #4 comment, release `v0.5.0`.
 > Fable design finished 2026-09-18 (in-session, effort high) — the pending target
 > moved from `TreadmillLink` to `BeltIntent` (stop-cleanup by construction), the
 > already-running case became an execute-time resolution to a plain `speed:`, and
