@@ -15,6 +15,17 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (Alacritty 0.17 IPC is lossy on macOS); recovery records in SQLite survive
   daemon and Alacritty restarts. A window zoomed by hand (⌘=/⌘-) ignores it
   until ⌘0.
+- `tm toggle` and `tm speed up|down` (±0.1 km/h) — relative belt commands
+  resolved by the daemon against live speed and a 5 s intent memory, so rapid
+  key presses add up (задача 063). Refused on a stopped belt and while the
+  daemon does not hold the link.
+
+### Fixed
+
+- `tm led off` darkens the strip after a mains power-cycle: `Off` is primed
+  with `On` first (задача 061).
+- Piped CLI output (`tm stats | head`) exits quietly instead of panicking on a
+  broken pipe (задача 060).
 
 ## [0.4.0] — 2026-08-28
 

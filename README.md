@@ -32,8 +32,12 @@ and can drive the treadmill (start / stop / target speed). 🏃💨
   widget and a sensor-battery check (`tm status`, low-battery glyph in the
   widget). Optional — everything degrades silently when no sensor is worn.
 - 🎯 **Step-goal milestones** — up to 3 daily goals with native macOS toasts.
-- 🎛️ **Control** — start / stop / set target speed, and toggle the ambient LED
-  strip, on a live link.
+- 🎛️ **Control** — start / stop / toggle, absolute or ±0.1 km/h relative speed
+  (`tm speed up|down` — bind to hotkeys), and the ambient LED strip, on a live link.
+- 🫀 **Zone Hold** — auto-adjusts belt speed to keep your heart rate in a target
+  zone (`tm zone`).
+- 🔠 **Alacritty zoom** — optionally grows the Alacritty font while you walk and
+  restores it when the belt stops (`tm alacritty-zoom`).
 - 🖥️ **tmux status-bar widget** — see the current workout in your status line
   (see [`scripts/tmux/`](./scripts/tmux)).
 - 🛟 **Self-healing daemon** — auto reconnect, watchdog, pause/resume speed
@@ -123,9 +127,14 @@ tm stats              # today's stats;  tm stats --all  → every day
 tm status             # daemon / connection / presence snapshot
 tm widget             # compact TSV of the current workout (for status bars)
 tm hr                 # diagnostic: connect to a heart-rate sensor, print battery + live bpm
+tm doctor             # liveness matrix for diagnostics (no BLE)
 tm speed <kmh>        # set target speed on the live link
-tm start | tm stop    # start / stop the belt
-tm led on | tm led off  # toggle the ambient LED strip
+tm speed up | down    # ±0.1 km/h, rapid presses add up (via the daemon)
+tm start | tm stop | tm toggle  # start / stop the belt
+tm led on | tm led off  # toggle the ambient LED strip;  tm led default → on-connect state
+tm zone               # Zone Hold: status, or on/off/setup/target/list/…
+tm alacritty-zoom     # font zoom while walking: status, or on/off/pt/preview/reset
+tm speed-widget       # show live belt speed in the widget: status, or on/off
 tm recompute-segments # rebuild workout segments from raw samples (no BLE)
 tm default-speed      # show the computed default start speed (no BLE)
 tm --help             # full command list
@@ -183,6 +192,9 @@ goals = [8000, 10000, 12000]
 - ⏸️ `auto_pause_minutes` (optional, default 5, `0` = off) — how long the belt may
   keep running while nobody is walking (you stepped off) before the daemon pauses
   it; the machine's own shutoff then powers it down.
+- 🧩 `show_speed`, `led_on_connect`, `alacritty_zoom` / `alacritty_zoom_pt`,
+  `[zone_hold]` — usually written by the matching `tm …` setter; see the example
+  file for defaults.
 
 Edits are **hot-reloaded** by the daemon within ~5s while it is connected to the
 treadmill (see [`docs/tasks/017`](./docs/tasks/017-hot-reload-goals-config.md)).
@@ -214,9 +226,8 @@ the exact output contract.
   as generic FTMS, so other FTMS treadmills may work, but are untested.
 - ⛰️ **No incline.** The W2 Pro does not expose inclination over FTMS
   (`SetTargetInclination` → *Operation Failed*, no `0x2AD5`). Incline is remote-only.
-- 🎚️ **Partial control.** Start / stop and target-speed are implemented and
-  hardware-verified. Incline is not. LED backlight control is
-  [backlog](./docs/backlog/004-led-control-via-hci-capture.md), not started.
+- 🎚️ **Partial control.** Start / stop, target speed and the LED strip are
+  implemented and hardware-verified. Incline is not.
 - 🔕 **Not in the macOS Bluetooth menu — by design.** The treadmill is app-managed
   BLE, without OS-level pairing/bonding (avoids a race for the single BLE central
   with the phone app). See [ADR 0001](./docs/adr/0001-no-macos-bluetooth-device-list.md).
