@@ -6,7 +6,7 @@ set -euo pipefail
 listing="$(tar -tzf "$1")"
 root="${listing%%/*}"
 for file in treadmill-bluetooth-macos scripts/install-prebuilt.sh \
-  scripts/uninstall-daemon.sh scripts/register-notification-identity.sh \
+  scripts/uninstall-daemon.sh scripts/register-notification-identity.sh scripts/cli-link.sh \
   macos/AppIcon.icns README.md LICENSE; do
   if ! grep -Fxq "${root}/${file}" <<< "$listing"; then
     echo "release archive missing: ${file}" >&2
