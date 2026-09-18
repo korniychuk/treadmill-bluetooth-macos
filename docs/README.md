@@ -16,6 +16,11 @@ Documentation-first workspace for `treadmill-bluetooth-macos`.
     [061](tasks/061-led-off-prime-after-power-cycle.md) LED `off` no-op after
     power-cycle → prime with `on` (**done**, pending live);
     [062](tasks/062-alacritty-zoom-while-walking.md) Alacritty font zoom while walking,
-    `tm alacritty-zoom` (**done**, live-verified; facts: [research 008](research/008-alacritty-ipc-font-size.md)).
+    `tm alacritty-zoom` (**done**, live-verified; facts: [research 008](research/008-alacritty-ipc-font-size.md));
+    [063](tasks/063-keyboard-belt-control.md) `tm toggle` / `tm speed up|down` (**done**, live-verified).
+  - External PRs by @huertin03 (finished in review): [066](tasks/066-prebuilt-release-packaging.md)
+    release archive ships `install-prebuilt.sh` + archive check; [067](tasks/067-installer-path-guidance.md)
+    `tm` alias in `~/.bin`/`~/.local/bin` + PATH hint; [068](tasks/068-json-cli-contract.md)
+    `tm stats --json` / `tm samples` JSON export. `065` reserved for PR #4 (start with speed, draft).
 - `backlog/` — not-yet-scheduled work. `004`–`011` done (see each file).
 - `ideas/` — loose ideas / future directions.

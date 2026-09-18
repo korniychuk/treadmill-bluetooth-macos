@@ -19,9 +19,18 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   resolved by the daemon against live speed and a 5 s intent memory, so rapid
   key presses add up (задача 063). Refused on a stopped belt and while the
   daemon does not hold the link.
+- `tm stats --json [--all]` and `tm samples --after-id N --limit N` — versioned,
+  read-only JSON export of daily stats, workouts and raw readings; no Bluetooth
+  (задача 068, contributed by @huertin03).
+- Installers put the `tm` alias into `~/.bin` or `~/.local/bin`, whichever is
+  already on `PATH` (default `~/.local/bin`), and print a ready-to-paste
+  `export PATH=…` line when neither is (задача 067, contributed by @huertin03).
 
 ### Fixed
 
+- Release archives now ship `scripts/install-prebuilt.sh` (the README's
+  no-Rust install path) instead of the cargo-based installer, and CI checks the
+  archive contents before publishing (задача 066, contributed by @huertin03).
 - `tm led off` darkens the strip after a mains power-cycle: `Off` is primed
   with `On` first (задача 061).
 - Piped CLI output (`tm stats | head`) exits quietly instead of panicking on a
