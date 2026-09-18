@@ -213,6 +213,11 @@ When to delegate is in the global instructions, section "Coding-Agent Executor";
   (задача 014, дефолт 15). `load_auto_pause()` (`auto_pause.rs`) — порог
   авто-паузы простаивающей ленты из того же файла (задача 020, дефолт 5 мин,
   `0` — выключено), `None` = выключено.
+- `src/commands/json.rs` + `src/store/export.rs` — локальный JSON-экспорт
+  (задача 068): `tm stats --json [--all]`, `tm samples --after-id N --limit N`.
+  Read-only SQLite (`Store::open_readonly`, без миграций/создания), без BLE;
+  store отдаёт типизированные строки, wire-контракт (`schema_version`) — только
+  в `commands/json.rs`. Пагинация по `id`, не по `ts_ms`. Логи tracing — в stderr.
 - `src/logger.rs` — сырой JSONL-лог телеметрии (source-of-truth параллельно с SQLite).
 - `src/store.rs` (доп., задача 025) — `hr_samples` (индекс по `ts_ms`, не по
   `session_id` — агрегаты джойнят по временному окну тренировки/дня) +
@@ -352,6 +357,8 @@ cargo run             # = scan: перечислить BLE-устройства 
 cargo run -- connect  # подключиться к первой FTMS-дорожке и стримить данные
 cargo run -- daemon    # фоновый режим: авто-коннект + presence + toast (для интерактивной проверки)
 cargo run -- stats     # статистика за сегодня; `stats --all` — за все дни
+cargo run -- stats --json [--all]  # то же JSON-документом (задача 068)
+cargo run -- samples --after-id 0 --limit 1000  # страница raw_samples в JSON (без BLE)
 cargo run -- status    # состояние демона/дорожки/HR/zone (read-only, без BLE)
 cargo run -- doctor    # матрица живости для диагностики (задача 038; без BLE)
 cargo run -- widget    # компактный TSV текущей тренировки для status-bar виджета; пусто если дорожка off (см. docs/tasks/009)

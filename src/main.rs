@@ -87,8 +87,13 @@ enum Commands {
         /// Exclusive row-ID cursor; reset when replacing the source database.
         #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
         after_id: i64,
-        #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(i64).range(1..=10000))]
-        limit: i64,
+        /// Page size, 1..=10000.
+        #[arg(
+            long,
+            default_value_t = commands::json::SAMPLES_PAGE_DEFAULT,
+            value_parser = clap::value_parser!(u64).range(1..=store::SAMPLES_PAGE_MAX as u64)
+        )]
+        limit: u64,
     },
     /// Print daemon/treadmill/power state and today's workouts. Read-only —
     /// never opens the BLE adapter itself, so it cannot contend with a
@@ -312,7 +317,7 @@ async fn main() -> Result<()> {
         return run_stats(all);
     }
     if let Commands::Samples { after_id, limit } = command {
-        return commands::json::run_samples_json(after_id, limit);
+        return commands::json::run_samples_json(after_id, limit as usize);
     }
     if let Commands::Status = command {
         return run_status();

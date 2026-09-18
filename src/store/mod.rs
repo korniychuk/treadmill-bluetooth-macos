@@ -23,7 +23,7 @@ mod activity;
 mod alacritty_zoom;
 pub use alacritty_zoom::ZoomRecord;
 mod control_queue;
-mod json;
+mod export;
 mod samples;
 mod schema;
 mod status;
@@ -32,6 +32,7 @@ pub use activity::{DailyStats, RawDeltas, Segment, Workout, merge_segments};
 // Re-exported for public API parity even when no local path names the type.
 #[allow(unused_imports)]
 pub use control_queue::QueuedControlCommand;
+pub use export::{SAMPLES_PAGE_MAX, SampleExportRow, SamplePage};
 pub use samples::{HrRow, HrSummary, RawSample};
 pub use status::DaemonStatus;
 
