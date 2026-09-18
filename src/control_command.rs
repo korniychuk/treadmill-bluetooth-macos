@@ -51,6 +51,7 @@ pub const CONTROL_STALE_THRESHOLD: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlCommand {
     Start,
+    StartWithSpeed(CentiKmh),
     Stop,
     Speed(CentiKmh),
     SpeedStep(StepDirection),
@@ -60,13 +61,14 @@ pub enum ControlCommand {
 
 impl ControlCommand {
     /// Compact string persisted in `control_commands.command`: `start`,
-    /// `stop`, `toggle`, `speed:<kmh>` (e.g. `speed:2.5`), `speed_step:up` /
+    /// `start_speed:<kmh>`, `stop`, `toggle`, `speed:<kmh>` (e.g. `speed:2.5`), `speed_step:up` /
     /// `speed_step:down`, or `led:on`/`led:off`. Human-readable km/h outside;
     /// [`CentiKmh`] inside. Relative forms (`toggle`, `speed_step:*`) are
     /// resolved by the daemon (задача 063).
     pub fn to_wire(self) -> String {
         match self {
             Self::Start => "start".to_string(),
+            Self::StartWithSpeed(speed) => format!("start_speed:{speed}"),
             Self::Stop => "stop".to_string(),
             Self::Toggle => "toggle".to_string(),
             Self::Speed(speed) => format!("speed:{speed}"),
@@ -75,12 +77,15 @@ impl ControlCommand {
         }
     }
 
-    /// Relative intents (`toggle`, `speed_step:*`) need the daemon's live
+    /// Start-speed and relative intents need the daemon's live
     /// telemetry and intent memory; the CLI must not fall back to a direct
     /// BLE write for them.
     #[must_use]
     pub fn requires_daemon_intent(self) -> bool {
-        matches!(self, Self::SpeedStep(_) | Self::Toggle)
+        matches!(
+            self,
+            Self::StartWithSpeed(_) | Self::SpeedStep(_) | Self::Toggle
+        )
     }
 
     /// Parse the wire form back into a command. Errors (rather than silently
@@ -102,6 +107,7 @@ impl ControlCommand {
                 }
                 let raw = other
                     .strip_prefix("speed:")
+                    .or_else(|| other.strip_prefix("start_speed:"))
                     .with_context(|| format!("unknown control command wire form: {other:?}"))?;
                 let kmh: f32 = raw
                     .parse()
@@ -109,6 +115,9 @@ impl ControlCommand {
                 let Some(speed) = CentiKmh::from_kmh_f32(kmh) else {
                     bail!("speed out of range in {other:?}");
                 };
+                if other.starts_with("start_speed:") {
+                    return Ok(Self::StartWithSpeed(speed));
+                }
                 Ok(Self::Speed(speed))
             }
         }
@@ -129,9 +138,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_start_speed_wire_without_device_range_validation() {
+        let command = ControlCommand::StartWithSpeed(CentiKmh::from_wire(350));
+        assert_eq!(command.to_wire(), "start_speed:3.5");
+        assert!(command.requires_daemon_intent());
+        for wire in [
+            "start_speed:",
+            "start_speed:abc",
+            "start_speed:NaN",
+            "start_speed:-1",
+        ] {
+            assert!(ControlCommand::parse(wire).is_err(), "{wire}");
+        }
+        assert_eq!(
+            ControlCommand::parse("start_speed:9").unwrap(),
+            ControlCommand::StartWithSpeed(CentiKmh::from_wire(900))
+        );
+    }
+
+    #[test]
     fn wire_round_trips_every_variant() {
         for cmd in [
             ControlCommand::Start,
+            ControlCommand::StartWithSpeed(CentiKmh::from_wire(350)),
             ControlCommand::Stop,
             ControlCommand::Toggle,
             ControlCommand::Speed(CentiKmh::from_wire(250)),

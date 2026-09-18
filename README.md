@@ -138,7 +138,8 @@ tm hr                 # diagnostic: connect to a heart-rate sensor, print batter
 tm doctor             # liveness matrix for diagnostics (no BLE)
 tm speed <kmh>        # set target speed on the live link
 tm speed up | down    # ±0.1 km/h, rapid presses add up (via the daemon)
-tm start | tm stop | tm toggle  # start / stop the belt
+tm start [--speed <kmh>] | tm stop | tm toggle  # start / stop the belt
+# --speed: 0.5–6.1 km/h after countdown, immediately if moving; connected daemon required
 tm led on | tm led off  # toggle the ambient LED strip;  tm led default → on-connect state
 tm zone               # Zone Hold: status, or on/off/setup/target/list/…
 tm alacritty-zoom     # font zoom while walking: status, or on/off/pt/preview/reset

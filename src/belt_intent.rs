@@ -10,6 +10,8 @@
 
 use std::time::{Duration, Instant};
 
+use tracing::warn;
+
 use crate::control_command::StepDirection;
 use crate::speed::CentiKmh;
 
@@ -24,6 +26,19 @@ pub const SPEED_MAX: CentiKmh = CentiKmh::from_wire(610);
 
 /// How long a recorded target speed or start/stop remains the resolution base.
 pub const INTENT_WINDOW: Duration = Duration::from_secs(5);
+
+/// Maximum age of a deferred start-speed target at countdown completion.
+pub const PENDING_START_SPEED_TTL: Duration = Duration::from_secs(15);
+
+pub fn is_supported_target(speed: CentiKmh) -> bool {
+    (SPEED_MIN..=SPEED_MAX).contains(&speed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartSpeedPlan {
+    SetSpeedNow,
+    StartThenSpeed,
+}
 
 /// Last CLI-issued start or stop the daemon actually wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +86,7 @@ pub struct BeltIntent {
     /// Last daemon-issued Stop (auto-pause, Zone Hold safety). Blocks speed steps
     /// like a CLI Stop, but does not flip `toggle` — the operator did not press it.
     last_safety_stop: Option<Instant>,
+    pending_start_speed: Option<(CentiKmh, Instant)>,
 }
 
 impl BeltIntent {
@@ -89,12 +105,45 @@ impl BeltIntent {
     /// and Zone Hold stops must not call this — the operator is not at the keys.
     pub fn note_run(&mut self, run: RunIntent, now: Instant) {
         self.last_run = Some((run, now));
+        if run == RunIntent::Stop {
+            self.pending_start_speed = None;
+        }
     }
 
     /// Record a daemon-issued Stop (auto-pause, Zone Hold). Call even when the
     /// write failed or timed out — it may still have reached the belt.
     pub fn note_safety_stop(&mut self, now: Instant) {
         self.last_safety_stop = Some(now);
+        self.pending_start_speed = None;
+    }
+
+    pub fn resolve_start_speed(&self, live: Option<CentiKmh>, now: Instant) -> StartSpeedPlan {
+        if self.recent_run(RunIntent::Stop, now) || self.recent_safety_stop(now) {
+            return StartSpeedPlan::StartThenSpeed;
+        }
+        if live.is_some_and(|speed| speed > CentiKmh::ZERO) {
+            return StartSpeedPlan::SetSpeedNow;
+        }
+        StartSpeedPlan::StartThenSpeed
+    }
+
+    pub fn arm_start_speed(&mut self, target: CentiKmh, now: Instant) {
+        self.pending_start_speed = Some((target, now));
+    }
+
+    pub fn take_pending_start_speed(&mut self, now: Instant) -> Option<CentiKmh> {
+        let (target, at) = self.pending_start_speed.take()?;
+        let age = now.saturating_duration_since(at);
+        if age > PENDING_START_SPEED_TTL {
+            warn!(
+                %target,
+                age_s = age.as_secs_f64(),
+                ttl_s = PENDING_START_SPEED_TTL.as_secs(),
+                "pending start speed expired — expected countdown completion within TTL"
+            );
+            return None;
+        }
+        Some(target)
     }
 
     /// Resolve `speed_step:up|down` against intent memory and live telemetry.
@@ -191,6 +240,85 @@ mod tests {
 
     fn c(centi: u16) -> CentiKmh {
         CentiKmh::from_wire(centi)
+    }
+
+    #[test]
+    fn take_start_speed_once_through_ttl_boundary() {
+        let now = Instant::now();
+        for age in [Duration::ZERO, PENDING_START_SPEED_TTL] {
+            let mut intent = BeltIntent::new();
+            intent.arm_start_speed(c(350), now);
+            assert_eq!(intent.take_pending_start_speed(now + age), Some(c(350)));
+            assert_eq!(intent.take_pending_start_speed(now + age), None);
+        }
+    }
+
+    #[test]
+    fn expire_start_speed_and_clear_pending_target() {
+        let now = Instant::now();
+        let mut intent = BeltIntent::new();
+        intent.arm_start_speed(c(350), now);
+        let expired = now + PENDING_START_SPEED_TTL + Duration::from_nanos(1);
+        assert_eq!(intent.take_pending_start_speed(expired), None);
+        assert!(intent.pending_start_speed.is_none());
+    }
+
+    #[test]
+    fn clear_start_speed_on_cli_or_safety_stop_but_keep_on_start() {
+        let now = Instant::now();
+        let mut intent = BeltIntent::new();
+        intent.arm_start_speed(c(350), now);
+        intent.note_run(RunIntent::Stop, now);
+        assert_eq!(intent.take_pending_start_speed(now), None);
+        intent.arm_start_speed(c(350), now);
+        intent.note_safety_stop(now);
+        assert_eq!(intent.take_pending_start_speed(now), None);
+        intent.arm_start_speed(c(350), now);
+        intent.note_run(RunIntent::Start, now);
+        assert_eq!(intent.take_pending_start_speed(now), Some(c(350)));
+    }
+
+    #[test]
+    fn resolve_start_speed_from_live_speed_and_recent_stops() {
+        let now = Instant::now();
+        let mut intent = BeltIntent::new();
+        assert_eq!(
+            intent.resolve_start_speed(Some(c(300)), now),
+            StartSpeedPlan::SetSpeedNow
+        );
+        for live in [None, Some(CentiKmh::ZERO)] {
+            assert_eq!(
+                intent.resolve_start_speed(live, now),
+                StartSpeedPlan::StartThenSpeed
+            );
+        }
+        intent.note_run(RunIntent::Stop, now);
+        assert_eq!(
+            intent.resolve_start_speed(Some(c(300)), now),
+            StartSpeedPlan::StartThenSpeed
+        );
+        assert_eq!(
+            intent.resolve_start_speed(Some(c(300)), now + INTENT_WINDOW),
+            StartSpeedPlan::SetSpeedNow
+        );
+        let later = now + INTENT_WINDOW;
+        intent.note_safety_stop(later);
+        assert_eq!(
+            intent.resolve_start_speed(Some(c(300)), later),
+            StartSpeedPlan::StartThenSpeed
+        );
+        assert_eq!(
+            intent.resolve_start_speed(Some(c(300)), later + INTENT_WINDOW),
+            StartSpeedPlan::SetSpeedNow
+        );
+    }
+
+    #[test]
+    fn check_supported_target_boundaries() {
+        assert!(!is_supported_target(c(49)));
+        assert!(is_supported_target(c(50)));
+        assert!(is_supported_target(c(610)));
+        assert!(!is_supported_target(c(611)));
     }
 
     #[test]

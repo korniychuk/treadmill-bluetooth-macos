@@ -198,6 +198,11 @@ pub fn default_speed_applied(from_kmh: f32, to_kmh: f32) {
     );
 }
 
+/// Fired when the operator's explicit start speed is applied after countdown.
+pub fn start_speed_applied(to_kmh: f32) {
+    toast("Treadmill", &format!("Started at {to_kmh:.1} km/h"));
+}
+
 /// Celebrate crossing a daily step goal, graduated by `tier` (задача 011):
 /// tier 1 is a quiet flourish, tier 2 adds heat and a sound, tier 3 is the
 /// loudest with a distinct sound. `threshold` is the goal's step count.

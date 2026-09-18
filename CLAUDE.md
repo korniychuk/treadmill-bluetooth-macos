@@ -87,6 +87,8 @@ When to delegate is in the global instructions, section "Coding-Agent Executor";
   `SpeedStep`, `Toggle`, `Led(LedState)`; текстовый wire-формат очереди без
   schema change (задача 013/054/058/063). Relative `toggle`/`speed_step:*`
   резолвятся демоном, не CLI.
+  `StartWithSpeed(CentiKmh)` uses `start_speed:<kmh>` (задача 065) and requires
+  the connected daemon; bare `start` retains its wire form.
 - `src/belt_intent.rs` — intent memory для relative CLI-команд (задача 063):
   last target speed + last start/stop, окно `INTENT_WINDOW` 5 с. Резолвит
   `speed_step:up|down` и `toggle` в момент execute, чтобы быстрые нажатия
@@ -94,6 +96,9 @@ When to delegate is in the global instructions, section "Coding-Agent Executor";
   `[SPEED_MIN, SPEED_MAX]` (0.50–6.10). `note_speed` на каждом успешном
   speed-write (CLI / restore / default / Zone Hold); `note_run` только на
   CLI start/stop/toggle (не auto-pause).
+  Start-speed intent (задача 065): a moving belt resolves to `Speed`; a recent
+  Stop or stopped/unknown belt resolves to Start plus a pending target. Pending
+  targets expire after 15 s, are consumed once, and clear on every recorded Stop.
 - `src/led.rs` — Yesoul ambient LED strip (задача 058): `LedState` (`on`/`off`),
   `led_frame` (`F0 10 02` / `F0 10 01`), GATT `0xFFF0`/`0xFFF2`. Не FitShow-кадр
   (нет конверта `02 … xor 03`). Никогда не пишет `0xFF00`/`0xFF01`/`0xFAB*` и
@@ -138,6 +143,9 @@ When to delegate is in the global instructions, section "Coding-Agent Executor";
   `current_segment=None`) в presence-переходе при уходе из `Walking` (задача 014);
   на resume после паузы авто-восстанавливает pre-pause скорость ленты через
   `control.rs` (bounded BLE-write, см. `docs/tasks/012`).
+  `try_apply_start_speed` (задача 065) takes precedence over restore/default at
+  countdown completion (`Paused → Walking`), consumes the default attempt even
+  on failure, and opens the Zone Hold override only after a successful write.
   Единственный владелец BLE-линка: команды управления (`tm speed`/`start`/`stop`/
   `toggle`/`speed up|down`) от CLI идут через SQLite-очередь `control_commands` и
   исполняются здесь на живом подключении (задача 013/063). Relative `toggle` и
@@ -369,7 +377,7 @@ cargo run -- hr        # диагностика: подключиться к HR-
 cargo run -- zone      # Zone Hold: статус (без аргумента) или on/off/setup/limits/target/list/add/edit/remove/mode (docs/tasks/027)
 cargo run -- alacritty-zoom  # status/probe; on | off | pt <value> | preview | reset (docs/tasks/062)
 cargo run -- speed-widget  # показ живой скорости в виджете: статус (без аргумента) или on/off (docs/tasks/029)
-cargo run -- start / stop / toggle  # лента через очередь демона (toggle = задача 063)
+cargo run -- start [--speed <kmh>] / stop / toggle  # лента через очередь демона (toggle = задача 063)
 cargo run -- speed <kmh|up|down>    # абсолютная цель или ±0.1 relative (задача 063)
 cargo run -- led on|off    # ambient LED strip via daemon queue or direct BLE (задача 058)
 cargo run -- led default   # on-connect strip default: status (no arg) or off|on|none (задача 059)

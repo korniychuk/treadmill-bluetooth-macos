@@ -40,13 +40,14 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use crate::commands::belt::{Command, SpeedTarget, run_command};
+use crate::commands::belt::{Command, SpeedTarget, parse_start_speed, run_command};
 use crate::commands::{
     refuse_if_daemon_live, run_connect, run_control, run_daemon, run_default_speed, run_discover,
     run_doctor, run_fitshow_probe, run_fitshow_set, run_hr, run_notify_test, run_sniff, run_stats,
     run_status, run_zone,
 };
 use crate::control_command::ControlCommand;
+use crate::speed::CentiKmh;
 use crate::widget::{run_speed_widget, run_widget};
 
 #[derive(Parser)]
@@ -139,7 +140,11 @@ enum Commands {
     /// `status` surface heart rate from the daemon instead (see docs/tasks/025).
     Hr,
     /// Start the belt via the FTMS Control Point.
-    Start,
+    Start {
+        /// Set the target after the countdown (requires the connected daemon).
+        #[arg(long, value_parser = parse_start_speed)]
+        speed: Option<CentiKmh>,
+    },
     /// Stop the belt via the FTMS Control Point.
     Stop,
     /// Start the belt if stopped, stop it if moving (задача 063). Needs the
@@ -355,8 +360,9 @@ async fn main() -> Result<()> {
     // link (two processes can't co-own the connection — задача 013), and only
     // fall back to a direct connection when the daemon is off. Handled here,
     // before the adapter is opened, so the enqueue path never touches BLE.
-    if let Commands::Start = command {
-        return run_control(ControlCommand::Start).await;
+    if let Commands::Start { speed } = command {
+        return run_control(speed.map_or(ControlCommand::Start, ControlCommand::StartWithSpeed))
+            .await;
     }
     if let Commands::Stop = command {
         return run_control(ControlCommand::Stop).await;
@@ -400,7 +406,7 @@ async fn main() -> Result<()> {
         | Commands::Zone { .. }
         | Commands::AlacrittyZoom { .. }
         | Commands::SpeedWidget { .. }
-        | Commands::Start
+        | Commands::Start { .. }
         | Commands::Stop
         | Commands::Toggle
         | Commands::Speed { .. }
@@ -430,4 +436,22 @@ fn init_tracing() {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
+}
+
+#[cfg(test)]
+mod start_speed_tests {
+    use super::*;
+
+    #[test]
+    fn parse_start_with_optional_speed() {
+        let cli = Cli::try_parse_from(["tm", "start"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Start { speed: None })));
+        let cli = Cli::try_parse_from(["tm", "start", "--speed", "3.5"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Commands::Start { speed: Some(speed) }) if speed == CentiKmh::from_wire(350))
+        );
+        for raw in ["9", "0.4", "abc"] {
+            assert!(Cli::try_parse_from(["tm", "start", "--speed", raw]).is_err());
+        }
+    }
 }

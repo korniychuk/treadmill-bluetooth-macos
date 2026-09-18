@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 use btleplug::platform::Adapter;
 use tracing::info;
 
+use crate::belt_intent::{SPEED_MAX, SPEED_MIN, is_supported_target};
 use crate::commands::common::{daemon_process_alive, daemon_status_fresh};
 use crate::control;
 use crate::control_command::{ControlCommand, StepDirection};
@@ -41,16 +42,26 @@ impl FromStr for SpeedTarget {
         match s {
             "up" => Ok(Self::Up),
             "down" => Ok(Self::Down),
-            other => {
-                let kmh: f32 = other
-                    .parse()
-                    .map_err(|_| format!("invalid speed {other:?}; expected km/h, up, or down"))?;
-                CentiKmh::from_kmh_f32(kmh)
-                    .map(Self::Absolute)
-                    .ok_or_else(|| format!("speed {kmh} km/h out of range"))
-            }
+            other => parse_speed(other).map(Self::Absolute),
         }
     }
+}
+
+fn parse_speed(raw: &str) -> Result<CentiKmh, String> {
+    let kmh: f32 = raw
+        .parse()
+        .map_err(|_| format!("invalid speed {raw:?}; expected km/h, up, or down"))?;
+    CentiKmh::from_kmh_f32(kmh).ok_or_else(|| format!("speed {kmh} km/h out of range"))
+}
+
+pub(crate) fn parse_start_speed(raw: &str) -> Result<CentiKmh, String> {
+    let speed = parse_speed(raw)?;
+    if !is_supported_target(speed) {
+        return Err(format!(
+            "speed {speed} km/h is outside the belt's range {SPEED_MIN}–{SPEED_MAX} km/h"
+        ));
+    }
+    Ok(speed)
 }
 
 /// How long the CLI waits for the daemon to run an enqueued command before
@@ -88,8 +99,10 @@ pub(crate) async fn run_control(command: ControlCommand) -> Result<()> {
         ControlCommand::Stop => Command::Stop,
         ControlCommand::Speed(speed) => Command::Speed(speed),
         ControlCommand::Led(state) => Command::Led(state),
-        ControlCommand::SpeedStep(_) | ControlCommand::Toggle => {
-            unreachable!("relative commands bailed before the direct-BLE path")
+        ControlCommand::StartWithSpeed(_)
+        | ControlCommand::SpeedStep(_)
+        | ControlCommand::Toggle => {
+            unreachable!("daemon-only commands bailed before the direct-BLE path")
         }
     };
     run_command(&adapter, mapped).await?;
@@ -151,6 +164,9 @@ pub(crate) async fn enqueue_and_wait(store: &store::Store, command: ControlComma
 pub(crate) fn describe_control_success(command: &ControlCommand) -> String {
     match command {
         ControlCommand::Start => "belt started".to_string(),
+        ControlCommand::StartWithSpeed(speed) => format!(
+            "belt starting — {speed} km/h once the countdown ends (right away if already moving)"
+        ),
         ControlCommand::Stop => "belt stopped".to_string(),
         ControlCommand::Toggle => "belt toggled".to_string(),
         ControlCommand::Speed(speed) => format!("speed set to {speed} km/h"),
@@ -185,6 +201,27 @@ pub(crate) async fn run_command(adapter: &Adapter, command: Command) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_start_speed_checks_supported_range() {
+        assert_eq!(parse_start_speed("3.5"), Ok(CentiKmh::from_wire(350)));
+        for raw in ["0.4", "6.2", "abc", "NaN", "inf", "-1"] {
+            assert!(parse_start_speed(raw).is_err(), "{raw}");
+        }
+        assert_eq!(
+            parse_start_speed("9").unwrap_err(),
+            "speed 9 km/h is outside the belt's range 0.5–6.1 km/h"
+        );
+        assert!("9".parse::<SpeedTarget>().is_ok());
+    }
+
+    #[test]
+    fn describe_start_speed_covers_both_execution_plans() {
+        assert_eq!(
+            describe_control_success(&ControlCommand::StartWithSpeed(CentiKmh::from_wire(350))),
+            "belt starting — 3.5 km/h once the countdown ends (right away if already moving)"
+        );
+    }
 
     #[test]
     fn speed_target_parses_absolute_up_and_down() {

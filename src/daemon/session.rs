@@ -282,8 +282,16 @@ pub(super) async fn stream_with_presence(
                         }
                         PresenceState::Walking if prev_state == PresenceState::Paused => {
                             let resume = link.on_resume(Instant::now());
-                            // Speed-dependent restore/default only when measured.
-                            if let Some(resumed_speed) = data.speed {
+                            if let Some(target) = intent.take_pending_start_speed(Instant::now()) {
+                                match super::speed::try_apply_start_speed(peripheral, target, &mut link, &mut intent).await {
+                                    Some(applied) => {
+                                        zh_effective = Some(applied);
+                                        zone.note_cli_speed(Instant::now());
+                                        notify::start_speed_applied(applied.to_kmh_f32());
+                                    }
+                                    None => notify::treadmill_resumed(resume.paused_for, None),
+                                }
+                            } else if let Some(resumed_speed) = data.speed {
                                 match resume.pre_pause_speed {
                                     // A real captured walking speed → restore it (задача 012).
                                     Some(pre_f32) => {

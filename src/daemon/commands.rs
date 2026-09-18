@@ -6,7 +6,7 @@ use chrono::Utc;
 use tracing::{info, warn};
 
 use super::SPEED_RESTORE_TIMEOUT;
-use crate::belt_intent::{BeltIntent, RunIntent};
+use crate::belt_intent::{BeltIntent, RunIntent, StartSpeedPlan};
 use crate::control::Controller;
 use crate::control_command::{self, ControlCommand};
 use crate::speed::CentiKmh;
@@ -103,12 +103,8 @@ pub(super) async fn process_control_commands(
     };
 
     let source = ControlSource::Cli;
-    // Only a CLI Speed / resolved speed_step opens the Zone Hold override
-    // window; Led/Start/Stop/toggle must not look like a speed restore.
-    let was_speed = matches!(
-        queued.command,
-        ControlCommand::Speed(_) | ControlCommand::SpeedStep(_)
-    );
+    // Open the override only when speed is written now, not during a countdown.
+    let was_speed = matches!(executed, ControlCommand::Speed(_));
     match tokio::time::timeout(
         SPEED_RESTORE_TIMEOUT,
         execute_control_command(peripheral, executed, source),
@@ -169,6 +165,11 @@ fn resolve_relative_command(
     now: Instant,
 ) -> RelativeResolve {
     match command {
+        ControlCommand::StartWithSpeed(target) => match intent.resolve_start_speed(live_speed, now)
+        {
+            StartSpeedPlan::SetSpeedNow => RelativeResolve::Ready(ControlCommand::Speed(target)),
+            StartSpeedPlan::StartThenSpeed => RelativeResolve::Ready(command),
+        },
         ControlCommand::SpeedStep(dir) => match intent.resolve_step(dir, live_speed, now) {
             Ok(speed) => RelativeResolve::Ready(ControlCommand::Speed(speed)),
             Err(reason) => RelativeResolve::Refused(reason.as_str()),
@@ -191,6 +192,10 @@ fn resolve_relative_command(
 
 fn record_cli_intent(intent: &mut BeltIntent, executed: ControlCommand, now: Instant) {
     match executed {
+        ControlCommand::StartWithSpeed(target) => {
+            intent.note_run(RunIntent::Start, now);
+            intent.arm_start_speed(target, now);
+        }
         ControlCommand::Speed(speed) => intent.note_speed(speed, now),
         ControlCommand::Start => intent.note_run(RunIntent::Start, now),
         ControlCommand::Stop => intent.note_run(RunIntent::Stop, now),
@@ -213,7 +218,7 @@ pub(super) async fn execute_control_command(
 ) -> Result<()> {
     let controller = Controller::take_control(peripheral).await?;
     match command {
-        ControlCommand::Start => controller.start().await,
+        ControlCommand::Start | ControlCommand::StartWithSpeed(_) => controller.start().await,
         ControlCommand::Stop => controller.stop().await,
         ControlCommand::Speed(kmh) => controller.set_speed(kmh).await,
         ControlCommand::Led(state) => controller.set_led(state).await,
@@ -223,5 +228,47 @@ pub(super) async fn execute_control_command(
                 command.to_wire()
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_start_speed_to_speed_only_when_moving() {
+        let now = Instant::now();
+        let intent = BeltIntent::new();
+        let target = CentiKmh::from_wire(350);
+        let start = ControlCommand::StartWithSpeed(target);
+        for (live, expected) in [
+            (
+                Some(CentiKmh::from_wire(300)),
+                ControlCommand::Speed(target),
+            ),
+            (Some(CentiKmh::ZERO), start),
+            (None, start),
+        ] {
+            let RelativeResolve::Ready(actual) =
+                resolve_relative_command(start, &intent, live, now)
+            else {
+                panic!("start-speed must resolve to a ready command");
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn record_start_speed_arms_target_and_notes_start() {
+        let now = Instant::now();
+        let mut intent = BeltIntent::new();
+        let target = CentiKmh::from_wire(350);
+        record_cli_intent(&mut intent, ControlCommand::StartWithSpeed(target), now);
+        assert_eq!(
+            intent.resolve_toggle(Some(CentiKmh::ZERO), now).run,
+            RunIntent::Stop
+        );
+        assert_eq!(intent.take_pending_start_speed(now), Some(target));
+        assert_eq!(intent.take_pending_start_speed(now), None);
     }
 }

@@ -186,6 +186,38 @@ pub(super) async fn try_apply_default_speed(
     }
 }
 
+/// Apply the operator's deferred target once the console countdown ends.
+pub(super) async fn try_apply_start_speed(
+    peripheral: &Peripheral,
+    target: CentiKmh,
+    link: &mut TreadmillLink,
+    intent: &mut BeltIntent,
+) -> Option<CentiKmh> {
+    // Consume the default attempt even on failure: the operator owns this speed.
+    link.mark_default_speed_applied();
+    let source = ControlSource::Cli;
+    match tokio::time::timeout(SPEED_RESTORE_TIMEOUT, restore_speed(peripheral, target)).await {
+        Ok(Ok(())) => {
+            info!(%target, control_source = source.as_str(), "applied explicit start speed after countdown");
+            intent.note_speed(target, Instant::now());
+            Some(target)
+        }
+        Ok(Err(err)) => {
+            warn!(%err, %target, control_source = source.as_str(), "failed to apply start speed after countdown — leaving belt as is");
+            None
+        }
+        Err(_) => {
+            warn!(
+                timeout_s = SPEED_RESTORE_TIMEOUT.as_secs(),
+                %target,
+                control_source = source.as_str(),
+                "start speed write timed out (possible CoreBluetooth hang)"
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

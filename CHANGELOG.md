@@ -8,6 +8,9 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `tm start --speed <kmh>` — apply an explicit 0.5–6.1 km/h target after the
+  countdown, or immediately when already moving; requires the connected daemon
+  (задача 065; idea by @huertin03, PR #4).
 - `alacritty_zoom` / `tm alacritty-zoom [on|off|pt <value>|preview|reset]` —
   grow the Alacritty font by `alacritty_zoom_pt` (default +0.625 pt) while
   walking and write the base size back when the belt stops or the treadmill
