@@ -45,7 +45,12 @@ and can drive the treadmill (start / stop / target speed). 🏃💨
 
 ## 📸 Demo
 
-**Live workout in your tmux status bar** (walking = green, paused = yellow):
+**Live workout in your tmux status bar** — time, steps vs. daily total & goal,
+distance, heart rate, belt speed:
+
+![tmux widget — walking, with day totals, heart rate and speed](./docs/screenshots/tmux-rich-widget.png)
+
+Walking = green, paused = yellow:
 
 ![tmux status-bar widget — walking](./docs/screenshots/tmux-widget-walking.png)
 
@@ -227,6 +232,12 @@ when the treadmill is off, so the segment hides). A reference renderer for
 **Dracula** (and a plain-tmux variant) lives in
 [`scripts/tmux/`](./scripts/tmux) — see its README for the install recipe and
 the exact output contract.
+
+The widget is not tied to tmux: `tm widget` is a plain data contract, and the
+tmux script is only one renderer. The same output can drive a segment in
+another terminal multiplexer, a shell prompt, or a desktop status bar.
+
+![full tmux status bar with the treadmill segment](./docs/screenshots/tmux-rich-full-bar.png)
 
 ![tmux widget — paused state](./docs/screenshots/tmux-widget-paused.png)
 
